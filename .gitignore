@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Virtualenv
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+.junie/
+*.swp
+
+# Training artefacts
+runs/
+checkpoints/
+*.pt
+*.pth
+
+# Misc
+.DS_Store
+Thumbs.db

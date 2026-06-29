@@ -1,0 +1,12 @@
+# Core
+numpy>=1.24
+torch>=2.0
+gymnasium>=0.29
+pettingzoo>=1.24
+
+# Logging / visualisation
+tensorboard>=2.14
+matplotlib>=3.7
+
+# Dev / test
+pytest>=7.4
