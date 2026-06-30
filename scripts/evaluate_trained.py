@@ -1,0 +1,336 @@
+"""
+scripts/evaluate_trained.py — Stage 1 acceptance evaluation.
+
+Given a trained checkpoint:
+
+1. Evaluate (deterministic, N seeds) against each red baseline:
+   stationary / random / run_from_nearest.
+2. Re-run the heuristic baselines (Random / Greedy blue) on the same
+   seeds for direct comparison.
+3. Render one GIF per scenario (trained blue vs each red).
+4. Also render Greedy blue vs Run on the same seed so the user can
+   visually compare coordination behaviour.
+5. Write a markdown results writeup to ``docs/stage1_results.md`` with:
+   acceptance verdict, full eval table, GIF links, training metadata.
+
+Run:
+    python scripts/evaluate_trained.py --checkpoint runs/stage1/<run>/best.pt
+
+Outputs land alongside the checkpoint:
+    runs/stage1/<run>/eval_gifs/
+    runs/stage1/<run>/eval_results.json
+    docs/stage1_results.md  (overwritten each call — by design)
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Callable, Dict, List, Tuple
+
+import numpy as np
+import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from isr.agents.heuristics import (
+    GreedyPursuer, HeuristicBlueAgent, RandomAgent,
+    run_from_nearest_uav, stationary_red, random_red,
+)
+from isr.agents.policy_loader import TrainedBlueAgent, load_policy
+from isr.env.pursuit_env import PursuitEnv
+from isr.utils.render import animate_episode
+
+
+# ---------------------------------------------------------------------------
+# Episode rollout (works with any HeuristicBlueAgent)
+# ---------------------------------------------------------------------------
+
+def run_episode(
+    blue:        HeuristicBlueAgent,
+    red_policy:  Callable,
+    env_kwargs:  Dict,
+    seed:        int,
+    collect_snaps: bool = False,
+) -> Tuple[float, int, List]:
+    env = PursuitEnv(**env_kwargs, red_policy=red_policy, seed=seed)
+    obs_d, _ = env.reset(seed=seed)
+    total   = 0.0
+    snaps: List[Dict] = []
+    if collect_snaps:
+        snaps.append(env.state_snapshot())
+    while env.agents:
+        actions = {a: blue.act(obs_d[a], env, a) for a in env.agents}
+        obs_d, rew_d, term_d, trunc_d, info_d = env.step(actions)
+        total += rew_d[env.possible_agents[0]]
+        if collect_snaps:
+            snaps.append(env.state_snapshot())
+    n_caught = int((~env.state_snapshot()["red_active"]).sum())
+    return total, n_caught, snaps
+
+
+def eval_matrix(
+    blue_factories: Dict[str, Callable],   # name -> ()->HeuristicBlueAgent
+    red_factories:  Dict[str, Callable],   # name -> red_policy callable
+    env_kwargs:     Dict,
+    n_episodes:     int,
+    seed_base:      int = 50_000,
+) -> Dict[str, Dict[str, Dict[str, float]]]:
+    """
+    Returns nested dict: results[blue_name][red_name] = {mean_return,
+    std_return, mean_caught}.
+    """
+    results: Dict[str, Dict[str, Dict[str, float]]] = {}
+    for b_name, b_factory in blue_factories.items():
+        results[b_name] = {}
+        for r_name, r_policy in red_factories.items():
+            returns: List[float] = []
+            caughts: List[int]   = []
+            for ep in range(n_episodes):
+                blue = b_factory()
+                # Same seed across blue policies => directly comparable
+                seed = seed_base + ep
+                r, c, _ = run_episode(blue, r_policy, env_kwargs, seed)
+                returns.append(r)
+                caughts.append(c)
+            results[b_name][r_name] = {
+                "mean_return": float(np.mean(returns)),
+                "std_return":  float(np.std(returns)),
+                "mean_caught": float(np.mean(caughts)),
+            }
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Markdown writeup
+# ---------------------------------------------------------------------------
+
+def _fmt_cell(d: Dict[str, float]) -> str:
+    return f"{d['mean_return']:+7.2f} ± {d['std_return']:.2f}  ({d['mean_caught']:.2f} caught)"
+
+
+def write_results_md(
+    out_path:        Path,
+    ckpt_path:       Path,
+    ckpt_meta:       Dict,
+    results:         Dict[str, Dict[str, Dict[str, float]]],
+    acceptance_bar:  float,
+    trained_vs_run:  float,
+    n_red:           int,
+    gif_paths:       Dict[str, Path],
+    eval_episodes:   int,
+) -> None:
+    """Render the Stage 1 results writeup."""
+    passed = trained_vs_run >= acceptance_bar
+    verdict = "PASS" if passed else "FAIL"
+    margin = trained_vs_run - acceptance_bar
+
+    blue_names = list(results.keys())
+    red_names  = list(next(iter(results.values())).keys())
+
+    header = "| Blue \\\\ Red | " + " | ".join(red_names) + " |"
+    align  = "|---" + "|---" * len(red_names) + "|"
+    rows = []
+    for b in blue_names:
+        cells = [_fmt_cell(results[b][r]) for r in red_names]
+        rows.append(f"| **{b}** | " + " | ".join(cells) + " |")
+    table = "\n".join([header, align] + rows)
+
+    gif_links = "\n".join(
+        f"- [{name}]({path.as_posix()})" for name, path in gif_paths.items()
+    )
+
+    md = f"""# Stage 1 — Results
+
+**Acceptance verdict: {verdict}**
+(trained policy mean return vs `run_from_nearest_uav`: **{trained_vs_run:+.2f}**;
+bar = 1.20 × GreedyPursuer = **{acceptance_bar:+.2f}**; margin = **{margin:+.2f}**)
+
+Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}
+Checkpoint: `{ckpt_path}`
+Training: rollout {ckpt_meta.get('rollout', '?')}, global_step {ckpt_meta.get('global_step', '?')}
+Eval episodes per cell: {eval_episodes} (deterministic, fixed seeds shared across blue policies)
+
+## Evaluation table
+
+Rows: blue policy.  Columns: red policy.
+Cell shows ``mean_return ± std_return  (mean caught of {n_red})`` — averaged
+over {eval_episodes} episodes with matched seeds.
+
+{table}
+
+## Visualisations
+
+{gif_links}
+
+## Training arguments
+
+```json
+{json.dumps(ckpt_meta.get('args', {}), indent=2)}
+```
+
+## Interpretation notes
+
+- The acceptance criterion (1.2× GreedyPursuer against the
+  ``run_from_nearest_uav`` red) tests whether the learned policy does
+  something a per-UAV nearest-target rule cannot — typically:
+  splitting coverage across reds, anticipating where the red will
+  dodge, or arriving from the direction red is fleeing.
+- Reward components: +10 per catch, -0.01·||a||² (action cost), -0.05
+  step cost, -5 terminal penalty per uncaught red.  A trained policy
+  beating Greedy can do so by **catching the same number of reds
+  faster** (less step cost), **catching with less effort** (lower
+  action cost), or **catching more reds in time-up episodes** (less
+  terminal penalty).
+- Eval is deterministic (distribution mean, no exploration noise).
+  Returns will be lower-variance than during training.
+"""
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(md, encoding="utf-8")
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--checkpoint", required=True, type=Path,
+                   help="path to a checkpoint .pt (best.pt or final.pt)")
+    p.add_argument("--n-episodes", type=int, default=50,
+                   help="episodes per (blue, red) cell")
+    p.add_argument("--device",     default="cpu")
+    p.add_argument("--seed-base",  type=int, default=50_000,
+                   help="shared seed base across blue policies for the same env")
+    p.add_argument("--gif-seed",   type=int, default=12_345,
+                   help="seed used for the qualitative GIFs (single episode)")
+    p.add_argument("--fps",        type=int, default=10)
+    p.add_argument("--results-md", default="docs/stage1_results.md",
+                   help="output markdown writeup path")
+    args = p.parse_args()
+
+    device = torch.device(args.device)
+    ckpt_path = args.checkpoint.resolve()
+    assert ckpt_path.exists(), f"Checkpoint not found: {ckpt_path}"
+
+    # ---- Load policy + reconstruct env config from saved args -----------
+    ckpt_meta = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    train_args = ckpt_meta["args"]
+    env_kwargs = dict(
+        n_blue         = train_args["n_blue"],
+        n_red          = train_args["n_red"],
+        arena_size     = train_args["arena_size"],
+        max_steps      = train_args["max_steps"],
+        capture_radius = train_args["capture_radius"],
+    )
+    policy = load_policy(ckpt_path, device)
+    print(f"Loaded checkpoint: {ckpt_path}")
+    print(f"  rollout={ckpt_meta.get('rollout','?')}  "
+          f"global_step={ckpt_meta.get('global_step','?')}")
+    print(f"  env_kwargs={env_kwargs}")
+
+    # ---- Eval matrix ----------------------------------------------------
+    blue_factories = {
+        "Random":  lambda: RandomAgent(seed=0),
+        "Greedy":  lambda: GreedyPursuer(),
+        "Trained": lambda: TrainedBlueAgent(policy, device, deterministic=True),
+    }
+    red_factories = {
+        "Stationary":     stationary_red,
+        "Random":         random_red(seed=0),
+        "RunFromNearest": run_from_nearest_uav,
+    }
+
+    print(f"\nEvaluating ({args.n_episodes} episodes per cell, matched seeds)...")
+    t0 = time.time()
+    results = eval_matrix(
+        blue_factories, red_factories, env_kwargs,
+        n_episodes=args.n_episodes, seed_base=args.seed_base,
+    )
+    print(f"  done in {time.time() - t0:.1f}s")
+
+    # ---- Print the table to stdout -------------------------------------
+    print("\nResults:")
+    blue_names = list(results.keys())
+    red_names  = list(next(iter(results.values())).keys())
+    header = f"{'Blue':>10}  " + "  ".join(f"{r:>25}" for r in red_names)
+    print(header)
+    print("-" * len(header))
+    for b in blue_names:
+        cells = [_fmt_cell(results[b][r]) for r in red_names]
+        print(f"{b:>10}  " + "  ".join(f"{c:>25}" for c in cells))
+
+    # ---- Acceptance check ----------------------------------------------
+    trained_vs_run = results["Trained"]["RunFromNearest"]["mean_return"]
+    greedy_vs_run  = results["Greedy"]["RunFromNearest"]["mean_return"]
+    bar = 1.20 * greedy_vs_run
+    verdict = "PASS" if trained_vs_run >= bar else "FAIL"
+    print(f"\nAcceptance: trained={trained_vs_run:+.2f}  "
+          f"bar=1.20×Greedy={bar:+.2f}  -> {verdict}")
+
+    # ---- Render GIFs (one per red policy + one Greedy-vs-Run reference) -
+    gif_dir = ckpt_path.parent / "eval_gifs"
+    gif_dir.mkdir(parents=True, exist_ok=True)
+    gif_paths: Dict[str, Path] = {}
+
+    print(f"\nRendering GIFs to {gif_dir}/ ...")
+    for r_name, r_policy in red_factories.items():
+        # Trained blue vs this red
+        blue = TrainedBlueAgent(policy, device, deterministic=True)
+        _, _, snaps = run_episode(blue, r_policy, env_kwargs,
+                                  seed=args.gif_seed, collect_snaps=True)
+        path = gif_dir / f"trained_vs_{r_name.lower()}.gif"
+        animate_episode(snaps, env_kwargs["arena_size"],
+                        save_path=str(path), fps=args.fps)
+        gif_paths[f"Trained vs {r_name}"] = path
+        print(f"  {path.name}  ({len(snaps)} frames)")
+
+    # Reference: Greedy blue vs Run, same seed as the trained-vs-Run GIF
+    greedy = GreedyPursuer()
+    _, _, snaps = run_episode(greedy, run_from_nearest_uav, env_kwargs,
+                              seed=args.gif_seed, collect_snaps=True)
+    path = gif_dir / "greedy_vs_runfromnearest.gif"
+    animate_episode(snaps, env_kwargs["arena_size"],
+                    save_path=str(path), fps=args.fps)
+    gif_paths["Greedy vs RunFromNearest (reference)"] = path
+    print(f"  {path.name}  ({len(snaps)} frames)")
+
+    # ---- Persist results.json + markdown writeup -----------------------
+    results_json_path = ckpt_path.parent / "eval_results.json"
+    with results_json_path.open("w", encoding="utf-8") as f:
+        json.dump({
+            "checkpoint":   str(ckpt_path),
+            "rollout":      ckpt_meta.get("rollout"),
+            "global_step":  ckpt_meta.get("global_step"),
+            "results":      results,
+            "acceptance":   {
+                "trained_vs_run": trained_vs_run,
+                "bar":            bar,
+                "verdict":        verdict,
+            },
+        }, f, indent=2)
+    print(f"\nResults JSON: {results_json_path}")
+
+    md_path = Path(args.results_md).resolve()
+    write_results_md(
+        out_path        = md_path,
+        ckpt_path       = ckpt_path,
+        ckpt_meta       = ckpt_meta,
+        results         = results,
+        acceptance_bar  = bar,
+        trained_vs_run  = trained_vs_run,
+        n_red           = env_kwargs["n_red"],
+        gif_paths       = {k: v.relative_to(md_path.parent.parent)
+                              if v.is_absolute() and md_path.parent.parent in v.parents
+                              else v
+                           for k, v in gif_paths.items()},
+        eval_episodes   = args.n_episodes,
+    )
+    print(f"Markdown writeup: {md_path}")
+
+
+if __name__ == "__main__":
+    main()

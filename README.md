@@ -101,9 +101,65 @@ Random-policy episode (sanity check):
 python scripts/render_demo.py
 ```
 
-Train Stage 1:
+Render Greedy heuristic blue vs Run-from-nearest red:
+```bash
+python scripts/render_demo.py --blue greedy --red run --save out/demo.gif
+```
+
+Train Stage 1 on CPU:
 ```bash
 python scripts/train_stage1.py
+```
+
+Evaluate a trained checkpoint (writes `docs/stage1_results.md`):
+```bash
+python scripts/evaluate_trained.py --checkpoint runs/stage1/<run>/best.pt
+```
+
+## Training on GPU (RunPod or similar)
+
+Stage 1 trains on CPU in ~2.5h but is faster on a single small GPU
+(RTX 3060 / T4 class) at ~30-45 min.
+
+### Setup on a fresh pod
+
+```bash
+git clone https://github.com/quialga/Multi-UAV-ISR.git
+cd Multi-UAV-ISR
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+# Verify CUDA is visible
+python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+```
+
+### Train
+
+```bash
+python scripts/train_stage1.py --device cuda --n-rollouts 1000
+```
+
+Live stdout shows per-rollout reward / catch rate / PPO diagnostics.
+TensorBoard scalars stream to `runs/stage1/<timestamp>/tb/` — point a
+local tensorboard at it via `tensorboard --logdir runs/stage1/`.
+
+### Evaluate + sync results back
+
+```bash
+python scripts/evaluate_trained.py \
+    --checkpoint runs/stage1/<timestamp>/best.pt \
+    --device cuda \
+    --n-episodes 50
+```
+
+This writes:
+- `runs/stage1/<timestamp>/eval_results.json` — full eval table
+- `runs/stage1/<timestamp>/eval_gifs/*.gif` — qualitative GIFs
+- `docs/stage1_results.md` — markdown writeup with acceptance verdict
+
+Pack everything for download:
+```bash
+tar czf stage1_artifacts.tar.gz runs/stage1/<timestamp>/ docs/stage1_results.md
 ```
 
 ## Status
