@@ -21,6 +21,9 @@ checkpoints/
 *.pt
 *.pth
 
+# Render outputs (regenerate via scripts/render_demo.py)
+out/
+
 # Misc
 .DS_Store
 Thumbs.db
