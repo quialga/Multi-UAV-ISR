@@ -141,15 +141,43 @@ pip install -r requirements.txt
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-### Train
+### Train — Stage 1 (MLP)
 
 ```bash
 python scripts/train_stage1.py --device cuda --n-rollouts 1000
 ```
 
-Live stdout shows per-rollout reward / catch rate / PPO diagnostics.
-TensorBoard scalars stream to `runs/stage1/<timestamp>/tb/` — point a
-local tensorboard at it via `tensorboard --logdir runs/stage1/`.
+Default `--policy-type mlp`.  Reproduces the Stage 1 v2 soft-pass
+baseline.
+
+### Train — Stage 2 (GNN)
+
+Same script, `--policy-type gnn` flag:
+
+```bash
+python scripts/train_stage1.py \
+    --device cuda \
+    --policy-type gnn \
+    --n-rollouts 1000
+```
+
+Optional knobs (all shown at default values): `--d-hidden 64`,
+`--n-msg-rounds 2`.  Everything else (env config, red-policy mix,
+PPO hyperparameters, `n_envs`, `rollout_steps`) is shared with the
+MLP path so the head-to-head comparison stays fair.
+
+Live stdout shows the same fields for both policies:
+per-rollout reward, catch rate, `pol / val / ent / kl / clip`
+diagnostics.  TensorBoard scalars stream to
+`runs/stage1/<timestamp>/tb/` — one directory per run,
+policy-type-agnostic.
+
+**Expected timing (Stage 2 GNN, single T4-class GPU, 1000
+rollouts):** ≈ 30-60 min.  GNN forward is heavier per step than MLP
+(2 rounds × ~50 vector ops each vs one MLP forward) but the
+message-passing tensors are small and parallelise well on GPU.
+CPU is much slower (~200 sps observed on a laptop) — GPU is
+strongly recommended.
 
 ### Evaluate + sync results back
 
@@ -160,10 +188,15 @@ python scripts/evaluate_trained.py \
     --n-episodes 50
 ```
 
-This writes:
-- `runs/stage1/<timestamp>/eval_results.json` — full eval table
-- `runs/stage1/<timestamp>/eval_gifs/*.gif` — qualitative GIFs
-- `docs/stage1_results.md` — markdown writeup with acceptance verdict
+Auto-dispatches based on the checkpoint's `policy_type`:
+- **MLP checkpoint** → writes `docs/stage1_results.md`
+- **GNN checkpoint** → writes `docs/stage2_results.md`
+- **Both** → produce `runs/stage1/<timestamp>/eval_results.json` +
+  4 GIFs under `runs/stage1/<timestamp>/eval_gifs/`
+
+Acceptance criteria per stage are documented in
+[`docs/stage1_analysis.md §6b`](docs/stage1_analysis.md) and
+[`docs/stage2_gnn_design.md §6`](docs/stage2_gnn_design.md).
 
 Pack everything for download:
 ```bash

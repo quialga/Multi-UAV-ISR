@@ -297,27 +297,67 @@ Recorded here so we don't skip them in the write-up:
 Only ablation 1 is a required part of the Stage 2 write-up; the
 others are optional depending on how much compute we spend.
 
-## 8. Implementation plan (for the next code-writing turn)
+## 8. Implementation plan + status
 
-1. **Doc first** (this file + `design.md` re-numbering) — done.
-2. **Env obs restructure:** add
-   `PursuitEnv._build_structured_obs(blue_idx)`.  Add smoke tests for
-   graph invariants (edge features negate correctly on bidirectional
-   pairs, bearing sign flips as expected).
-3. **GNN policy:** new file `isr/agents/gnn_policy.py`, ~150 lines
-   pure PyTorch.  Two type embedding MLPs, edge embedding MLPs,
-   shared message MLP, shared update MLP, actor head, critic head.
-   `get_action_and_value(obs_dict)` returns the same 4-tuple as the
-   MLP `ActorCritic` so PPO update code is unchanged.
-4. **Buffer + vec_env changes:** dict-obs support.  Buffer stores
-   per-key tensors; `iter_minibatches` yields dicts.  `vec_env` step
-   returns a dict batched over envs and agents.
-5. **Training script:** `--policy-type mlp|gnn` flag defaulting to
-   `gnn`, dispatches to the right policy constructor + obs formatter.
-6. **Smoke test:** 20 rollouts of GNN training, confirm reward
-   increases (analogous to Stage 1 v2 smoke).
-7. **Full training + eval:** 1000 rollouts on GPU + head-to-head
-   evaluation matrix (MLP vs GNN, 50 episodes/cell).
+1. **[x] Doc first** (this file + `design.md` re-numbering).
+2. **[x] Env obs restructure:** `PursuitEnv._build_structured_obs()`
+   and public `structured_observation()` accessor
+   ([`isr/env/pursuit_env.py`](../isr/env/pursuit_env.py)); five
+   graph-invariant smoke tests all passing (shapes, negation on
+   bidirectional bb edges, rb rel_pos convention, zeroed edges out
+   of caught reds, wall-distance layout).
+3. **[x] GNN policy:** [`isr/agents/gnn_policy.py`](../isr/agents/gnn_policy.py)
+   ~220 lines pure PyTorch.  Per-type input embedding MLPs, per-type
+   edge embedding MLPs, shared message MLP, shared residual update
+   MLP, decentralised actor head reading acting agent's blue node
+   embedding, CTDE critic head (sum-of-blue + concat-of-red).
+   `get_action_and_value(obs_dict, action=None)` returns
+   `(action, log_prob, entropy, value)` with shapes
+   `(B, N_blue, 2)`, `(B, N_blue)`, `(B, N_blue)`, `(B,)`.  **64k
+   params** vs MLP's 76.5k — matched-compute discipline holds.
+4. **[x] Buffer + vec_env changes:**
+   - New [`isr/train/graph_buffer.py`](../isr/train/graph_buffer.py)
+     `GraphRolloutBuffer` stores dict obs per key
+     `(T, E, n_tokens, feat_dim)`, per-agent actions/log_probs, per-env
+     values/rewards/dones.  GAE computed per env from single V trace;
+     advantages broadcast per-agent in the loss.
+   - [`isr/train/vec_env.py`](../isr/train/vec_env.py) got an
+     `obs_format="flat"|"structured"` parameter.  Structured mode's
+     reset/step return the batched graph dict + per-env reward
+     `(n_envs,)`.  Flat mode unchanged.
+   - New `ppo_update_graph` in
+     [`isr/train/ppo.py`](../isr/train/ppo.py) — same clipped
+     surrogate math as flat `ppo_update` with per-agent
+     broadcasting of advantages against the per-agent ratio.
+5. **[x] Training script:**
+   [`scripts/train_stage1.py`](../scripts/train_stage1.py) gained
+   `--policy-type {mlp,gnn}` (default mlp), `--d-hidden`,
+   `--n-msg-rounds`.  A `_run_gnn_training` helper packages the
+   full GNN loop (structured vec_env, GNNActorCritic,
+   GraphRolloutBuffer, ppo_update_graph).  `main()` dispatches
+   right after vec_env setup; MLP path unchanged.
+6. **[x] Smoke test:** 5-rollout CPU smoke run passed —
+   `Policy: GNNActorCritic d_hidden=64 rounds=2 params=64005`,
+   KL ~0.003, clip_frac ~3%, entropy stable ~2.85, no crashes.
+   Full evaluation pipeline (load → dispatch → eval matrix → GIFs
+   → markdown writeup) also verified against the smoke checkpoint.
+7. **[ ] Full training + eval:** 1000-rollout GNN training on GPU
+   + head-to-head evaluation matrix (v2 MLP vs GNN, 50 episodes/
+   cell, same seeds).  Auto-writes `docs/stage2_results.md`.  This
+   is the user's turn on the pod; see README §
+   *"Training on GPU (RunPod or similar)"* for the exact commands.
+
+Two subsequent cleanups already landed as part of the
+implementation:
+- [`isr/agents/policy_loader.py`](../isr/agents/policy_loader.py)
+  now auto-dispatches to `GNNActorCritic` or `ActorCritic` based on
+  the checkpoint's saved `policy_type`; `TrainedBlueAgent` detects
+  the GNN case via `isinstance` and pulls graph obs from
+  `env.structured_observation()`.
+- [`scripts/evaluate_trained.py`](../scripts/evaluate_trained.py)'s
+  `--results-md` default is now policy-type-aware: MLP checkpoints
+  overwrite `docs/stage1_results.md`, GNN checkpoints overwrite
+  `docs/stage2_results.md`.  Explicit override still supported.
 
 ## 9. Expected outcomes
 
