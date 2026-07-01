@@ -161,6 +161,21 @@ class PursuitEnv(ParallelEnv):
             for a in self.possible_agents
         }
 
+        # ---- Stage 2 graph dims + fixed edge index tables ------------
+        # The structured obs used by the GNN policy is not per-agent —
+        # the graph is the same at each timestep; only the "acting
+        # agent" interpretation differs.  We expose the graph as a
+        # dict of arrays via ``structured_observation()``.  See
+        # ``_build_structured_obs`` docstring for the layout.
+        self.blue_feat_dim: int = 8
+        self.red_feat_dim:  int = 1
+        self.edge_feat_dim: int = 7
+        # Fixed edge indices (blue-blue bidirectional, red-blue directed).
+        self.bb_edge_src, self.bb_edge_dst = self._build_bb_edge_indices()
+        self.rb_edge_src, self.rb_edge_dst = self._build_rb_edge_indices()
+        self.n_bb_edges = len(self.bb_edge_src)   # N_blue * (N_blue - 1)
+        self.n_rb_edges = len(self.rb_edge_src)   # N_red * N_blue
+
         # Mutable state — initialised in reset().
         self._blue_pos:   Optional[np.ndarray] = None
         self._blue_vel:   Optional[np.ndarray] = None
@@ -521,3 +536,159 @@ class PursuitEnv(ParallelEnv):
             walls,            # 4
             time_remaining,   # 1
         ]).astype(np.float32)
+
+    # ------------------------------------------------------------------ #
+    #  Structured observation (v3 / Stage 2 — for the GNN policy)         #
+    # ------------------------------------------------------------------ #
+
+    def _build_bb_edge_indices(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Fixed directed edges between every pair of distinct blue nodes.
+        Order: for src in 0..N-1, for dst in 0..N-1 if dst != src.
+        For N_blue = 3 -> src = [0,0,1,1,2,2], dst = [1,2,0,2,0,1].
+        """
+        src, dst = [], []
+        for s in range(self.n_blue):
+            for d in range(self.n_blue):
+                if s != d:
+                    src.append(s); dst.append(d)
+        return (np.asarray(src, dtype=np.int64),
+                np.asarray(dst, dtype=np.int64))
+
+    def _build_rb_edge_indices(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Fixed directed edges from every red to every blue.
+        Order: for src in 0..N_red-1, for dst in 0..N_blue-1.
+        For N_red=2, N_blue=3 -> src=[0,0,0,1,1,1], dst=[0,1,2,0,1,2].
+        """
+        src, dst = [], []
+        for r in range(self.n_red):
+            for b in range(self.n_blue):
+                src.append(r); dst.append(b)
+        return (np.asarray(src, dtype=np.int64),
+                np.asarray(dst, dtype=np.int64))
+
+    def _edge_features_for(
+        self,
+        src_pos:  np.ndarray,   # (E, 2) sender positions
+        src_vel:  np.ndarray,   # (E, 2) sender velocities
+        dst_pos:  np.ndarray,   # (E, 2) receiver positions
+        dst_vel:  np.ndarray,   # (E, 2) receiver velocities
+    ) -> np.ndarray:
+        """
+        Compute the shared 7-D edge feature layout
+        ``[rel_pos_xy (2), rel_vel_xy (2), range (1), bearing_cs (2)]``
+        for an arbitrary set of directed edges.
+
+        The bearing is defined in the **sender's** frame (angle between
+        sender_vel and rel_pos = dst - src), following the design in
+        docs/stage2_gnn_design.md §2.2.  All positional / velocity
+        features are normalised the same way as in the flat obs
+        (positions by ``arena_size``, velocities by ``BLUE_UAV.v_max``).
+        """
+        L = self.arena_size
+        v_max = BLUE_UAV.v_max
+        rel_pos = dst_pos - src_pos                           # (E, 2)
+        rel_vel = dst_vel - src_vel                           # (E, 2)
+        ranges  = np.linalg.norm(rel_pos, axis=1)             # (E,)
+        # Bearing in sender frame — reuse the same helper.
+        bearing = np.zeros((rel_pos.shape[0], 2), dtype=np.float32)
+        for i in range(rel_pos.shape[0]):
+            bearing[i] = self._bearing_features(
+                src_vel[i], rel_pos[i:i + 1], ranges[i:i + 1],
+            )[0]
+        return np.concatenate([
+            (rel_pos / L).astype(np.float32),
+            (rel_vel / v_max).astype(np.float32),
+            (ranges / L).astype(np.float32).reshape(-1, 1),
+            bearing,
+        ], axis=1).astype(np.float32)
+
+    def _build_structured_obs(self) -> Dict[str, np.ndarray]:
+        """
+        Build the graph-structured observation for the GNN policy.
+
+        Layout:
+        - ``blue_features``    : (N_blue, 8)  intrinsic blue node feats
+          per row = [vel_xy_norm (2), speed_norm (1), wall_dists (4),
+                     time_remaining (1)]
+        - ``red_features``     : (N_red,  1)  intrinsic red node feats
+          per row = [active_flag (1)]
+        - ``bb_edge_features`` : (n_bb, 7)    blue-blue edge feats
+          ordered per self.bb_edge_src / self.bb_edge_dst
+        - ``rb_edge_features`` : (n_rb, 7)    red-blue edge feats
+          ordered per self.rb_edge_src / self.rb_edge_dst
+
+        The graph *structure* (edge index tables) is fixed at env
+        construction time and exposed as ``self.{bb,rb}_edge_{src,dst}``
+        — no need to include it in every obs.
+        """
+        L = self.arena_size
+        v_max = BLUE_UAV.v_max
+        t = self._t
+
+        # ---- Blue node features (N_blue, 8) --------------------------
+        blue_vel_n = (self._blue_vel / v_max).astype(np.float32)       # (N_blue, 2)
+        blue_speed = np.linalg.norm(self._blue_vel, axis=1) / v_max    # (N_blue,)
+        wall_dists = np.stack([
+            self._blue_pos[:, 0] / L,
+            (L - self._blue_pos[:, 0]) / L,
+            self._blue_pos[:, 1] / L,
+            (L - self._blue_pos[:, 1]) / L,
+        ], axis=1).astype(np.float32)                                  # (N_blue, 4)
+        time_col = np.full(
+            (self.n_blue, 1),
+            (self.max_steps - t) / self.max_steps,
+            dtype=np.float32,
+        )                                                              # (N_blue, 1)
+        blue_features = np.concatenate([
+            blue_vel_n,                                                # 2
+            blue_speed.reshape(-1, 1).astype(np.float32),              # 1
+            wall_dists,                                                # 4
+            time_col,                                                  # 1
+        ], axis=1)                                                     # (N_blue, 8)
+
+        # ---- Red node features (N_red, 1) ----------------------------
+        red_features = self._red_active.astype(np.float32).reshape(-1, 1)
+
+        # ---- Blue-Blue edge features (n_bb, 7) -----------------------
+        bb_src_pos = self._blue_pos[self.bb_edge_src]
+        bb_src_vel = self._blue_vel[self.bb_edge_src]
+        bb_dst_pos = self._blue_pos[self.bb_edge_dst]
+        bb_dst_vel = self._blue_vel[self.bb_edge_dst]
+        bb_edge_features = self._edge_features_for(
+            bb_src_pos, bb_src_vel, bb_dst_pos, bb_dst_vel,
+        )
+
+        # ---- Red-Blue edge features (n_rb, 7) ------------------------
+        rb_src_pos = self._red_pos[self.rb_edge_src]
+        rb_src_vel = self._red_vel[self.rb_edge_src]
+        rb_dst_pos = self._blue_pos[self.rb_edge_dst]
+        rb_dst_vel = self._blue_vel[self.rb_edge_dst]
+        rb_edge_features = self._edge_features_for(
+            rb_src_pos, rb_src_vel, rb_dst_pos, rb_dst_vel,
+        )
+        # Zero edge features for edges to/from caught reds — the network
+        # can still see active_flag on the red node.
+        for i, r in enumerate(self.rb_edge_src):
+            if not self._red_active[r]:
+                rb_edge_features[i] = 0.0
+
+        return {
+            "blue_features":     blue_features,
+            "red_features":      red_features,
+            "bb_edge_features":  bb_edge_features,
+            "rb_edge_features":  rb_edge_features,
+        }
+
+    def structured_observation(self) -> Dict[str, np.ndarray]:
+        """
+        Public accessor for the Stage 2 graph-structured obs.
+
+        Unlike the flat per-agent ``observation_space`` used by the
+        PettingZoo Gym API, this returns one dict describing the whole
+        graph at the current timestep.  The GNN policy's forward pass
+        consumes this once and produces action distributions for every
+        blue node simultaneously.
+        """
+        return self._build_structured_obs()

@@ -262,6 +262,121 @@ def test_positions_stay_inside_arena():
                 f"{arr_name} escaped arena at step {snap['t']}: {arr}"
 
 
+# ---------------------------------------------------------------------------
+# Stage 2 structured / graph observation
+# ---------------------------------------------------------------------------
+
+def test_structured_obs_shapes():
+    env = PursuitEnv(n_blue=3, n_red=2, seed=0)
+    env.reset(seed=0)
+    obs = env.structured_observation()
+    assert set(obs.keys()) == {"blue_features", "red_features",
+                               "bb_edge_features", "rb_edge_features"}
+    assert obs["blue_features"].shape    == (3, 8)
+    assert obs["red_features"].shape     == (2, 1)
+    assert obs["bb_edge_features"].shape == (6, 7)   # 3 * (3 - 1)
+    assert obs["rb_edge_features"].shape == (6, 7)   # 2 * 3
+    # Dims consistent with env-exposed constants
+    assert env.blue_feat_dim == obs["blue_features"].shape[1]
+    assert env.red_feat_dim  == obs["red_features"].shape[1]
+    assert env.edge_feat_dim == obs["bb_edge_features"].shape[1]
+    assert env.n_bb_edges    == obs["bb_edge_features"].shape[0]
+    assert env.n_rb_edges    == obs["rb_edge_features"].shape[0]
+
+
+def test_bb_edges_are_bidirectional_with_negated_rel_pos():
+    """
+    For every blue-blue pair (i, j), the directed edge i->j and its
+    reverse j->i must carry rel_pos with opposite sign and identical
+    range.  Bearing_cs will *differ* (it's in sender frame) so we
+    do not assert on it here.
+    """
+    env = PursuitEnv(n_blue=3, n_red=2, seed=1)
+    env.reset(seed=1)
+    obs = env.structured_observation()
+    bb_src, bb_dst = env.bb_edge_src, env.bb_edge_dst
+    bb_feats = obs["bb_edge_features"]      # (6, 7)
+
+    for a in range(len(bb_src)):
+        s_a, d_a = int(bb_src[a]), int(bb_dst[a])
+        # find the reverse-direction edge
+        rev = None
+        for b in range(len(bb_src)):
+            if int(bb_src[b]) == d_a and int(bb_dst[b]) == s_a:
+                rev = b
+                break
+        assert rev is not None
+        rel_pos_a = bb_feats[a,   0:2]
+        rel_pos_b = bb_feats[rev, 0:2]
+        assert np.allclose(rel_pos_a, -rel_pos_b, atol=1e-6), \
+            f"edge {a} ({s_a}->{d_a}) rel_pos should negate edge {rev}"
+        range_a = bb_feats[a,   4]
+        range_b = bb_feats[rev, 4]
+        assert np.isclose(range_a, range_b, atol=1e-6), \
+            "range must be symmetric across direction"
+
+
+def test_rb_edges_are_directed_and_carry_correct_rel_pos():
+    """rb edge features go red -> blue: rel_pos = blue_pos - red_pos."""
+    env = PursuitEnv(n_blue=3, n_red=2, red_policy=stationary_red, seed=2)
+    env.reset(seed=2)
+    obs = env.structured_observation()
+    rb_feats = obs["rb_edge_features"]
+    L = env.arena_size
+    for i in range(len(env.rb_edge_src)):
+        r = int(env.rb_edge_src[i])
+        b = int(env.rb_edge_dst[i])
+        expected_rel_pos_n = (env._blue_pos[b] - env._red_pos[r]) / L
+        got = rb_feats[i, 0:2]
+        assert np.allclose(got, expected_rel_pos_n, atol=1e-6), \
+            f"rb edge {i} (r={r} -> b={b}) rel_pos mismatch"
+
+
+def test_rb_edges_zeroed_for_caught_reds():
+    """
+    After a red is caught, all rb edges *from* that red must be zero
+    (the network can still see active_flag on the node itself).
+    """
+    env = PursuitEnv(n_blue=1, n_red=2, capture_radius=5.0,
+                     red_policy=stationary_red, seed=3)
+    env.reset(seed=3)
+    # Force positions so red_0 gets caught, red_1 stays alive far away.
+    env._blue_pos[0] = np.array([50.0, 50.0], dtype=np.float32)
+    env._red_pos[0]  = np.array([52.0, 52.0], dtype=np.float32)
+    env._red_pos[1]  = np.array([90.0, 90.0], dtype=np.float32)
+    # step to trigger capture of red_0 only
+    env.step({"blue_0": np.zeros(2, dtype=np.float32)})
+    assert not env._red_active[0]      # red_0 caught
+    assert env._red_active[1]           # red_1 alive
+    obs = env.structured_observation()
+    rb_feats = obs["rb_edge_features"]
+    for i in range(len(env.rb_edge_src)):
+        r = int(env.rb_edge_src[i])
+        if not env._red_active[r]:
+            assert np.allclose(rb_feats[i], 0.0), \
+                f"rb edge {i} from caught red {r} should be zeroed"
+    # red_1's edges must be non-zero (assuming non-degenerate geometry)
+    for i in range(len(env.rb_edge_src)):
+        r = int(env.rb_edge_src[i])
+        if r == 1:
+            assert not np.allclose(rb_feats[i], 0.0), \
+                f"rb edge {i} from alive red {r} should carry data"
+
+
+def test_blue_node_wall_distances():
+    """wall_distances at cols 3..7 should reproduce (x, L-x, y, L-y)/L."""
+    env = PursuitEnv(n_blue=3, n_red=2, seed=4)
+    env.reset(seed=4)
+    env._blue_pos[0] = np.array([5.0, 5.0], dtype=np.float32)   # near lower-left
+    obs = env.structured_observation()
+    walls = obs["blue_features"][0, 3:7]
+    L = env.arena_size
+    expected = np.array([5.0 / L, (L - 5.0) / L, 5.0 / L, (L - 5.0) / L],
+                        dtype=np.float32)
+    assert np.allclose(walls, expected, atol=1e-6), \
+        f"wall_distances {walls} should equal {expected}"
+
+
 def test_velocities_respect_class_cap():
     """Each entity's per-axis velocity must respect the class v_max."""
     env = PursuitEnv(seed=0)
