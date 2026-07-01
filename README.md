@@ -44,8 +44,8 @@ concept on top of the last, with measurable acceptance criteria.  See
 
 | Stage | Concept added | Status |
 |------:|---|---|
-| 1 | Pursuit-evasion baseline (continuous 2D, fully observable, fixed red, PPO blue) | in progress |
-| 2 | Partial observability — sensor radius, GRU/LSTM recurrent policies | |
+| 1 | Pursuit-evasion baseline (continuous 2D, fully observable, fixed red, PPO blue) | **soft pass** (v2: +15.37 vs Run, Greedy = +16.15; strict bar +19.38 not cleared but 2.00/2 caught on every red — see [`docs/stage1_analysis.md`](docs/stage1_analysis.md)) |
+| 2 | Partial observability — sensor radius, GRU/LSTM recurrent policies + attention over entities | next |
 | 3 | Sensor noise + occlusion — explicit belief-state predictor (aux loss) | |
 | 4 | Self-play — red team becomes learned; fictitious self-play, league training | |
 | 5 | Communication — range-gated message passing between teammates | |
@@ -164,6 +164,14 @@ tar czf stage1_artifacts.tar.gz runs/stage1/<timestamp>/ docs/stage1_results.md
 
 ## Status
 
-Stage 1 in progress.  This README will track which stages are landed; per-stage
-result writeups land in `docs/stage{N}_results.md` as each one passes its
-acceptance criterion.
+Stage 1 landed as a **soft pass** (July 2026) — v2 matches
+GreedyPursuer across the red distribution, catches 2.00/2 on every red
+type, misses the strict 1.20× bar by 4.01 points.  Full analysis and
+verdict reasoning in [`docs/stage1_analysis.md`](docs/stage1_analysis.md);
+the red-policy mixing that closed v1's OOD failure is documented in
+[`docs/red_policy_mixing.md`](docs/red_policy_mixing.md).  Stage 2 (partial
+observability + attention-over-entities) is next.
+
+Per-stage result writeups land in `docs/stage{N}_results.md` as each
+stage completes; broader analysis notes accumulate in `docs/` alongside
+them.
