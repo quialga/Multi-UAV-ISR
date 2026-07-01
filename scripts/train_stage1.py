@@ -48,8 +48,11 @@ from isr.agents.heuristics import (
     run_from_nearest_uav, stationary_red,
 )
 from isr.train.buffer import RolloutBuffer
-from isr.train.ppo    import ppo_update
+from isr.train.ppo    import ppo_update, ppo_update_graph
 from isr.train.vec_env import VectorPursuitEnv
+# Stage 2 GNN path
+from isr.agents.gnn_policy import GNNActorCritic
+from isr.train.graph_buffer import GraphRolloutBuffer
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +96,15 @@ def _parse_args() -> argparse.Namespace:
                         "stationary / random / run.  Set to 'run' to reproduce "
                         "the legacy v1 training distribution.  Default: uniform "
                         "mix over all three (v2 default).")
+    # Stage 2: architecture selection
+    p.add_argument("--policy-type", choices=("mlp", "gnn"), default="mlp",
+                   help="mlp = Stage 1 v2 flat-obs MLP (default; keep for "
+                        "backward-compat and head-to-head).  gnn = Stage 2 "
+                        "graph policy over the typed entity graph.")
+    p.add_argument("--d-hidden", type=int, default=64,
+                   help="Node embedding dimension for the GNN policy.")
+    p.add_argument("--n-msg-rounds", type=int, default=2,
+                   help="Rounds of message passing in the GNN policy.")
     # Run management
     p.add_argument("--seed",           type=int,   default=0)
     p.add_argument("--device",         default="cpu",
@@ -184,6 +196,169 @@ def evaluate_heuristic_baseline(
 # Main training loop
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Stage 2 GNN training path
+# ---------------------------------------------------------------------------
+
+def _dict_to_device(obs_dict, device):
+    return {k: torch.from_numpy(v).float().to(device) for k, v in obs_dict.items()}
+
+
+def _run_gnn_training(
+    args, env_kwargs, red_policy_mix, run_dir, writer, log, device,
+    args_dict_saved,
+) -> None:
+    """
+    Stage 2 training loop with the GNN policy + CTDE critic +
+    structured (dict) observations.  Mirrors the structure of the MLP
+    path but uses:
+    - VectorPursuitEnv with obs_format="structured"
+    - GNNActorCritic
+    - GraphRolloutBuffer
+    - ppo_update_graph
+    Periodic eval against heuristic red baselines is intentionally
+    minimal here — full head-to-head evaluation is delegated to
+    scripts/evaluate_trained.py after training completes.
+    """
+    vec_env = VectorPursuitEnv(
+        n_envs              = args.n_envs,
+        env_kwargs          = env_kwargs,
+        base_seed           = args.seed,
+        episode_buffer_size = 256,
+        red_policy_mix      = red_policy_mix,
+        obs_format          = "structured",
+    )
+    n_agents   = vec_env.n_agents
+    action_dim = vec_env.action_dim
+
+    policy = GNNActorCritic(
+        n_blue        = vec_env.n_blue,
+        n_red         = vec_env.n_red,
+        blue_feat_dim = vec_env.blue_feat_dim,
+        red_feat_dim  = vec_env.red_feat_dim,
+        edge_feat_dim = vec_env.edge_feat_dim,
+        action_dim    = action_dim,
+        d_hidden      = args.d_hidden,
+        n_msg_rounds  = args.n_msg_rounds,
+        init_log_std  = STAGE1_DEFAULTS["init_log_std"],
+    ).to(device)
+    optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
+    n_params = sum(p.numel() for p in policy.parameters())
+    log(f"Policy: GNNActorCritic d_hidden={args.d_hidden} "
+        f"rounds={args.n_msg_rounds} params={n_params}")
+
+    buffer = GraphRolloutBuffer(
+        rollout_steps = args.rollout_steps,
+        n_envs        = args.n_envs,
+        n_agents      = n_agents,
+        action_dim    = action_dim,
+        obs_feature_dims={
+            "blue_features":    vec_env.blue_feat_dim,
+            "red_features":     vec_env.red_feat_dim,
+            "bb_edge_features": vec_env.edge_feat_dim,
+            "rb_edge_features": vec_env.edge_feat_dim,
+        },
+        obs_token_counts={
+            "blue_features":    vec_env.n_blue,
+            "red_features":     vec_env.n_red,
+            "bb_edge_features": vec_env.n_bb_edges,
+            "rb_edge_features": vec_env.n_rb_edges,
+        },
+        device        = device,
+    )
+
+    log(f"\nStarting GNN training: {args.n_rollouts} rollouts x "
+        f"{args.rollout_steps} steps x {args.n_envs} envs x {n_agents} agents")
+
+    obs_np = vec_env.reset(seed=args.seed)
+    t_start = time.time()
+    global_step = 0
+
+    for rollout in range(args.n_rollouts):
+        buffer.reset()
+
+        for step in range(args.rollout_steps):
+            obs_t = _dict_to_device(obs_np, device)
+            with torch.no_grad():
+                action_t, log_p_t, _, value_t = policy.get_action_and_value(obs_t)
+            # action_t: (E, N_blue, action_dim); log_p_t: (E, N_blue); value_t: (E,)
+            action_np = action_t.cpu().numpy().astype(np.float32)
+            next_obs_np, reward_np, done_np, _ = vec_env.step(action_np)
+            # In structured mode, reward_np and done_np are shape (n_envs,).
+            buffer.add(
+                obs       = obs_t,
+                actions   = action_t,
+                log_probs = log_p_t,
+                values    = value_t,
+                rewards   = torch.from_numpy(reward_np).to(device),
+                dones     = torch.from_numpy(done_np).to(device),
+            )
+            obs_np = next_obs_np
+            global_step += args.n_envs
+
+        with torch.no_grad():
+            last_obs_t = _dict_to_device(obs_np, device)
+            _, _, _, last_value = policy.get_action_and_value(last_obs_t)
+        buffer.compute_gae(last_value, args.gamma, args.gae_lambda)
+
+        update_metrics = ppo_update_graph(
+            policy        = policy,
+            optimizer     = optimizer,
+            buffer        = buffer,
+            clip_eps      = args.clip_eps,
+            ent_coef      = args.ent_coef,
+            vf_coef       = args.vf_coef,
+            max_grad_norm = args.max_grad_norm,
+            n_epochs      = args.n_epochs,
+            mb_size       = args.mb_size,
+            value_clip    = STAGE1_DEFAULTS["value_clip"],
+            normalize_adv = STAGE1_DEFAULTS["normalize_adv"],
+        )
+
+        ep_stats = vec_env.recent_episode_stats()
+        if (rollout + 1) % args.log_interval == 0:
+            elapsed = time.time() - t_start
+            sps = global_step / max(elapsed, 1e-6)
+            log(
+                f"[rollout {rollout+1:>4d}/{args.n_rollouts}]  "
+                f"steps={global_step:>9d}  sps={sps:>6.0f}  "
+                f"epR={ep_stats['mean_return']:+7.2f}+-{ep_stats['std_return']:.2f}  "
+                f"caught={ep_stats['mean_caught']:.2f}/{args.n_red}  "
+                f"pol={update_metrics['policy_loss']:+.4f}  "
+                f"val={update_metrics['value_loss']:.4f}  "
+                f"ent={update_metrics['entropy']:.3f}  "
+                f"kl={update_metrics['approx_kl']:.4f}  "
+                f"clip={update_metrics['clip_frac']:.3f}"
+            )
+        writer.add_scalar("rollout/mean_return", ep_stats["mean_return"], global_step)
+        writer.add_scalar("rollout/mean_caught", ep_stats["mean_caught"], global_step)
+        writer.add_scalar("ppo/policy_loss", update_metrics["policy_loss"], global_step)
+        writer.add_scalar("ppo/value_loss",  update_metrics["value_loss"],  global_step)
+        writer.add_scalar("ppo/entropy",     update_metrics["entropy"],     global_step)
+        writer.add_scalar("ppo/approx_kl",   update_metrics["approx_kl"],   global_step)
+        writer.add_scalar("ppo/clip_frac",   update_metrics["clip_frac"],   global_step)
+
+        if (rollout + 1) % args.save_interval == 0:
+            ckpt_path = run_dir / f"checkpoint_{rollout+1:05d}.pt"
+            torch.save({
+                "policy_state": policy.state_dict(),
+                "rollout":      rollout + 1,
+                "global_step":  global_step,
+                "args":         args_dict_saved,
+            }, ckpt_path)
+
+    torch.save({
+        "policy_state": policy.state_dict(),
+        "rollout":      args.n_rollouts,
+        "global_step":  global_step,
+        "args":         args_dict_saved,
+    }, run_dir / "final.pt")
+
+    elapsed = time.time() - t_start
+    log(f"\nGNN training done.  Elapsed: {elapsed/60:.1f} min")
+    log(f"Final checkpoints under {run_dir}")
+
+
 def main() -> None:
     args = _parse_args()
     torch.manual_seed(args.seed)
@@ -242,6 +417,14 @@ def main() -> None:
     # policy_loader can reconstruct the correct network without
     # duplicating the obs-layout formula.
     args_dict_saved = {**vars(args), "obs_dim": obs_dim}
+
+    # ---- Dispatch to GNN training path if requested --------------------
+    if args.policy_type == "gnn":
+        _run_gnn_training(
+            args, env_kwargs, red_policy_mix, run_dir, writer, log, device,
+            args_dict_saved,
+        )
+        return
 
     # ---- Policy + optimiser --------------------------------------------
     policy = ActorCritic(

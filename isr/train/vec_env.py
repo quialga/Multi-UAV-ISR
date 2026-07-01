@@ -59,6 +59,7 @@ class VectorPursuitEnv:
         base_seed:           int = 0,
         episode_buffer_size: int = 128,
         red_policy_mix:      Optional[Sequence[Tuple[str, float]]] = None,
+        obs_format:          str = "flat",
     ) -> None:
         """
         red_policy_mix: optional list of (name, weight) tuples specifying
@@ -100,6 +101,12 @@ class VectorPursuitEnv:
             self._red_policy_names = names
             self._red_policy_probs = weights / total
 
+        if obs_format not in ("flat", "structured"):
+            raise ValueError(
+                f"obs_format must be 'flat' or 'structured', got {obs_format!r}"
+            )
+        self.obs_format = obs_format
+
         e0 = self.envs[0]
         self.n_agents   = e0.n_blue
         self.action_dim = 2
@@ -107,6 +114,14 @@ class VectorPursuitEnv:
         self.possible_agents = list(e0.possible_agents)
         self.arena_size = e0.arena_size
         self.max_steps  = e0.max_steps
+        # Graph-obs sizing, exposed for GraphRolloutBuffer construction.
+        self.blue_feat_dim = e0.blue_feat_dim
+        self.red_feat_dim  = e0.red_feat_dim
+        self.edge_feat_dim = e0.edge_feat_dim
+        self.n_bb_edges    = e0.n_bb_edges
+        self.n_rb_edges    = e0.n_rb_edges
+        self.n_blue        = e0.n_blue
+        self.n_red         = e0.n_red
 
         # Per-env episode-tracking state (running totals; rotated on done).
         self._ep_return = np.zeros(self.n_envs, dtype=np.float32)
@@ -152,45 +167,96 @@ class VectorPursuitEnv:
     #  Reset / step                                                        #
     # ------------------------------------------------------------------ #
 
-    def reset(self, seed: Optional[int] = None) -> np.ndarray:
+    def _empty_structured_batch(self) -> Dict[str, np.ndarray]:
+        """Pre-allocate an empty batched dict for structured obs mode."""
+        return {
+            "blue_features":     np.zeros((self.n_envs, self.n_blue,
+                                           self.blue_feat_dim),
+                                          dtype=np.float32),
+            "red_features":      np.zeros((self.n_envs, self.n_red,
+                                           self.red_feat_dim),
+                                          dtype=np.float32),
+            "bb_edge_features":  np.zeros((self.n_envs, self.n_bb_edges,
+                                           self.edge_feat_dim),
+                                          dtype=np.float32),
+            "rb_edge_features":  np.zeros((self.n_envs, self.n_rb_edges,
+                                           self.edge_feat_dim),
+                                          dtype=np.float32),
+        }
+
+    def _fill_structured_row(
+        self,
+        batch: Dict[str, np.ndarray],
+        idx:   int,
+        env:   PursuitEnv,
+    ) -> None:
+        s = env.structured_observation()
+        for k, arr in s.items():
+            batch[k][idx] = arr
+
+    def reset(self, seed: Optional[int] = None):
         """
-        Reset every env.  Returns obs shaped (n_envs, n_agents, obs_dim).
+        Reset every env.  Return format depends on ``self.obs_format``:
+
+        - "flat" (default): obs is np.ndarray shaped
+          ``(n_envs, n_agents, obs_dim)``.
+        - "structured": obs is a dict of arrays, each shaped
+          ``(n_envs, n_tokens, feat_dim)`` for the GNN policy.
 
         If ``seed`` is given, re-seeds with base ``seed`` and per-env
         offsets — used at the very start of training for full
         determinism.
         """
-        obs_batch = np.zeros(
-            (self.n_envs, self.n_agents, self.obs_dim), dtype=np.float32
-        )
+        if self.obs_format == "flat":
+            obs_batch = np.zeros(
+                (self.n_envs, self.n_agents, self.obs_dim), dtype=np.float32
+            )
+        else:
+            obs_batch = self._empty_structured_batch()
+
         for i, env in enumerate(self.envs):
             self._resample_red_policy(env)
             s = None if seed is None else int(seed + i)
             obs_dict, _ = env.reset(seed=s)
-            for j, name in enumerate(self.possible_agents):
-                obs_batch[i, j] = obs_dict[name]
+            if self.obs_format == "flat":
+                for j, name in enumerate(self.possible_agents):
+                    obs_batch[i, j] = obs_dict[name]
+            else:
+                self._fill_structured_row(obs_batch, i, env)
+
         self._ep_return[:] = 0.0
         self._ep_length[:] = 0
         return obs_batch
 
-    def step(
-        self,
-        actions: np.ndarray,    # (n_envs, n_agents, action_dim)
-    ) -> Tuple[
-        np.ndarray,  # obs   (n_envs, n_agents, obs_dim)
-        np.ndarray,  # rewards (n_envs, n_agents) — per-agent (= shared team r)
-        np.ndarray,  # dones (n_envs,) — episode done flag (term OR trunc)
-        List[Dict],  # per-env info dict (raw — first agent's view is fine)
-    ]:
+    def step(self, actions: np.ndarray):
+        """
+        Step every env.  Return format depends on ``self.obs_format``:
+
+        - "flat":
+            obs:     np.ndarray (n_envs, n_agents, obs_dim)
+            rewards: np.ndarray (n_envs, n_agents) — per-agent = team r
+            dones:   np.ndarray (n_envs,)
+            infos:   list[dict]
+        - "structured":
+            obs:     dict of arrays for the GNN policy
+            rewards: np.ndarray (n_envs,) — team reward per env
+            dones:   np.ndarray (n_envs,)
+            infos:   list[dict]
+        """
         assert actions.shape == (self.n_envs, self.n_agents, self.action_dim), \
             f"actions shape {actions.shape} != " \
             f"{(self.n_envs, self.n_agents, self.action_dim)}"
 
-        obs_batch = np.zeros(
-            (self.n_envs, self.n_agents, self.obs_dim), dtype=np.float32
-        )
-        reward_batch = np.zeros((self.n_envs, self.n_agents), dtype=np.float32)
-        done_batch   = np.zeros(self.n_envs, dtype=np.float32)
+        if self.obs_format == "flat":
+            obs_batch = np.zeros(
+                (self.n_envs, self.n_agents, self.obs_dim), dtype=np.float32
+            )
+            reward_batch = np.zeros((self.n_envs, self.n_agents), dtype=np.float32)
+        else:
+            obs_batch = self._empty_structured_batch()
+            reward_batch = np.zeros(self.n_envs, dtype=np.float32)
+
+        done_batch: np.ndarray = np.zeros(self.n_envs, dtype=np.float32)
         infos: List[Dict] = []
 
         for i, env in enumerate(self.envs):
@@ -209,8 +275,6 @@ class VectorPursuitEnv:
             self._ep_length[i] += 1
 
             if done:
-                # Capture the final state's "caught" count for logging
-                # before we reset.
                 snap = env.state_snapshot()
                 n_caught = int((~snap["red_active"]).sum())
                 self.episode_returns.append(float(self._ep_return[i]))
@@ -219,15 +283,19 @@ class VectorPursuitEnv:
                 self._ep_return[i] = 0.0
                 self._ep_length[i] = 0
 
-                # Auto-reset.  Resample red policy first (no-op if
-                # mixing is disabled), then let the env's internal RNG
-                # advance naturally on the fresh episode.
+                # Auto-reset with fresh red policy.
                 self._resample_red_policy(env)
                 obs_d, _ = env.reset()
 
-            for j, name in enumerate(self.possible_agents):
-                obs_batch[i, j]    = obs_d[name]
-                reward_batch[i, j] = float(rew_d[name])
+            # Reward: same shared value from any agent.
+            if self.obs_format == "flat":
+                for j, name in enumerate(self.possible_agents):
+                    obs_batch[i, j]    = obs_d[name]
+                    reward_batch[i, j] = float(rew_d[name])
+            else:
+                self._fill_structured_row(obs_batch, i, env)
+                reward_batch[i] = float(rew_d[first])
+
             done_batch[i] = 1.0 if done else 0.0
             infos.append(info_d)
 
