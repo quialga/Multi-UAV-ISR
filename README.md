@@ -44,13 +44,21 @@ concept on top of the last, with measurable acceptance criteria.  See
 
 | Stage | Concept added | Status |
 |------:|---|---|
-| 1 | Pursuit-evasion baseline (continuous 2D, fully observable, fixed red, PPO blue) | **soft pass** (v2: +15.37 vs Run, Greedy = +16.15; strict bar +19.38 not cleared but 2.00/2 caught on every red — see [`docs/stage1_analysis.md`](docs/stage1_analysis.md)) |
-| 2 | Partial observability — sensor radius, GRU/LSTM recurrent policies + attention over entities | next |
-| 3 | Sensor noise + occlusion — explicit belief-state predictor (aux loss) | |
-| 4 | Self-play — red team becomes learned; fictitious self-play, league training | |
-| 5 | Communication — range-gated message passing between teammates | |
-| 6 | Dynamic objectives — moving / appearing / re-prioritised targets | |
-| 7 | Adversarial robustness evaluation — exploitability metrics, held-out opponents | |
+| 1 | Pursuit-evasion baseline (continuous 2D, fully observable, fixed red, MLP shared policy) | **soft pass** (v2: +15.37 vs Run, Greedy = +16.15; strict bar +19.38 not cleared but 2.00/2 caught on every red — see [`docs/stage1_analysis.md`](docs/stage1_analysis.md)) |
+| 2 | **Structured architecture — GNN over entities + CTDE critic** (same env, MLP → GNN as sole variable; falsification test of the Stage 1 "architectural ceiling" verdict) | **next** — spec: [`docs/stage2_gnn_design.md`](docs/stage2_gnn_design.md) |
+| 3 | Partial observability — sensor radius, GRU on top of the Stage 2 GNN | |
+| 4 | Sensor noise + occlusion — explicit belief-state predictor (aux loss) | |
+| 5 | Self-play — red team becomes learned; fictitious self-play, league training | |
+| 6 | Communication — range-gated message passing between teammates | |
+| 7 | Dynamic objectives — moving / appearing / re-prioritised targets | |
+| 8 | Adversarial robustness evaluation — exploitability metrics, held-out opponents | |
+
+Curriculum resequenced from 7 stages to 8 in July 2026 to isolate
+architecture as a standalone Stage 2 variable *before* introducing
+partial observability (previously Stage 2, now Stage 3).  The change
+was motivated by the Stage 1 v2 soft-pass verdict — see
+[`docs/stage1_analysis.md §6b`](docs/stage1_analysis.md) for the
+rationale.
 
 Each stage produces a self-contained mini-result and a reusable training
 artifact.

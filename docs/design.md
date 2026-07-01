@@ -38,13 +38,23 @@ Each stage has:
 
 | Stage | Concept | Env mechanic | Acceptance |
 |---:|---|---|---|
-| 1 | Actor-critic on a continuous-action multi-agent task; vectorised rollouts | Pursuit-evasion, full observability, fixed-policy red | Trained blue beats GreedyPursuer baseline by ≥20% mean episode reward |
-| 2 | POMDP + recurrent policies | Sensor radius (finite, no noise yet); GRU policy | GRU policy beats MLP policy under matched compute |
-| 3 | State estimation under sensor noise; auxiliary belief loss | Gaussian sensor noise + occlusion by terrain; predictor head | Belief loss correlates with policy performance; visualised belief tracks ground truth |
-| 4 | Self-play, non-stationarity, exploitability | Red team learned; fictitious self-play / league training | Trained blue beats *every* historic red policy in the league, not just the latest |
-| 5 | Differentiable communication | Range-gated message passing; learned messages | Learned-comm blue beats no-comm blue under information-limited regimes |
-| 6 | Non-stationary objectives, custody-over-time | Moving targets, appearing/disappearing, priority weights | Mean custody-time-ratio improves vs Stage 5 baseline |
-| 7 | Robust evaluation | Held-out red policies, distribution-shift sweeps | Worst-case episode reward across held-out opponents ≥ X% of in-distribution reward |
+| 1 | Actor-critic on a continuous-action multi-agent task; vectorised rollouts | Pursuit-evasion, full observability, fixed-policy red, flat-MLP shared policy | Trained blue beats GreedyPursuer baseline by ≥20% mean episode reward |
+| **2** | **Structured architecture — GNN over entities with CTDE critic** | **Same env as Stage 1 (full obs, fixed red mix).  Isolates architecture as the sole variable vs Stage 1 baseline** | **GNN blue closes the Stage 1 coordination gap: trained_vs_run ≥ +19.38 (the strict 1.20× Greedy bar that Stage 1 v2 MLP missed by 4.01)** |
+| 3 | POMDP + recurrent policies | Sensor radius (finite, no noise yet); GRU on top of the Stage 2 GNN | GRU policy beats non-recurrent Stage 2 GNN under matched compute at fixed sensor radius |
+| 4 | State estimation under sensor noise; auxiliary belief loss | Gaussian sensor noise + occlusion by terrain; predictor head | Belief loss correlates with policy performance; visualised belief tracks ground truth |
+| 5 | Self-play, non-stationarity, exploitability | Red team learned; fictitious self-play / league training | Trained blue beats *every* historic red policy in the league, not just the latest |
+| 6 | Differentiable communication | Range-gated message passing; learned messages | Learned-comm blue beats no-comm blue under information-limited regimes |
+| 7 | Non-stationary objectives, custody-over-time | Moving targets, appearing/disappearing, priority weights | Mean custody-time-ratio improves vs Stage 6 baseline |
+| 8 | Robust evaluation | Held-out red policies, distribution-shift sweeps | Worst-case episode reward across held-out opponents ≥ X% of in-distribution reward |
+
+Curriculum is 8 stages (up from 7).  Stage 2 was originally "POMDP +
+recurrent"; after Stage 1's soft-pass verdict (see
+[`stage1_analysis.md §6b`](stage1_analysis.md)), the curriculum was
+resequenced to test the "architectural ceiling" hypothesis as a
+standalone step *before* introducing partial observability.  This
+isolates architecture as the sole variable in the Stage 1 → Stage 2
+comparison and gives us two separable results instead of one lumped
+one.  Stages 3-8 (previously 2-7) shift by one; concepts unchanged.
 
 ## 3. Stage 1 — Pursuit-Evasion baseline (detailed spec)
 
@@ -216,28 +226,41 @@ targets, herding), not just "go to the nearest red".
 
 ## 5. Stages 2-7 (sketches, expand later)
 
-- **Stage 2 — Sensor radius:** observation becomes per-UAV local
+- **Stage 2 — Structured architecture (GNN + CTDE critic):** same
+  environment as Stage 1 (full observability, mixed-red training
+  distribution).  Replace the flat MLP with a GNN over an
+  entity-typed graph (blue and red nodes; blue-blue bidirectional
+  edges + red-blue directed edges), 2 rounds of message passing,
+  residual node updates.  Policy head reads the acting agent's blue
+  node embedding.  Critic head sums blue embeddings and concatenates
+  red embeddings — a centralised value estimate consistent with the
+  shared team reward (CTDE).  Full detailed spec in
+  [`docs/stage2_gnn_design.md`](stage2_gnn_design.md).  The natural
+  falsification test of the Stage 1 v2 verdict: if the architectural-
+  ceiling story is right, GNN should close the +4.01 gap.
+- **Stage 3 — Sensor radius:** observation becomes per-UAV local
   (relative-position features of entities within `sensor_radius`, zero
-  padded).  Recurrent policies (GRU) to integrate observations over time.
-  Compare MLP vs GRU under matched compute.
-- **Stage 3 — Sensor noise + occlusion:** sensor reports
-  `p_observed = p_true + N(0, σ²)`, occluded by simple terrain blocks.  Add
-  an explicit belief-state predictor head trained with auxiliary loss
-  reconstructing true target positions from observation history.
-- **Stage 4 — Self-play:** swap scripted red for a learned policy.  Naive
-  self-play (latest vs latest) is unstable; use **fictitious self-play**
-  (sample opponents from history) or **PSRO / league training** (maintain
-  a population of past opponents, train against the meta-game).  Track
-  **exploitability** as the headline metric.
-- **Stage 5 — Comms:** introduce a discrete message vocabulary or
+  padded).  Recurrent policies (GRU) integrate observations over time.
+  Reference architecture is the Stage 2 GNN with GRU on the node
+  embeddings.  Compare MLP vs GRU under matched compute.
+- **Stage 4 — Sensor noise + occlusion:** sensor reports
+  `p_observed = p_true + N(0, σ²)`, occluded by simple terrain blocks.
+  Add an explicit belief-state predictor head trained with auxiliary
+  loss reconstructing true target positions from observation history.
+- **Stage 5 — Self-play:** swap scripted red for a learned policy.
+  Naive self-play (latest vs latest) is unstable; use **fictitious
+  self-play** (sample opponents from history) or **PSRO / league
+  training** (maintain a population of past opponents, train against
+  the meta-game).  Track **exploitability** as the headline metric.
+- **Stage 6 — Comms:** introduce a discrete message vocabulary or
   continuous message vector that blue UAVs can broadcast within a
   `comms_radius`.  Learn the message protocol differentiably.  Compare
   no-comm, fixed-protocol comm (designed by hand), and learned comm.
-- **Stage 6 — Dynamic objectives:** targets move with learned policies,
-  new targets spawn at random rates, custody must be **maintained** (not
-  just achieved once).  Priority weighting (VIP targets worth more).
-  Reward structure shifts to integral-of-custody.
-- **Stage 7 — Robustness eval:** train a "blue under test", evaluate
+- **Stage 7 — Dynamic objectives:** targets move with learned policies,
+  new targets spawn at random rates, custody must be **maintained**
+  (not just achieved once).  Priority weighting (VIP targets worth
+  more).  Reward structure shifts to integral-of-custody.
+- **Stage 8 — Robustness eval:** train a "blue under test", evaluate
   against a held-out population of red policies (different scripted
   strategies, different historic self-play checkpoints).  Report mean
   and **worst-case** reward across the held-out set.  Implement a
