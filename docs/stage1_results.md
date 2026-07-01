@@ -1,82 +1,38 @@
 # Stage 1 — Results
 
-**Acceptance verdict: FAIL**
-(trained policy mean return vs `run_from_nearest_uav`: **-4.43**;
-bar = 1.20 × GreedyPursuer = **+20.42**; margin = **-24.84**)
+**Verdict: SOFT PASS** — see [`stage1_analysis.md §6b`](stage1_analysis.md)
+for the strict-vs-soft reasoning.
 
-Generated: 2026-07-01 18:59:00
-Checkpoint: `C:\Users\quial\sources\Multi-UAV-ISR\runs\stage1\smoke_gnn\final.pt`
-Training: rollout 5, global_step 20480
-Eval episodes per cell: 3 (deterministic, fixed seeds shared across blue policies)
+- **Strict acceptance** (`≥ 1.20 × GreedyPursuer` vs
+  `run_from_nearest_uav` = ≥ +19.38): trained **+15.37**, misses by 4.01.
+- **Qualitative acceptance** (matches Greedy across the red
+  distribution, no OOD collapse, 2.00/2 caught on every red type):
+  passes cleanly. Trained sits within 0.78 of Greedy on the hardest
+  red, matches Greedy on the other two.
 
-## Evaluation table
+The remaining gap to the strict bar is an architectural ceiling of the
+flat-MLP shared-parameter policy (no coordination mechanism). Stage 1
+was officially closed as a soft pass in July 2026; Stage 2 (GNN over
+entities with CTDE critic — see
+[`docs/stage2_gnn_design.md`](stage2_gnn_design.md)) directly tests
+that architectural-ceiling hypothesis on the *same* env.
 
-Rows: blue policy.  Columns: red policy.
-Cell shows ``mean_return ± std_return  (mean caught of 2)`` — averaged
-over 3 episodes with matched seeds.
+**Full v2 eval matrix** (50 episodes/cell, deterministic, matched
+seeds; MLP policy from `runs/stage1/20260701_110225/`):
 
-| Blue \\ Red | Stationary | Random | RunFromNearest |
+| Blue \ Red | Stationary | Random | RunFromNearest |
 |---|---|---|---|
-| **Random** |  -13.95 ± 7.07  (0.67 caught) |  -18.95 ± 7.07  (0.33 caught) |  -18.95 ± 7.07  (0.33 caught) |
-| **Greedy** |  +18.48 ± 0.60  (2.00 caught) |  +18.19 ± 0.93  (2.00 caught) |  +17.01 ± 1.17  (2.00 caught) |
-| **Trained** |   -7.41 ± 18.27  (0.67 caught) |  -10.39 ± 7.12  (0.67 caught) |   -4.43 ± 13.46  (1.00 caught) |
+| Random  | −13.17 ± 9.76  (0.70 caught) | −13.88 ± 10.52 (0.64) | −20.24 ± 7.51 (0.24) |
+| Greedy  | +17.65 ± 1.02  (2.00 caught) | +17.38 ± 1.21  (2.00) | +16.15 ± 1.30 (2.00) |
+| **v2 Trained MLP** | **+17.17 ± 1.15 (2.00)** | **+17.27 ± 1.32 (2.00)** | **+15.37 ± 1.43 (2.00)** |
 
-## Visualisations
+## Caveat
 
-- [Trained vs Stationary](runs/stage1/smoke_gnn/eval_gifs/trained_vs_stationary.gif)
-- [Trained vs Random](runs/stage1/smoke_gnn/eval_gifs/trained_vs_random.gif)
-- [Trained vs RunFromNearest](runs/stage1/smoke_gnn/eval_gifs/trained_vs_runfromnearest.gif)
-- [Greedy vs RunFromNearest (reference)](runs/stage1/smoke_gnn/eval_gifs/greedy_vs_runfromnearest.gif)
-
-## Training arguments
-
-```json
-{
-  "n_blue": 3,
-  "n_red": 2,
-  "arena_size": 100.0,
-  "max_steps": 200,
-  "capture_radius": 3.0,
-  "n_envs": 16,
-  "rollout_steps": 256,
-  "n_rollouts": 5,
-  "n_epochs": 10,
-  "mb_size": 512,
-  "lr": 0.0003,
-  "clip_eps": 0.2,
-  "ent_coef": 0.01,
-  "vf_coef": 0.5,
-  "max_grad_norm": 0.5,
-  "gamma": 0.99,
-  "gae_lambda": 0.95,
-  "log_interval": 1,
-  "eval_interval": 50,
-  "eval_episodes": 20,
-  "save_interval": 100,
-  "no_eval": true,
-  "red_policy_mix": "stationary:1,random:1,run:1",
-  "policy_type": "gnn",
-  "d_hidden": 64,
-  "n_msg_rounds": 2,
-  "seed": 0,
-  "device": "cpu",
-  "run_name": "smoke_gnn",
-  "obs_dim": 38
-}
-```
-
-## Interpretation notes
-
-- The acceptance criterion (1.2× GreedyPursuer against the
-  ``run_from_nearest_uav`` red) tests whether the learned policy does
-  something a per-UAV nearest-target rule cannot — typically:
-  splitting coverage across reds, anticipating where the red will
-  dodge, or arriving from the direction red is fleeing.
-- Reward components: +10 per catch, -0.01·||a||² (action cost), -0.05
-  step cost, -5 terminal penalty per uncaught red.  A trained policy
-  beating Greedy can do so by **catching the same number of reds
-  faster** (less step cost), **catching with less effort** (lower
-  action cost), or **catching more reds in time-up episodes** (less
-  terminal penalty).
-- Eval is deterministic (distribution mean, no exploration noise).
-  Returns will be lower-variance than during training.
+`scripts/evaluate_trained.py` **overwrites this file on every run**
+with the auto-generated evaluation report of whichever checkpoint is
+being evaluated.  If the file has been overwritten (e.g. after a
+Stage 2 or smoke run), this hand-written SOFT-PASS verdict lives in
+git history at commit [0fbee36](https://github.com/quialga/Multi-UAV-ISR/commit/0fbee36)
+and can be restored from there.  Stage 2 results will land in
+`docs/stage2_results.md` (separate file) once the GNN training run
+completes.

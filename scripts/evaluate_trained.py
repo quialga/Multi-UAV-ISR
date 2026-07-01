@@ -208,8 +208,11 @@ def main() -> None:
     p.add_argument("--gif-seed",   type=int, default=12_345,
                    help="seed used for the qualitative GIFs (single episode)")
     p.add_argument("--fps",        type=int, default=10)
-    p.add_argument("--results-md", default="docs/stage1_results.md",
-                   help="output markdown writeup path")
+    p.add_argument("--results-md", default=None,
+                   help="output markdown writeup path.  If omitted, defaults "
+                        "to docs/stage1_results.md for MLP checkpoints and "
+                        "docs/stage2_results.md for GNN checkpoints (based on "
+                        "the policy_type saved in the checkpoint args).")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -314,6 +317,17 @@ def main() -> None:
         }, f, indent=2)
     print(f"\nResults JSON: {results_json_path}")
 
+    # Default results-md path based on the trained policy's type so
+    # Stage 2 GNN eval doesn't stomp Stage 1 MLP's writeup.
+    if args.results_md is None:
+        default_by_type = {
+            "gnn": "docs/stage2_results.md",
+            "mlp": "docs/stage1_results.md",
+        }
+        args.results_md = default_by_type.get(
+            train_args.get("policy_type", "mlp"),
+            "docs/stage1_results.md",
+        )
     md_path = Path(args.results_md).resolve()
     write_results_md(
         out_path        = md_path,
