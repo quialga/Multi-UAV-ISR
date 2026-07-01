@@ -54,7 +54,20 @@ def run_episode(
     env_kwargs:  Dict,
     seed:        int,
     collect_snaps: bool = False,
-) -> Tuple[float, int, List]:
+) -> Tuple[float, int, int, List]:
+    """
+    Roll out one episode.
+
+    Returns
+    -------
+    total    : cumulative shared team reward
+    n_caught : number of reds caught by episode end
+    n_steps  : episode length in env steps (< max_steps if all reds
+               caught early; == max_steps on timeout).  This is a much
+               more coordination-sensitive metric than reward under
+               the step-cost-dominated reward function.
+    snaps    : list of state snapshots if collect_snaps else []
+    """
     env = PursuitEnv(**env_kwargs, red_policy=red_policy, seed=seed)
     obs_d, _ = env.reset(seed=seed)
     total   = 0.0
@@ -67,8 +80,10 @@ def run_episode(
         total += rew_d[env.possible_agents[0]]
         if collect_snaps:
             snaps.append(env.state_snapshot())
-    n_caught = int((~env.state_snapshot()["red_active"]).sum())
-    return total, n_caught, snaps
+    snap = env.state_snapshot()
+    n_caught = int((~snap["red_active"]).sum())
+    n_steps  = int(snap["t"])
+    return total, n_caught, n_steps, snaps
 
 
 def eval_matrix(
@@ -88,17 +103,21 @@ def eval_matrix(
         for r_name, r_policy in red_factories.items():
             returns: List[float] = []
             caughts: List[int]   = []
+            steps:   List[int]   = []
             for ep in range(n_episodes):
                 blue = b_factory()
                 # Same seed across blue policies => directly comparable
                 seed = seed_base + ep
-                r, c, _ = run_episode(blue, r_policy, env_kwargs, seed)
+                r, c, n, _ = run_episode(blue, r_policy, env_kwargs, seed)
                 returns.append(r)
                 caughts.append(c)
+                steps.append(n)
             results[b_name][r_name] = {
-                "mean_return": float(np.mean(returns)),
-                "std_return":  float(np.std(returns)),
-                "mean_caught": float(np.mean(caughts)),
+                "mean_return":  float(np.mean(returns)),
+                "std_return":   float(np.std(returns)),
+                "mean_caught":  float(np.mean(caughts)),
+                "mean_steps":   float(np.mean(steps)),
+                "std_steps":    float(np.std(steps)),
             }
     return results
 
@@ -108,7 +127,10 @@ def eval_matrix(
 # ---------------------------------------------------------------------------
 
 def _fmt_cell(d: Dict[str, float]) -> str:
-    return f"{d['mean_return']:+7.2f} ± {d['std_return']:.2f}  ({d['mean_caught']:.2f} caught)"
+    steps = d.get("mean_steps")
+    step_str = f" — {steps:.1f} steps" if steps is not None else ""
+    return (f"{d['mean_return']:+7.2f} ± {d['std_return']:.2f}  "
+            f"({d['mean_caught']:.2f} caught{step_str})")
 
 
 def write_results_md(
@@ -156,8 +178,16 @@ Eval episodes per cell: {eval_episodes} (deterministic, fixed seeds shared acros
 ## Evaluation table
 
 Rows: blue policy.  Columns: red policy.
-Cell shows ``mean_return ± std_return  (mean caught of {n_red})`` — averaged
+Cell shows ``mean_return ± std_return  (mean caught of {n_red} — mean episode length in steps)`` — averaged
 over {eval_episodes} episodes with matched seeds.
+
+**Note on ``mean episode length``:** under the step-cost-dominated
+reward (``-0.05`` per step), two policies with different coordination
+quality can have very similar mean_return but noticeably different
+episode lengths.  Fewer steps to catch all reds = more efficient
+pursuit / better coordination.  Compare across the Trained row to see
+whether a structured architecture is *behaviourally* more coordinated
+even when reward moves only a little.
 
 {table}
 
@@ -283,7 +313,7 @@ def main() -> None:
     for r_name, r_policy in red_factories.items():
         # Trained blue vs this red
         blue = TrainedBlueAgent(policy, device, deterministic=True)
-        _, _, snaps = run_episode(blue, r_policy, env_kwargs,
+        _, _, _, snaps = run_episode(blue, r_policy, env_kwargs,
                                   seed=args.gif_seed, collect_snaps=True)
         path = gif_dir / f"trained_vs_{r_name.lower()}.gif"
         animate_episode(snaps, env_kwargs["arena_size"],
@@ -293,8 +323,8 @@ def main() -> None:
 
     # Reference: Greedy blue vs Run, same seed as the trained-vs-Run GIF
     greedy = GreedyPursuer()
-    _, _, snaps = run_episode(greedy, run_from_nearest_uav, env_kwargs,
-                              seed=args.gif_seed, collect_snaps=True)
+    _, _, _, snaps = run_episode(greedy, run_from_nearest_uav, env_kwargs,
+                                 seed=args.gif_seed, collect_snaps=True)
     path = gif_dir / "greedy_vs_runfromnearest.gif"
     animate_episode(snaps, env_kwargs["arena_size"],
                     save_path=str(path), fps=args.fps)

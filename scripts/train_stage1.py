@@ -172,7 +172,7 @@ def evaluate_heuristic_baseline(
     seed_base:   int = 20_000,
 ) -> Dict[str, float]:
     """Run a heuristic blue baseline (RandomAgent / GreedyPursuer) for comparison."""
-    returns, caught = [], []
+    returns, caught, steps = [], [], []
     for ep in range(n_episodes):
         env = PursuitEnv(**env_kwargs, red_policy=red_policy,
                          seed=seed_base + ep)
@@ -186,9 +186,11 @@ def evaluate_heuristic_baseline(
         snap = env.state_snapshot()
         returns.append(total)
         caught.append(int((~snap["red_active"]).sum()))
+        steps.append(int(snap["t"]))
     return {
         "mean_return": float(np.mean(returns)),
         "mean_caught": float(np.mean(caught)),
+        "mean_steps":  float(np.mean(steps)),
     }
 
 

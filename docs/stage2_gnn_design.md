@@ -359,6 +359,59 @@ implementation:
   overwrite `docs/stage1_results.md`, GNN checkpoints overwrite
   `docs/stage2_results.md`.  Explicit override still supported.
 
+## 8b. Follow-up: scaling experiment (pending)
+
+After the initial N=3 vs M=2 run, the empirical result was: GNN
+matched or slightly exceeded MLP in reward (+15.92 vs +15.37 on Run),
+but the qualitative behavioural difference — **emergent target
+assignment** — visible in the GIFs was much more striking than the
+reward delta.
+
+Working hypothesis: **at N=3 vs M=2 there is not enough room for
+coordination to dominate reward.**  3 UAVs on 2 targets means at
+least one is redundant, so "pile on the same red" (Greedy /
+parameter-shared MLP) is nearly as fast as "each UAV picks a
+different red" (GNN with target assignment).  In fact the initial
+5-episode smoke showed GNN taking *more* steps on average
+(48 vs 43 for Greedy vs Run) at this small scale — the reassignment
+overhead outweighs the parallelism benefit.
+
+Prediction: at larger N and M, target-assignment should measurably
+beat pile-on:
+- **N=5 vs M=3** or **N=6 vs M=4**: enough targets that at least
+  one UAV cannot pile on without redundancy; assignment overhead
+  should be dominated by parallel-catch speedup.
+- Prediction on the `mean_steps` metric: GNN vs Run should be
+  ~15-25% shorter than MLP vs Run at these scales.  Reward gain
+  correspondingly larger.
+
+To run the scaling experiment (pending user's GPU time):
+
+```bash
+# Bigger arena to keep density comparable
+python scripts/train_stage1.py --device cuda --policy-type mlp \
+    --n-blue 5 --n-red 3 --arena-size 130 --n-rollouts 1000
+python scripts/train_stage1.py --device cuda --policy-type gnn \
+    --n-blue 5 --n-red 3 --arena-size 130 --n-rollouts 1000
+
+# Eval both against the same red baselines + episode-length metric
+python scripts/evaluate_trained.py --checkpoint runs/stage1/<mlp>/best.pt \
+    --device cuda --n-episodes 50
+python scripts/evaluate_trained.py --checkpoint runs/stage1/<gnn>/best.pt \
+    --device cuda --n-episodes 50
+```
+
+Note: at N=5 vs M=3, GreedyPursuer's own baseline reward will differ
+from N=3 vs M=2 (denser arena, faster catches).  The strict 1.20×
+bar is recomputed inside the eval script relative to the new
+GreedyPursuer number.
+
+The Stage 2 verdict + writeup (`docs/stage2_results.md`) is
+intentionally held **until the scaling numbers land**.  If the
+mean_steps prediction is confirmed at scale, we have a clean
+quantitative confirmation of coordination-via-attention.  If not,
+we've falsified the hypothesis and need a different framing.
+
 ## 9. Expected outcomes
 
 Two directions are plausible; both are informative.
