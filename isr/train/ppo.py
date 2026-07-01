@@ -25,7 +25,6 @@ from typing import Dict
 
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
 
 from isr.train.buffer import RolloutBuffer
 

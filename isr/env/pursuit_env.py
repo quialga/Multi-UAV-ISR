@@ -86,20 +86,17 @@ class PursuitEnv(ParallelEnv):
                     policy here without further env changes.
     seed            Initial RNG seed.
 
-    Observation (per blue UAV)
-    --------------------------
-    Identical *global* observation for every blue agent in Stage 1
-    (parameter sharing + ``self_idx_onehot`` lets a single network
-    serve every agent while knowing which one it is).  Flattened
-    vector laid out as:
-
-        [blue_pos_normalised   (N_blue * 2),
-         blue_vel_normalised   (N_blue * 2),
-         red_pos_normalised    (N_red  * 2),    # zero for caught
-         red_vel_normalised    (N_red  * 2),    # zero for caught
-         red_active_mask       (N_red,),
-         self_idx_onehot       (N_blue,),
-         time_remaining        (1,)]
+    Observation (per blue UAV, v2)
+    ------------------------------
+    Ego-centric world-frame representation motivated by TERL (see
+    ``docs/stage1_analysis.md``).  All positional features are
+    relative to this UAV's own position; all velocities are relative
+    to this UAV's own velocity; each entity carries both Cartesian
+    (rel_pos, rel_vel) and polar (range, bearing) auxiliary features.
+    Every blue's obs is structurally identical from its own
+    perspective — no ``self_idx_onehot`` needed.  See
+    ``_build_obs`` docstring for the exact layout.  Total dim for
+    N_blue=3, N_red=2: 38.
 
     Action (per blue UAV)
     ---------------------
@@ -141,15 +138,17 @@ class PursuitEnv(ParallelEnv):
         self.possible_agents = [f"blue_{i}" for i in range(self.n_blue)]
         self.agents = list(self.possible_agents)
 
-        # Observation dim — see class docstring layout above.
+        # Observation dim — see the ``_build_obs`` docstring for the
+        # v2 layout (ego-centric world-frame relative + polar auxiliary
+        # features per entity, plus wall distances and speed).
+        # v2 total = 8 * n_red + 7 * (n_blue - 1) + 8
+        # (per-red: rel_pos 2 + rel_vel 2 + range 1 + bearing_cs 2 + active 1)
+        # (per-teammate: rel_pos 2 + rel_vel 2 + range 1 + bearing_cs 2)
+        # (self+global: vel 2 + speed 1 + walls 4 + time 1)
         self._obs_dim = (
-            self.n_blue * 2 +    # blue pos
-            self.n_blue * 2 +    # blue vel
-            self.n_red  * 2 +    # red pos
-            self.n_red  * 2 +    # red vel
-            self.n_red       +   # red active mask
-            self.n_blue      +   # self_idx_onehot
-            1                    # time remaining
+            8 * self.n_red
+            + 7 * (self.n_blue - 1)
+            + 2 + 1 + 4 + 1
         )
 
         self._action_spaces = {
@@ -356,38 +355,169 @@ class PursuitEnv(ParallelEnv):
             new_vel[below | above, axis] = 0.0
         return new_pos.astype(np.float32), new_vel
 
+    # ------------------------------------------------------------------ #
+    #  Observation (v2: ego-centric world-frame relative + polar)         #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def _bearing_features(
+        self_vel:    np.ndarray,     # (2,)
+        rel_pos:     np.ndarray,     # (K, 2)
+        ranges:      np.ndarray,     # (K,)
+        eps:         float = 1e-6,
+    ) -> np.ndarray:
+        """
+        Compute (cos θ, sin θ) per entity, where θ is the angle between
+        the acting UAV's velocity vector and the world-frame relative
+        position vector to that entity.
+
+        Convention: θ = 0 iff the entity lies directly ahead of the
+        UAV's current motion; cos θ ~ +1 means "in front", cos θ ~ -1
+        means "behind", sin θ > 0 means "to the left of forward" (2D
+        cross-product z-component).
+
+        When the UAV is essentially still (|v| < eps), θ is undefined
+        — we return zeros as a well-defined signal that "bearing is
+        not meaningful right now" (paired with the ``speed`` scalar in
+        the obs so the network can learn to discount it).
+        """
+        out = np.zeros((rel_pos.shape[0], 2), dtype=np.float32)
+        speed = float(np.linalg.norm(self_vel))
+        if speed < eps:
+            return out
+        vel_dir = self_vel / speed                              # (2,)
+        safe_ranges = np.where(ranges > eps, ranges, 1.0)
+        rel_dir = rel_pos / safe_ranges[:, None]                # (K, 2)
+        cos_b = rel_dir @ vel_dir                               # (K,) dot
+        sin_b = (vel_dir[0] * rel_dir[:, 1]
+                 - vel_dir[1] * rel_dir[:, 0])                  # (K,) 2D cross-z
+        mask = ranges > eps
+        out[mask, 0] = cos_b[mask]
+        out[mask, 1] = sin_b[mask]
+        return out
+
     def _build_obs(self, blue_idx: int) -> np.ndarray:
         """
-        Build the flattened global observation for blue UAV ``blue_idx``.
+        Build the observation vector for blue UAV ``blue_idx``.
 
-        Only the ``self_idx_onehot`` block differs between blue agents.
-        Everything else (positions, velocities, masks) is identical —
-        Stage 1 is fully observable from a shared centralised viewpoint.
+        Ego-centric world-frame representation (v2).  All positional
+        features are relative to this UAV's own position; all
+        velocities are relative to this UAV's own velocity.  A polar
+        (range + bearing) pair complements the Cartesian relatives per
+        entity — following the TERL feature vocabulary (see
+        ``docs/stage1_analysis.md`` for rationale).
+
+        Layout (concatenated float32):
+
+            For each red target j (fixed order, N_red entries):
+                rel_pos_xy      (2)  = (red_pos_j - self_pos) / arena_size
+                rel_vel_xy      (2)  = (red_vel_j - self_vel) / v_max_blue
+                range           (1)  = |rel_pos_xy| * arena_size / arena_size
+                bearing_cos_sin (2)  = (cos θ, sin θ) between self_vel and rel_pos
+                active_flag     (1)  = 1 if red still active else 0
+            → 8 D per red
+
+            For each teammate t (excluding self, fixed order in
+            teammate_idx = [i for i != blue_idx], N_blue-1 entries):
+                rel_pos_xy      (2)
+                rel_vel_xy      (2)
+                range           (1)
+                bearing_cos_sin (2)
+            → 7 D per teammate
+
+            Self features:
+                self_vel_xy_normalised (2)
+                self_speed_normalised   (1)
+                wall_distances          (4) = (x, L-x, y, L-y) / L
+
+            Global:
+                time_remaining          (1) = (max_steps - t) / max_steps
+
+        No ``self_idx_onehot`` — every blue's obs is structurally
+        identical from its own perspective, so parameter-shared PPO
+        needs no symmetry-breaking feature.
+
+        Total dim for N_blue=3, N_red=2 = 16 + 14 + 8 = 38.
         """
         L = self.arena_size
-        blue_pos_n = (self._blue_pos / L).astype(np.float32)
-        blue_vel_n = (self._blue_vel / BLUE_UAV.v_max).astype(np.float32)
-        red_pos_n  = (self._red_pos / L).astype(np.float32)
-        red_vel_n  = (self._red_vel / RED_TARGET.v_max).astype(np.float32)
-        # Zero out caught reds' pos/vel so the network can't latch onto
-        # stale positions.  The active_mask carries the "this red still
-        # exists" signal.
-        red_pos_n[~self._red_active] = 0.0
-        red_vel_n[~self._red_active] = 0.0
+        v_max_self = BLUE_UAV.v_max
 
-        active_mask = self._red_active.astype(np.float32)
-        self_onehot = np.zeros(self.n_blue, dtype=np.float32)
-        self_onehot[blue_idx] = 1.0
+        self_pos = self._blue_pos[blue_idx]                     # (2,)
+        self_vel = self._blue_vel[blue_idx]                     # (2,)
+
+        # ---- Per-red block --------------------------------------------
+        rel_red_pos = self._red_pos - self_pos                  # (N_red, 2)
+        rel_red_vel = self._red_vel - self_vel                  # (N_red, 2)
+        red_ranges  = np.linalg.norm(rel_red_pos, axis=1)       # (N_red,)
+        red_bearings = self._bearing_features(self_vel,
+                                              rel_red_pos, red_ranges)
+
+        # Normalise: positions by L, velocities by v_max_self.
+        rel_red_pos_n = (rel_red_pos / L).astype(np.float32)
+        rel_red_vel_n = (rel_red_vel / v_max_self).astype(np.float32)
+        red_ranges_n  = (red_ranges  / L).astype(np.float32)
+
+        # Zero out caught reds (defensive — active_flag also carries
+        # the signal, but keeps the obs clean of stale data).
+        inactive_mask = ~self._red_active
+        rel_red_pos_n[inactive_mask] = 0.0
+        rel_red_vel_n[inactive_mask] = 0.0
+        red_ranges_n[inactive_mask]  = 0.0
+        red_bearings[inactive_mask]  = 0.0
+
+        red_active_flag = self._red_active.astype(np.float32)
+
+        red_block = np.concatenate([
+            rel_red_pos_n.flatten(),         # 2 * N_red
+            rel_red_vel_n.flatten(),         # 2 * N_red
+            red_ranges_n,                    #     N_red
+            red_bearings.flatten(),          # 2 * N_red
+            red_active_flag,                 #     N_red
+        ]).astype(np.float32)
+
+        # ---- Per-teammate block ---------------------------------------
+        teammate_idx = [i for i in range(self.n_blue) if i != blue_idx]
+        tm_pos = self._blue_pos[teammate_idx]                   # (N_blue-1, 2)
+        tm_vel = self._blue_vel[teammate_idx]
+        rel_tm_pos = tm_pos - self_pos
+        rel_tm_vel = tm_vel - self_vel
+        tm_ranges  = np.linalg.norm(rel_tm_pos, axis=1)
+        tm_bearings = self._bearing_features(self_vel,
+                                             rel_tm_pos, tm_ranges)
+
+        rel_tm_pos_n = (rel_tm_pos / L).astype(np.float32)
+        rel_tm_vel_n = (rel_tm_vel / v_max_self).astype(np.float32)
+        tm_ranges_n  = (tm_ranges  / L).astype(np.float32)
+
+        tm_block = np.concatenate([
+            rel_tm_pos_n.flatten(),          # 2 * (N_blue - 1)
+            rel_tm_vel_n.flatten(),          # 2 * (N_blue - 1)
+            tm_ranges_n,                     #     (N_blue - 1)
+            tm_bearings.flatten(),           # 2 * (N_blue - 1)
+        ]).astype(np.float32)
+
+        # ---- Self + global block --------------------------------------
+        self_vel_n = (self_vel / v_max_self).astype(np.float32)
+        self_speed_n = np.array(
+            [float(np.linalg.norm(self_vel)) / v_max_self],
+            dtype=np.float32,
+        )
+        walls = np.array([
+            self_pos[0] / L,                 # → left  wall (x=0)
+            (L - self_pos[0]) / L,           # → right wall
+            self_pos[1] / L,                 # → bottom wall (y=0)
+            (L - self_pos[1]) / L,           # → top   wall
+        ], dtype=np.float32)
         time_remaining = np.array(
-            [(self.max_steps - self._t) / self.max_steps], dtype=np.float32
+            [(self.max_steps - self._t) / self.max_steps],
+            dtype=np.float32,
         )
 
         return np.concatenate([
-            blue_pos_n.flatten(),
-            blue_vel_n.flatten(),
-            red_pos_n.flatten(),
-            red_vel_n.flatten(),
-            active_mask,
-            self_onehot,
-            time_remaining,
+            red_block,        # 8 * N_red
+            tm_block,         # 7 * (N_blue - 1)
+            self_vel_n,       # 2
+            self_speed_n,     # 1
+            walls,            # 4
+            time_remaining,   # 1
         ]).astype(np.float32)

@@ -87,7 +87,7 @@ class ActorCritic(nn.Module):
         # keep initial actions near-zero so exploration is reasonable
         # from step 1.
         self.actor_mean = _layer_init(nn.Linear(hidden[-1], action_dim), std=0.01)
-        self.critic     = _layer_init(nn.Linear(hidden[-1], 1),          std=1.0)
+        self.critic     = _layer_init(nn.Linear(hidden[-1], 1), std=1.0)
 
         # State-independent learned log_std (per action dim).
         self.actor_log_std = nn.Parameter(

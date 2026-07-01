@@ -26,11 +26,14 @@ Design notes
 from __future__ import annotations
 
 from collections import deque
-from typing import Any, Callable, Deque, Dict, List, Optional, Tuple
+from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 
 from isr.env.pursuit_env import PursuitEnv
+from isr.agents.heuristics import (
+    stationary_red, random_red, run_from_nearest_uav,
+)
 
 
 class VectorPursuitEnv:
@@ -55,7 +58,22 @@ class VectorPursuitEnv:
         env_kwargs:          Dict[str, Any],
         base_seed:           int = 0,
         episode_buffer_size: int = 128,
+        red_policy_mix:      Optional[Sequence[Tuple[str, float]]] = None,
     ) -> None:
+        """
+        red_policy_mix: optional list of (name, weight) tuples specifying
+            a per-episode categorical distribution over red policies.
+            names supported: 'stationary', 'random', 'run'.  Weights are
+            normalised.  If None (default), every env uses whatever red
+            policy was passed via ``env_kwargs['red_policy']`` (or the
+            env default = run_from_nearest_uav) for every episode — the
+            legacy v1 behaviour.
+
+            v2 default in scripts/train_stage1.py is
+            [('stationary', 1), ('random', 1), ('run', 1)] — uniform
+            mix — to eliminate the OOD failure documented in
+            docs/stage1_analysis.md §3 (Failure mode 1).
+        """
         self.n_envs = int(n_envs)
 
         # Build envs with distinct seeds so rollouts cover varied
@@ -65,6 +83,22 @@ class VectorPursuitEnv:
             kwargs = dict(env_kwargs)
             kwargs["seed"] = int(base_seed + i)
             self.envs.append(PursuitEnv(**kwargs))
+
+        # ---- Red-policy mixing setup --------------------------------
+        # A single RNG for the mixing decision — independent from any
+        # env's internal RNG so rollout determinism stays per-env-seed.
+        self._mix_rng = np.random.default_rng(int(base_seed))
+        self._red_policy_names: Optional[List[str]] = None
+        self._red_policy_probs: Optional[np.ndarray] = None
+        if red_policy_mix is not None:
+            names   = [n for n, _ in red_policy_mix]
+            weights = np.asarray([w for _, w in red_policy_mix],
+                                 dtype=np.float64)
+            total = float(weights.sum())
+            if total <= 0.0:
+                raise ValueError("red_policy_mix weights must sum > 0")
+            self._red_policy_names = names
+            self._red_policy_probs = weights / total
 
         e0 = self.envs[0]
         self.n_agents   = e0.n_blue
@@ -83,6 +117,38 @@ class VectorPursuitEnv:
         self.episode_caught:  Deque[int]   = deque(maxlen=episode_buffer_size)
 
     # ------------------------------------------------------------------ #
+    #  Red-policy mixing                                                   #
+    # ------------------------------------------------------------------ #
+
+    def _resample_red_policy(self, env: PursuitEnv) -> None:
+        """
+        If ``red_policy_mix`` is configured, sample a fresh red policy
+        for this env according to the categorical weights.  Called
+        before every env reset (initial + auto-reset on episode end).
+
+        No-op when mixing is disabled — the env keeps whatever policy
+        it was constructed with.
+        """
+        if self._red_policy_names is None or self._red_policy_probs is None:
+            return
+        idx = int(self._mix_rng.choice(
+            len(self._red_policy_names), p=self._red_policy_probs,
+        ))
+        name = self._red_policy_names[idx]
+        if name == "stationary":
+            env.red_policy = stationary_red
+        elif name == "random":
+            # Each sampled random_red gets its own seeded closure so
+            # different episodes see different random red trajectories.
+            env.red_policy = random_red(
+                seed=int(self._mix_rng.integers(0, 2**31 - 1)),
+            )
+        elif name == "run":
+            env.red_policy = run_from_nearest_uav
+        else:
+            raise ValueError(f"Unknown red policy name in mix: {name!r}")
+
+    # ------------------------------------------------------------------ #
     #  Reset / step                                                        #
     # ------------------------------------------------------------------ #
 
@@ -98,6 +164,7 @@ class VectorPursuitEnv:
             (self.n_envs, self.n_agents, self.obs_dim), dtype=np.float32
         )
         for i, env in enumerate(self.envs):
+            self._resample_red_policy(env)
             s = None if seed is None else int(seed + i)
             obs_dict, _ = env.reset(seed=s)
             for j, name in enumerate(self.possible_agents):
@@ -152,9 +219,10 @@ class VectorPursuitEnv:
                 self._ep_return[i] = 0.0
                 self._ep_length[i] = 0
 
-                # Auto-reset.  Next-episode seed = some derived value;
-                # use base + i + a step-counter is overkill — just let
-                # the env's internal RNG advance naturally.
+                # Auto-reset.  Resample red policy first (no-op if
+                # mixing is disabled), then let the env's internal RNG
+                # advance naturally on the fresh episode.
+                self._resample_red_policy(env)
                 obs_d, _ = env.reset()
 
             for j, name in enumerate(self.possible_agents):

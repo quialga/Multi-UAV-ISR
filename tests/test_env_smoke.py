@@ -53,16 +53,65 @@ def test_step_returns_5_dicts_with_matching_keys():
         assert set(d.keys()) == expected, f"key set mismatch: {d.keys()} vs {expected}"
 
 
-def test_self_idx_onehot_is_identity_block():
-    """Each blue agent's obs differs only in the self_idx_onehot block."""
-    env = PursuitEnv(seed=0)
-    obs, _ = env.reset(seed=0)
-    n = env.n_blue
-    # The onehot lives at obs[-(n_blue+1):-1] — last (n_blue+1) entries
-    # are [self_idx_onehot (n_blue floats), time_remaining (1 float)].
-    onehots = np.stack([obs[a][-(n + 1):-1] for a in env.possible_agents])
-    assert np.allclose(onehots, np.eye(n)), \
-        f"self_idx_onehot block should be identity, got:\n{onehots}"
+def test_obs_dim_matches_v2_formula():
+    """v2 obs dim = 8*N_red + 7*(N_blue - 1) + 8."""
+    for n_blue, n_red in [(3, 2), (2, 3), (4, 1), (1, 2)]:
+        env = PursuitEnv(n_blue=n_blue, n_red=n_red)
+        obs, _ = env.reset(seed=0)
+        expected = 8 * n_red + 7 * (n_blue - 1) + 8
+        assert env._obs_dim == expected, (
+            f"n_blue={n_blue} n_red={n_red}: env._obs_dim={env._obs_dim} "
+            f"!= expected {expected}"
+        )
+        assert obs["blue_0"].shape == (expected,)
+
+
+def test_obs_is_ego_centric_translation_invariant():
+    """
+    Translating the entire scene (all blues + reds by the same vector)
+    should leave every agent's obs bit-exact — ego-centric relative obs
+    is translation invariant.  The only field affected by translation is
+    ``wall_distances``, which changes as expected; every other feature
+    is a relative quantity and must match.
+    """
+    env_a = PursuitEnv(n_blue=3, n_red=2,
+                       red_policy=stationary_red, seed=0)
+    env_b = PursuitEnv(n_blue=3, n_red=2,
+                       red_policy=stationary_red, seed=0)
+    env_a.reset(seed=0)
+    env_b.reset(seed=0)
+
+    # Copy positions from env_a, translate everyone by (+5, +7) into env_b.
+    dx, dy = 5.0, 7.0
+    env_b._blue_pos = env_a._blue_pos + np.array([dx, dy], dtype=np.float32)
+    env_b._blue_vel = env_a._blue_vel.copy()
+    env_b._red_pos  = env_a._red_pos  + np.array([dx, dy], dtype=np.float32)
+    env_b._red_vel  = env_a._red_vel.copy()
+    env_b._red_active = env_a._red_active.copy()
+    env_b._t = env_a._t
+
+    obs_a = env_a._build_obs(0)
+    obs_b = env_b._build_obs(0)
+
+    # Relative blocks (everything except wall_distances) must match.
+    # Wall block is the 4 entries starting 5 back from the end:
+    # ... [self_vel (2), self_speed (1), walls (4), time (1)]
+    wall_start = -1 - 4   # exclusive end of walls = -1, start = -5
+    wall_end   = -1
+    # Compare everything except the wall block:
+    a_pre  = obs_a[:wall_start]; b_pre  = obs_b[:wall_start]
+    a_post = obs_a[wall_end:];   b_post = obs_b[wall_end:]
+    assert np.allclose(a_pre, b_pre, atol=1e-6), \
+        "pre-walls block should be translation-invariant"
+    assert np.allclose(a_post, b_post, atol=1e-6), \
+        "time_remaining should be identical (both envs at same step)"
+    # Wall block should differ predictably (shifted by dx/dy /L).
+    walls_a = obs_a[wall_start:wall_end]
+    walls_b = obs_b[wall_start:wall_end]
+    L = env_a.arena_size
+    expected_delta = np.array([dx/L, -dx/L, dy/L, -dy/L], dtype=np.float32)
+    assert np.allclose(walls_b - walls_a, expected_delta, atol=1e-6), \
+        f"wall_distances delta mismatch: {walls_b - walls_a} vs {expected_delta}"
 
 
 # ---------------------------------------------------------------------------

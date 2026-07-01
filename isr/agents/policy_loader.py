@@ -33,12 +33,19 @@ from isr.env.pursuit_env import PursuitEnv
 
 def _infer_obs_dim(args_block: Dict) -> int:
     """
-    Reconstruct the obs_dim from the saved training args.  Mirrors the
-    layout in ``PursuitEnv.__init__``:
+    Reconstruct the obs_dim from the saved training args.
 
-        obs_dim = 2*N_blue + 2*N_blue + 2*N_red + 2*N_red
-                  + N_red + N_blue + 1
+    v2 checkpoints save ``obs_dim`` explicitly in ``args`` — we prefer
+    that when present.  If missing (legacy v1 checkpoints), fall back
+    to the v1 layout formula:
+
+        v1: obs_dim = 4*N_blue + 4*N_red + N_red + N_blue + 1
+
+    Note: v2 checkpoints cannot be loaded with the v1 formula because
+    the obs_dim differs (v1=26 vs v2=38 for N=3, M=2).
     """
+    if "obs_dim" in args_block:
+        return int(args_block["obs_dim"])
     n_blue = args_block["n_blue"]
     n_red  = args_block["n_red"]
     return (4 * n_blue) + (4 * n_red) + n_red + n_blue + 1

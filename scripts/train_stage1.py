@@ -86,6 +86,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--save-interval",  type=int,   default=d["save_interval"])
     p.add_argument("--no-eval",        action="store_true",
                    help="skip periodic eval (faster smoke runs)")
+    # v2: red policy mixing during training
+    p.add_argument("--red-policy-mix", default="stationary:1,random:1,run:1",
+                   help="Comma-separated 'name:weight' pairs specifying the "
+                        "per-episode red-policy distribution.  Names: "
+                        "stationary / random / run.  Set to 'run' to reproduce "
+                        "the legacy v1 training distribution.  Default: uniform "
+                        "mix over all three (v2 default).")
     # Run management
     p.add_argument("--seed",           type=int,   default=0)
     p.add_argument("--device",         default="cpu",
@@ -209,16 +216,32 @@ def main() -> None:
         # construction below; we don't pass it through env_kwargs so the eval
         # functions can vary it.
     )
+    # Parse --red-policy-mix "name:weight,name:weight" -> [(name, weight), ...]
+    red_policy_mix = []
+    for chunk in args.red_policy_mix.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        name, w = chunk.split(":")
+        red_policy_mix.append((name.strip(), float(w)))
+    log(f"red_policy_mix: {red_policy_mix}")
+
     vec_env = VectorPursuitEnv(
         n_envs              = args.n_envs,
         env_kwargs          = env_kwargs,
         base_seed           = args.seed,
         episode_buffer_size = 256,
+        red_policy_mix      = red_policy_mix,
     )
 
     obs_dim    = vec_env.obs_dim
     action_dim = vec_env.action_dim
     n_agents   = vec_env.n_agents
+
+    # Ensure obs_dim is written into the checkpoint args so
+    # policy_loader can reconstruct the correct network without
+    # duplicating the obs-layout formula.
+    args_dict_saved = {**vars(args), "obs_dim": obs_dim}
 
     # ---- Policy + optimiser --------------------------------------------
     policy = ActorCritic(
@@ -392,7 +415,7 @@ def main() -> None:
                     "rollout":      rollout + 1,
                     "global_step":  global_step,
                     "eval_vs_run":  eval_vs_run,
-                    "args":         vars(args),
+                    "args":         args_dict_saved,
                 }, run_dir / "best.pt")
 
         # ----- Periodic checkpoint ---------------------------------------
@@ -402,7 +425,7 @@ def main() -> None:
                 "policy_state": policy.state_dict(),
                 "rollout":      rollout + 1,
                 "global_step":  global_step,
-                "args":         vars(args),
+                "args":         args_dict_saved,
             }, ckpt_path)
 
     # ---- Final save ---------------------------------------------------
@@ -410,7 +433,7 @@ def main() -> None:
         "policy_state": policy.state_dict(),
         "rollout":      args.n_rollouts,
         "global_step":  global_step,
-        "args":         vars(args),
+        "args":         args_dict_saved,
     }, run_dir / "final.pt")
 
     elapsed = time.time() - t_start
