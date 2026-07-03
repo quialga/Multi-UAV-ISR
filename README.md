@@ -45,8 +45,8 @@ concept on top of the last, with measurable acceptance criteria.  See
 | Stage | Concept added | Status |
 |------:|---|---|
 | 1 | Pursuit-evasion baseline (continuous 2D, fully observable, fixed red, MLP shared policy) | **soft pass** (v2: +15.37 vs Run, Greedy = +16.15; strict bar +19.38 not cleared but 2.00/2 caught on every red — see [`docs/stage1_analysis.md`](docs/stage1_analysis.md)) |
-| 2 | **Structured architecture — GNN over entities + CTDE critic** (same env, MLP → GNN as sole variable; falsification test of the Stage 1 "architectural ceiling" verdict) | **next** — spec: [`docs/stage2_gnn_design.md`](docs/stage2_gnn_design.md) |
-| 3 | Partial observability — sensor radius, GRU on top of the Stage 2 GNN | |
+| 2 | **Structured architecture — GNN over entities + CTDE critic** (same env, MLP → GNN as sole variable; scaling experiment at N=5 vs M=3 confirms the coordination hypothesis) | **PASS** (GNN 15.7% faster than Greedy on `mean_steps` vs Run — right in the +15-25% predicted band; MLP at scale collapses; see [`docs/stage2_results.md`](docs/stage2_results.md)) |
+| 3 | Partial observability — sensor radius, GRU on top of the Stage 2 GNN | **next** |
 | 4 | Sensor noise + occlusion — explicit belief-state predictor (aux loss) | |
 | 5 | Self-play — red team becomes learned; fictitious self-play, league training | |
 | 6 | Communication — range-gated message passing between teammates | |
@@ -205,13 +205,21 @@ tar czf stage1_artifacts.tar.gz runs/stage1/<timestamp>/ docs/stage1_results.md
 
 ## Status
 
-Stage 1 landed as a **soft pass** (July 2026) — v2 matches
+Stage 1 landed as a **soft pass** (July 2026) — v2 MLP matches
 GreedyPursuer across the red distribution, catches 2.00/2 on every red
-type, misses the strict 1.20× bar by 4.01 points.  Full analysis and
-verdict reasoning in [`docs/stage1_analysis.md`](docs/stage1_analysis.md);
-the red-policy mixing that closed v1's OOD failure is documented in
-[`docs/red_policy_mixing.md`](docs/red_policy_mixing.md).  Stage 2 (partial
-observability + attention-over-entities) is next.
+type, misses the strict 1.20× bar by 4.01 points.  See
+[`docs/stage1_analysis.md`](docs/stage1_analysis.md) for the full
+analysis; [`docs/red_policy_mixing.md`](docs/red_policy_mixing.md)
+covers the red-policy mixing that closed v1's OOD failure.
+
+Stage 2 landed as a **PASS** (July 2026) — at N=5 vs M=3 scaling, the
+GNN + CTDE-critic architecture catches all 3 reds every episode and
+runs 15.7% faster than GreedyPursuer on episode length vs the
+`run_from_nearest_uav` red, right in the +15-25% predicted band.  At
+the same scale the MLP baseline structurally fails (2.12/3 caught;
+policy collapse visible in the training log).  Full analysis:
+[`docs/stage2_results.md`](docs/stage2_results.md).  Stage 3 (partial
+observability + recurrent policy on top of the Stage 2 GNN) is next.
 
 Per-stage result writeups land in `docs/stage{N}_results.md` as each
 stage completes; broader analysis notes accumulate in `docs/` alongside

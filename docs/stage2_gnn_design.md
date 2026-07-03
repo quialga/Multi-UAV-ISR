@@ -1,7 +1,10 @@
 # Stage 2 — GNN over Entities + CTDE Critic (Design)
 
 _Research journal entry, July 2026.  Written after Stage 1 v2 landed
-as a soft pass ([`stage1_analysis.md §6b`](stage1_analysis.md))._
+as a soft pass ([`stage1_analysis.md §6b`](stage1_analysis.md)).
+**Stage 2 landed as a PASS after the scaling experiment in §8b —
+final result and analysis in
+[`stage2_results.md`](stage2_results.md).**_
 
 Stage 2 is a **controlled architecture-only experiment on the
 Stage 1 v2 environment**.  Everything about the world stays fixed
