@@ -266,6 +266,28 @@ targets, herding), not just "go to the nearest red".
   and **worst-case** reward across the held-out set.  Implement a
   simple regret / exploitability estimator.
 
+## 5b. Note on MLP removal (July 2026)
+
+The flat-MLP + parameter-sharing baseline that Stage 1 was built on
+was **removed from the codebase** after the Stage 2 scaling
+experiment.  Justification:
+
+- At N=3 vs M=2 the MLP was a soft pass (matches Greedy across the
+  red distribution — see [`stage1_analysis.md §6b`](stage1_analysis.md)).
+- At N=5 vs M=3 the MLP **structurally fails**: catches only 2.12 of
+  3 reds on average against `run_from_nearest_uav`, policy collapse
+  visible in the training log (entropy negative, KL blown past 0.2,
+  clip_frac 0.63).  See [`stage2_results.md §2.3`](stage2_results.md).
+- The MLP is not competitive at the scales the curriculum runs on
+  from Stage 2 onwards.  Maintaining two policy paths (MLP + GNN)
+  in the trainer / vec_env / policy loader added complexity for
+  code that was never going to be used.
+
+Historical eval numbers are preserved in `docs/stage1_results.md`,
+`docs/stage1_analysis.md`, and `docs/stage2_results.md`.
+Pre-Stage-2 MLP checkpoints raise a clear error at load time; the
+`.pt` files themselves are still under `runs/stage1/`.
+
 ## 6. Cross-cutting decisions
 
 - **Parameter sharing among blue UAVs:** YES in Stage 1.  We may relax in

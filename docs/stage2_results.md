@@ -1,5 +1,11 @@
 # Stage 2 — Results
 
+> **Note (July 2026 cleanup):** the MLP + flat-obs policy path was
+> deleted from the codebase after this experiment.  Justification and
+> preservation of historical numbers are covered in
+> [`design.md §5b`](design.md).  Every stage from here on builds on
+> the GNN backbone.
+
 **Verdict: PASS (with reframing)** — the *architectural-ceiling*
 hypothesis from Stage 1 is confirmed at scale.  The GNN + CTDE-critic
 architecture unlocks coordination that a parameter-shared MLP cannot
