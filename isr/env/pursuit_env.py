@@ -120,7 +120,19 @@ class PursuitEnv(ParallelEnv):
         dt:             float              = 1.0,
         red_policy:     Optional[Callable] = None,
         seed:           Optional[int]      = None,
+        sensor_radius:  Optional[float]    = None,
     ):
+        """
+        sensor_radius: Stage 3 partial-observability knob.  When None
+            (default), the env is fully observable (Stage 1/2 behaviour).
+            When set to a positive value, each blue UAV only "sees"
+            entities within this Euclidean distance.  Visibility is
+            per-receiver (each blue has its own view), exposed via
+            ``structured_partial_observation()`` as per-edge masks so
+            the graph tensor shape stays constant across timesteps.
+            The full-state ``structured_observation()`` remains
+            unaffected — used by the CTDE critic.
+        """
         super().__init__()
         self.n_blue         = int(n_blue)
         self.n_red          = int(n_red)
@@ -129,6 +141,9 @@ class PursuitEnv(ParallelEnv):
         self.capture_radius = float(capture_radius)
         self.dt             = float(dt)
         self.red_policy     = red_policy or run_from_nearest_uav
+        self.sensor_radius: Optional[float] = (
+            float(sensor_radius) if sensor_radius is not None else None
+        )
 
         self._rng = np.random.default_rng(seed)
 
@@ -692,3 +707,80 @@ class PursuitEnv(ParallelEnv):
         blue node simultaneously.
         """
         return self._build_structured_obs()
+
+    # ------------------------------------------------------------------ #
+    #  Stage 3 partial observability (sensor_radius)                       #
+    # ------------------------------------------------------------------ #
+
+    def _compute_edge_visibility(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Per-edge visibility masks under ``sensor_radius``.
+
+        Convention (see docs/stage3_design.md §2.2):
+        - A bb edge ``(i -> j)`` is visible iff
+          ``distance(blue_j, blue_i) <= sensor_radius`` — the RECEIVER
+          is what matters.  Because Euclidean distance is symmetric,
+          bb visibility for a pair (i, j) is symmetric across the two
+          directed edges (i->j and j->i are both visible together).
+        - A rb edge ``(r -> b)`` is visible iff
+          ``distance(blue_b, red_r) <= sensor_radius``.
+
+        When ``sensor_radius`` is None (fully observable), both masks
+        are all ones (Stage 2 behaviour, preserved).
+
+        Returns
+        -------
+        bb_visible : (n_bb_edges,) float32
+        rb_visible : (n_rb_edges,) float32
+        """
+        n_bb = self.n_bb_edges
+        n_rb = self.n_rb_edges
+        if self.sensor_radius is None:
+            return (np.ones(n_bb, dtype=np.float32),
+                    np.ones(n_rb, dtype=np.float32))
+
+        R = self.sensor_radius
+        # bb: receiver = bb_edge_dst.  Distance receiver-to-sender.
+        bb_recv = self._blue_pos[self.bb_edge_dst]
+        bb_send = self._blue_pos[self.bb_edge_src]
+        bb_dists = np.linalg.norm(bb_recv - bb_send, axis=1)
+        bb_visible = (bb_dists <= R).astype(np.float32)
+
+        # rb: receiver blue = rb_edge_dst, sender red = rb_edge_src.
+        rb_recv = self._blue_pos[self.rb_edge_dst]
+        rb_send = self._red_pos[self.rb_edge_src]
+        rb_dists = np.linalg.norm(rb_recv - rb_send, axis=1)
+        rb_visible = (rb_dists <= R).astype(np.float32)
+        # Caught reds should also not appear in the actor's view even
+        # if physically near — active_flag on the red node still
+        # exists but their outgoing edges are hidden.
+        rb_visible = rb_visible * self._red_active[self.rb_edge_src].astype(np.float32)
+
+        return bb_visible, rb_visible
+
+    def structured_partial_observation(self) -> Dict[str, np.ndarray]:
+        """
+        Partial-observability variant of ``structured_observation()``
+        for the Stage 3 actor.
+
+        Returns the Stage 2 dict extended with two extra keys:
+        - ``bb_edge_visible`` : (n_bb, ) float32, 1.0 if the bb edge is
+          within sensor range of its receiver, 0.0 otherwise.
+        - ``rb_edge_visible`` : (n_rb, ) float32, same convention.
+
+        Consumers (the Stage 3 actor's GNN) multiply message tensors by
+        the visibility masks before aggregation so hidden edges
+        contribute zero — same tensor shape as the fully-observable
+        graph, just with masked contributions.
+
+        The Stage 2 fields (node features, edge features) are
+        unchanged; the mask is a *separate* signal.  If a downstream
+        consumer wants the raw obs it can still call
+        ``structured_observation()`` to get the full-state graph
+        (used by the CTDE critic).
+        """
+        obs = self._build_structured_obs()
+        bb_visible, rb_visible = self._compute_edge_visibility()
+        obs["bb_edge_visible"] = bb_visible
+        obs["rb_edge_visible"] = rb_visible
+        return obs

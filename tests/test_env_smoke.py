@@ -242,6 +242,121 @@ def test_greedy_catches_stationary_reds():
 
 
 # ---------------------------------------------------------------------------
+# Stage 3 partial-observability (sensor_radius)
+# ---------------------------------------------------------------------------
+
+def test_full_obs_when_sensor_radius_none():
+    """Default env is fully observable — masks all ones."""
+    env = PursuitEnv(n_blue=3, n_red=2, seed=0)   # sensor_radius=None (default)
+    env.reset(seed=0)
+    obs = env.structured_partial_observation()
+    assert set(obs.keys()) >= {"bb_edge_visible", "rb_edge_visible"}
+    assert np.all(obs["bb_edge_visible"] == 1.0)
+    assert np.all(obs["rb_edge_visible"] == 1.0)
+    # bb_edge_features and rb_edge_features must still be identical to
+    # the Stage 2 full obs (unchanged in partial mode; only the mask
+    # is separate).
+    full = env.structured_observation()
+    assert np.allclose(obs["bb_edge_features"], full["bb_edge_features"])
+    assert np.allclose(obs["rb_edge_features"], full["rb_edge_features"])
+
+
+def test_visibility_masks_reflect_within_radius():
+    """
+    Place agents at known positions and verify the visibility masks
+    match hand-computed distances vs sensor_radius.
+    """
+    env = PursuitEnv(n_blue=3, n_red=2, arena_size=100.0,
+                     sensor_radius=20.0, red_policy=stationary_red, seed=0)
+    env.reset(seed=0)
+    # Overwrite positions to a controlled configuration:
+    #   blue_0 at (50, 50), blue_1 at (55, 50), blue_2 at (80, 80)
+    #   red_0  at (60, 50), red_1  at (95, 95)
+    env._blue_pos[0] = np.array([50.0, 50.0], dtype=np.float32)
+    env._blue_pos[1] = np.array([55.0, 50.0], dtype=np.float32)
+    env._blue_pos[2] = np.array([80.0, 80.0], dtype=np.float32)
+    env._red_pos[0]  = np.array([60.0, 50.0], dtype=np.float32)
+    env._red_pos[1]  = np.array([95.0, 95.0], dtype=np.float32)
+
+    obs = env.structured_partial_observation()
+    bb_v = obs["bb_edge_visible"]
+    rb_v = obs["rb_edge_visible"]
+
+    # For each bb edge, verify visibility by manual distance check.
+    for e in range(env.n_bb_edges):
+        s, d = int(env.bb_edge_src[e]), int(env.bb_edge_dst[e])
+        dist = np.linalg.norm(env._blue_pos[d] - env._blue_pos[s])
+        expected = 1.0 if dist <= 20.0 else 0.0
+        assert bb_v[e] == expected, (
+            f"bb edge {e} ({s}->{d}) dist={dist:.2f} — mask {bb_v[e]} "
+            f"expected {expected}"
+        )
+
+    # For each rb edge (r -> b), verify visibility by manual check.
+    for e in range(env.n_rb_edges):
+        r, b = int(env.rb_edge_src[e]), int(env.rb_edge_dst[e])
+        dist = np.linalg.norm(env._blue_pos[b] - env._red_pos[r])
+        expected = 1.0 if dist <= 20.0 else 0.0
+        assert rb_v[e] == expected, (
+            f"rb edge {e} (r={r}->b={b}) dist={dist:.2f} — mask "
+            f"{rb_v[e]} expected {expected}"
+        )
+
+
+def test_bb_visibility_is_symmetric():
+    """
+    Euclidean distance is symmetric, so bb edges (i->j) and (j->i)
+    should always be visible or hidden together.
+    """
+    env = PursuitEnv(n_blue=5, n_red=3, arena_size=130.0,
+                     sensor_radius=40.0, seed=42)
+    env.reset(seed=42)
+    obs = env.structured_partial_observation()
+    bb_v = obs["bb_edge_visible"]
+    for e in range(env.n_bb_edges):
+        s, d = int(env.bb_edge_src[e]), int(env.bb_edge_dst[e])
+        # Find the reverse-direction edge.
+        rev = None
+        for e2 in range(env.n_bb_edges):
+            if int(env.bb_edge_src[e2]) == d and int(env.bb_edge_dst[e2]) == s:
+                rev = e2
+                break
+        assert rev is not None
+        assert bb_v[e] == bb_v[rev], (
+            f"bb visibility asymmetric: edge {e} ({s}->{d}) mask={bb_v[e]} "
+            f"vs edge {rev} ({d}->{s}) mask={bb_v[rev]}"
+        )
+
+
+def test_caught_reds_are_hidden_regardless_of_range():
+    """
+    Once a red is caught, all rb edges from it must be zeroed even if
+    physically inside sensor_radius.  Prevents the actor from
+    treating a caught red as a live target.
+    """
+    env = PursuitEnv(n_blue=1, n_red=2, capture_radius=5.0,
+                     sensor_radius=200.0,  # everything in range
+                     red_policy=stationary_red, seed=0)
+    env.reset(seed=0)
+    env._blue_pos[0] = np.array([50.0, 50.0], dtype=np.float32)
+    env._red_pos[0]  = np.array([52.0, 52.0], dtype=np.float32)  # will be caught
+    env._red_pos[1]  = np.array([70.0, 70.0], dtype=np.float32)  # still alive
+    env.step({"blue_0": np.zeros(2, dtype=np.float32)})
+    assert not env._red_active[0]
+    obs = env.structured_partial_observation()
+    for e in range(env.n_rb_edges):
+        r = int(env.rb_edge_src[e])
+        if r == 0:
+            assert obs["rb_edge_visible"][e] == 0.0, (
+                f"rb edge {e} from caught red {r} should be hidden"
+            )
+        else:
+            assert obs["rb_edge_visible"][e] == 1.0, (
+                f"rb edge {e} from alive red {r} should be visible"
+            )
+
+
+# ---------------------------------------------------------------------------
 # Kinematic invariants
 # ---------------------------------------------------------------------------
 
