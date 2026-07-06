@@ -190,6 +190,41 @@ now provided by the node-type separation — no `self_idx_onehot`
 needed (the acting agent is identified by *which node's embedding
 we read out*).
 
+**Shared, state-independent standard deviation (design choice).**  The
+`log_std` in the box above is a **single learned parameter of shape
+`(action_dim,)` = `(2,)`** — the same `log_std_x` and `log_std_y` are
+used by:
+- every blue UAV (the per-dim log std does NOT depend on the acting
+  agent's index or its node embedding);
+- every batch element (the log std does NOT depend on the observation
+  or the timestep — a "state-independent" Gaussian in the standard
+  PPO sense);
+- every rollout in the training run (the parameter is updated by
+  gradient descent like any other network weight, but slowly and
+  monotonically over training rather than reactively per step).
+
+This is the near-universal choice in continuous-action PPO for
+multi-agent systems and is a deliberate trade-off:
+- **Fewer parameters** — one scalar per action dim (2 total for our
+  2-D acceleration) instead of a whole `MLP_actor_std` head per
+  agent.  Removes a source of overfit under partial observability.
+- **More stable training** — a state-dependent std can feed back on
+  the policy's own uncertainty in unstable ways (policy commits to
+  low std → over-exploits a suboptimal mean → std collapses further).
+  A state-independent std learns exploration purely from the entropy
+  bonus and doesn't chase the mean.
+- **Multi-agent symmetry** — under parameter sharing, giving all
+  agents the *same* std is consistent with giving them the same
+  actor MLP.  A per-agent std would need per-agent-specific
+  parameters to break the symmetry that the shared-actor design
+  otherwise preserves.
+
+The alternative (state-dependent std, output from the network like the
+mean) is what SAC uses; PPO does not benefit from it at this scale and
+introduces training instabilities that are a known research
+frustration.  We keep the state-independent-shared-std choice for
+every stage in this curriculum.
+
 ### 3.4 Critic head — centralised training
 
 The critic uses global information the policy doesn't have access to.
