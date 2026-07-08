@@ -108,6 +108,23 @@ class GreedyPursuer(HeuristicBlueAgent):
         # Caught reds are not pursuit targets — mask their distance to inf
         # so argmin picks the closest *active* red.
         dists = np.where(red_active, dists, np.inf)
+
+        # Sensor-radius honesty: if the env is partial-observable
+        # (Stage 3), each UAV can only see reds within its own
+        # sensor_radius — matching the per-receiver edge visibility the
+        # trained CTDE policy sees.  Without this Greedy effectively
+        # cheats past the sensor cap and no fair comparison is possible.
+        # See docs/stage3_gpu_run.md §4 acceptance notes.
+        R = getattr(env, "sensor_radius", None)
+        if R is not None:
+            dists = np.where(dists <= float(R), dists, np.inf)
+            if not np.isfinite(dists).any():
+                # No red visible from this UAV this step — the honest
+                # stateless action is to hold position (a smarter policy
+                # would recall the last-known red via memory; that is
+                # exactly the GRU's job in the Stage 3 policy).
+                return np.zeros(2, dtype=np.float32)
+
         nearest = int(np.argmin(dists))
 
         d_vec = diffs[nearest]
