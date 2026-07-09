@@ -157,19 +157,29 @@ def ppo_update_ctde(
     variance of the recurrent actor at scale.
 
     Optional belief-state distillation via ``aux_hidden_coef > 0``.
-    When on, we run a second actor forward per minibatch with the
-    edge visibility masks set to all-ones (the "full-obs" oracle)
-    under ``no_grad``, and regress the partial-obs GRU hidden state
-    toward the oracle hidden state via MSE.  The oracle-forward
-    gets no gradients (target-style stop-grad); only the partial-obs
-    hidden state is trained toward it.  This is the "belief-state
-    matching" trick from Chen et al. Learning by Cheating and the
-    POMDP privileged-distillation family — the actor learns to
-    encode observations such that its recurrent state approximates
-    what it would have been if the actor had full information.
-    When ``sensor_radius`` is effectively infinite the aux loss is
-    trivially 0 (partial obs equals full obs), so the coef has no
-    effect on fully-observable envs.
+    When on, we regress the actor's partial-obs GNN encoder output
+    (per-blue node embeddings, pre-GRU) toward the CRITIC encoder's
+    full-obs output.  The critic's encoder has separate weights,
+    is trained by value_loss under full observability, and is
+    warm-started from a Stage 2 GNN checkpoint — so its embeddings
+    encode informative state features (target positions, relative
+    geometries).  The aux loss teaches the actor to approximate
+    those embeddings from the masked view.
+
+    Design note (v2 — see docs/stage3_design.md follow-up): the
+    v1 formulation regressed the actor's post-GRU hidden state
+    against a same-weights full-obs forward.  That trivially
+    degenerated to "encoder ignores edge messages" (aux → 0, no
+    learning) because both forwards shared weights.  The critic-
+    encoder-as-oracle formulation has separate weights, so no
+    such degenerate solution exists; the aux loss has an
+    irreducible floor > 0 whenever partial obs genuinely lacks
+    information the critic sees.
+
+    When ``sensor_radius`` is effectively infinite the actor sees
+    the same input as the critic and the aux loss reduces to the
+    inherent difference between the two encoders' weights — small
+    but non-zero.
 
     Returns averaged diagnostics for logging (aux_hidden_loss
     included as 0.0 when the aux path is disabled).
@@ -240,20 +250,31 @@ def ppo_update_ctde(
 
             entropy_loss = -entropy.mean()
 
-            # Auxiliary belief-state distillation (Chen et al. 2020 style).
-            # Off when aux_hidden_coef == 0 — the tensor is still
-            # constructed for a clean scalar metric.
+            # Auxiliary belief-state distillation, critic-encoder-as-oracle
+            # formulation (see docstring for the v1-vs-v2 design note).
+            # Off when aux_hidden_coef == 0 — the tensor is still constructed
+            # so the metric schema is consistent.
             if aux_hidden_coef > 0.0:
+                # Actor's partial-obs pre-GRU node embeddings (trainable).
+                h_blue_actor, _ = policy.actor_encoder(
+                    partial_obs["blue_features"],
+                    partial_obs["red_features"],
+                    partial_obs["bb_edge_features"],
+                    partial_obs["rb_edge_features"],
+                    bb_visible=partial_obs["bb_edge_visible"],
+                    rb_visible=partial_obs["rb_edge_visible"],
+                )   # (mb, N_blue, d_hidden)
+                # Critic's full-obs pre-aggregation node embeddings.
+                # Detached — only the actor's encoder is trained by this loss.
                 with torch.no_grad():
-                    full_partial_obs = {
-                        **full_state,
-                        "bb_edge_visible": torch.ones_like(bb_visible),
-                        "rb_edge_visible": torch.ones_like(rb_visible),
-                    }
-                    _, _, oracle_hidden = policy.actor_forward(
-                        full_partial_obs, hidden,
+                    h_blue_critic, _ = policy.critic_encoder(
+                        full_state["blue_features"],
+                        full_state["red_features"],
+                        full_state["bb_edge_features"],
+                        full_state["rb_edge_features"],
+                        # No visibility masks — critic sees the full graph.
                     )
-                aux_hidden_loss = (new_hidden_partial - oracle_hidden).pow(2).mean()
+                aux_hidden_loss = (h_blue_actor - h_blue_critic).pow(2).mean()
             else:
                 aux_hidden_loss = torch.zeros((), device=new_values.device)
 
