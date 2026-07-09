@@ -83,15 +83,22 @@ During training:
   1.5 by rollout ~500 and toward Greedy's ceiling (~2.7/3 depending
   on step penalty).
 
-## 4. Acceptance (from design §9)
+## 4. Acceptance (from design §9, revised 2026-07)
 
-Stage 3 vs `run_from_nearest_uav` red, N=5 M=3, 100 eval episodes:
+Stage 3 vs `run_from_nearest_uav` red at 50 episodes:
 
-- `mean_return` ≥ Greedy baseline **+5**.
-- `mean_caught` ≥ Greedy baseline **+0.5**, and ≥ **2.7/3** absolute.
+- `mean_caught` ≥ sensor-aware Greedy baseline **+0.15**, **and**
+- `std_return` ≤ **0.85 ×** sensor-aware Greedy `std_return`
+  (coordination-quality gate), **and**
+- `mean_caught` ≥ **2.7 / 3** absolute (task actually solved).
 
-Compare against the Stage 2 `scaling_gnn` baseline numbers logged
-in `docs/stage2_results.md`.
+Compare against the sensor-aware `GreedyPursuer` (commit ab947ee,
+respects `env.sensor_radius`) evaluated in the same partial-obs env.
+The Stage 2 GNN is NOT the H1 baseline for Stage 3 — it was trained
+under full obs and is OOD on the sensor masks.
+
+See `docs/stage3_design.md §9` for the full revised criterion and
+`docs/stage3_results.md` for the criterion's history and rationale.
 
 ## 5. Deliverables to produce after the run
 

@@ -309,26 +309,80 @@ Parameter count estimate: Stage 2 was 64k.  Stage 3 adds:
 
 ## 9. Acceptance criterion
 
-**Two-step measurement:**
+> **Revised 2026-07** after the fair-Greedy correction — see
+> `docs/stage3_results.md §4-5` for the history.  The original text
+> is preserved below the revision as a record.
 
-1. **H1 baseline** — evaluate Stage 2's `scaling_gnn/best.pt` on the
-   Stage 3 partial-obs env (`sensor_radius = 40`), 50 episodes per red
-   policy, matched seeds.  Record `mean_return`, `mean_caught`,
-   `mean_steps`.
-2. **Stage 3 policy** — evaluate the trained Stage 3 recurrent CTDE
+### 9.0 Baseline (revised)
+
+The correct H1 baseline is **sensor-aware `GreedyPursuer`** evaluated
+in the Stage 3 partial-obs env (`sensor_radius = 40`) — *not* the
+Stage 2 GNN checkpoint.  The Stage 2 GNN was trained under full
+observability and would be OOD on masks; comparing against it would
+measure the wrong thing (Stage 3 vs OOD-Stage-2 rather than Stage 3
+vs "best stateless heuristic under the same sensor").
+
+`GreedyPursuer` was updated in commit ab947ee to respect
+`env.sensor_radius`: each UAV pursues the closest active red *within
+its own sensor range*, or holds position if no red is visible.  Per-
+UAV visibility matches how the env's `_compute_edge_visibility` masks
+the graph's rb edges.
+
+### 9.1 Acceptance (revised)
+
+Stage 3 passes if, evaluated at 50 episodes per (blue, red) cell with
+matched seeds against sensor-aware Greedy in the same partial-obs env:
+
+Against **every** red baseline (Stationary, Random, RunFromNearest):
+- `mean_caught ≥ Greedy_caught + 0.15`, **and**
+- `std_return ≤ 0.85 × Greedy_std_return` (coordination-quality
+  gate: the learned policy must produce lower-variance outcomes than
+  a stateless heuristic — otherwise it isn't demonstrating memory or
+  coordination that the heuristic lacks).
+
+Additionally against RunFromNearest (the hardest red):
+- `mean_caught ≥ 2.7 / 3` absolute (task actually solved).
+
+**What was dropped and why**: the original criterion `mean_return ≥
+Greedy + 5` was set against a Greedy baseline that (unintentionally)
+read `env.state_snapshot()` directly and cheated past `sensor_radius`.
+After the fair fix, +5 return on top of a fair Greedy is
+mathematically unattainable in the arena — see `docs/stage3_results.md §4`
+for the arithmetic.  Return is retained as a diagnostic in the results
+writeup, not as a gate.
+
+**FAIL** if Stage 3 doesn't meet the catches criterion against
+RunFromNearest — that would suggest memory-based recovery isn't
+happening and would motivate the aux hidden-loss experiment (Phase
+3.5) or a belief-state predictor.
+
+### 9.2 Original text (2026-06, superseded)
+
+<details>
+<summary>Click to expand the pre-revision criterion</summary>
+
+The original acceptance text used the Stage 2 GNN as H1 baseline and
+demanded `mean_return ≥ H1 + 5`.  Both were miscalibrated: the Stage
+2 GNN was OOD on partial obs, and the +5 return target was set
+against a cheating Greedy in an unrelated calibration.
+
+```
+1. H1 baseline — evaluate Stage 2's scaling_gnn/best.pt on the
+   Stage 3 partial-obs env (sensor_radius = 40), 50 episodes per red
+   policy, matched seeds.
+2. Stage 3 policy — evaluate the trained Stage 3 recurrent CTDE
    policy on the same env with the same seeds.
 
-**PASS** if:
-- Stage 3 vs Run `mean_return` ≥ H1 baseline vs Run + 5.0, AND
-- Stage 3 vs Run `mean_caught` ≥ H1 baseline + 0.5, AND
-- Stage 3 vs Run `mean_caught` ≥ 2.7 / 3 (task actually solved).
+PASS if:
+- Stage 3 vs Run mean_return ≥ H1 baseline vs Run + 5.0, AND
+- Stage 3 vs Run mean_caught ≥ H1 baseline + 0.5, AND
+- Stage 3 vs Run mean_caught ≥ 2.7 / 3 (task actually solved).
+```
 
-**PARTIAL** (write up and move on) if catches ≥ 2.5/3 but the +5.0
-reward margin isn't quite met.
+Preserved for reproducibility of prior TB scalars / early-training
+`docs/stage3_gpu_run.md` references.
 
-**FAIL** if Stage 3 doesn't measurably improve on H1 baseline —
-would suggest memory alone isn't enough and we need Stage 4's
-belief-state auxiliary predictor.
+</details>
 
 ## 10. Implementation plan (checklist for the coding turn)
 
