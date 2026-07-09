@@ -21,6 +21,7 @@ Outputs go under ``runs/stage3/{timestamp}/``:
     - tb/                 (TensorBoard event files)
     - checkpoint_*.pt     (periodic snapshots)
     - final.pt            (last rollout)
+    - best.pt             (peak checkpoint by --best-ckpt-metric)
     - train_log.txt       (mirror of stdout)
 """
 from __future__ import annotations
@@ -107,6 +108,26 @@ def _parse_args() -> argparse.Namespace:
                         "GRU hidden state to the actor's blue node features "
                         "so bb messages carry belief state across allies.  "
                         "See docs/stage3_design.md §13.")
+    p.add_argument("--lr-schedule", default=d.get("lr_schedule", "linear"),
+                   choices=("constant", "linear"),
+                   help="constant | linear.  linear anneals lr from --lr "
+                        "down to --lr * --lr-min-frac over the run.")
+    p.add_argument("--lr-min-frac", type=float,
+                   default=d.get("lr_min_frac", 0.1),
+                   help="Floor for the linear LR schedule as a fraction of "
+                        "the initial LR.")
+    p.add_argument("--best-ckpt-metric", default=d.get("best_ckpt_metric",
+                                                        "mean_return"),
+                   choices=("mean_return", "mean_caught"),
+                   help="ep_stats field to track for best-checkpoint save.")
+    p.add_argument("--best-ckpt-min-delta", type=float,
+                   default=d.get("best_ckpt_min_delta", 0.05),
+                   help="Minimum improvement over previous best to overwrite "
+                        "best.pt.  Prevents thrashing on noise.")
+    p.add_argument("--best-ckpt-min-episodes", type=int,
+                   default=d.get("best_ckpt_min_episodes", 32),
+                   help="Skip best-ckpt tracking until this many episodes "
+                        "have completed (avoids saving on very-early noise).")
     # Logging / eval
     p.add_argument("--log-interval",   type=int,   default=d["log_interval"])
     p.add_argument("--save-interval",  type=int,   default=d["save_interval"])
@@ -350,7 +371,25 @@ def main() -> None:
     t_start = time.time()
     global_step = 0
 
+    # ---- Best-checkpoint tracking state -------------------------------
+    best_metric_val: float = float("-inf")
+    best_ckpt_path = run_dir / "best.pt"
+
+    def _current_lr_frac(r: int) -> float:
+        """Fraction of args.lr to use at rollout r (0-indexed)."""
+        if args.lr_schedule == "constant" or args.n_rollouts <= 1:
+            return 1.0
+        # Linear: 1.0 at r=0, args.lr_min_frac at r=n_rollouts-1.
+        progress = r / max(args.n_rollouts - 1, 1)
+        return 1.0 + (args.lr_min_frac - 1.0) * progress
+
     for rollout in range(args.n_rollouts):
+        # Apply LR schedule at the start of each rollout.
+        lr_frac = _current_lr_frac(rollout)
+        cur_lr  = args.lr * lr_frac
+        for pg in optimizer.param_groups:
+            pg["lr"] = cur_lr
+
         buffer.reset()
 
         for step in range(args.rollout_steps):
@@ -411,6 +450,8 @@ def main() -> None:
             sps = global_step / max(elapsed, 1e-6)
             aux_str = (f"  aux={update_metrics['aux_hidden_loss']:.4f}"
                        if args.aux_hidden_coef > 0 else "")
+            lr_str  = (f"  lr={cur_lr:.2e}"
+                       if args.lr_schedule != "constant" else "")
             log(
                 f"[rollout {rollout+1:>4d}/{args.n_rollouts}]  "
                 f"steps={global_step:>9d}  sps={sps:>6.0f}  "
@@ -422,7 +463,7 @@ def main() -> None:
                 f"kl={update_metrics['approx_kl']:.4f}  "
                 f"clip={update_metrics['clip_frac']:.3f}  "
                 f"eps={update_metrics['n_epochs_run']}"
-                f"{aux_str}"
+                f"{aux_str}{lr_str}"
             )
         writer.add_scalar("rollout/mean_return", ep_stats["mean_return"], global_step)
         writer.add_scalar("rollout/mean_caught", ep_stats["mean_caught"], global_step)
@@ -434,6 +475,31 @@ def main() -> None:
         writer.add_scalar("ppo/clip_frac",       update_metrics["clip_frac"],       global_step)
         writer.add_scalar("ppo/n_epochs_run",    update_metrics["n_epochs_run"],    global_step)
         writer.add_scalar("ppo/aux_hidden_loss", update_metrics["aux_hidden_loss"], global_step)
+        writer.add_scalar("ppo/lr",              cur_lr,                            global_step)
+
+        # ---- Best-checkpoint tracking ---------------------------------
+        # Save whenever the tracked ep_stats metric beats the previous
+        # best by at least best_ckpt_min_delta.  Guards the training peak
+        # against the late-training degradation observed on the Phase
+        # 3.5/3.6 runs (see docs/stage3_results.md).
+        n_completed = int(ep_stats.get("n_completed", 0))
+        if n_completed >= args.best_ckpt_min_episodes:
+            metric_val = float(ep_stats.get(args.best_ckpt_metric, 0.0))
+            if metric_val >= best_metric_val + args.best_ckpt_min_delta:
+                best_metric_val = metric_val
+                torch.save({
+                    "policy_state": policy.state_dict(),
+                    "rollout":      rollout + 1,
+                    "global_step":  global_step,
+                    "args":         args_dict_saved,
+                    "best_metric":  {
+                        "name":         args.best_ckpt_metric,
+                        "value":        metric_val,
+                        "n_completed":  n_completed,
+                    },
+                }, best_ckpt_path)
+                writer.add_scalar("rollout/best_metric",
+                                  metric_val, global_step)
 
         if (rollout + 1) % args.save_interval == 0:
             ckpt_path = run_dir / f"checkpoint_{rollout+1:05d}.pt"

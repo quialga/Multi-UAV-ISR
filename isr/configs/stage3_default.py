@@ -71,6 +71,26 @@ STAGE3_DEFAULTS = {
     # docs/stage3_design.md §13.
     "use_hidden_in_gnn": False,
 
+    # ----- LR schedule ---------------------------------------------------
+    # PPO late-training instability fix.  With a constant LR at low
+    # entropy, gradient steps have disproportionately large behavioural
+    # effect; linear decay dampens this.
+    # "constant" : LR stays at ``lr`` for the whole run (legacy behaviour).
+    # "linear"   : LR anneals from ``lr`` down to ``lr * lr_min_frac``
+    #              linearly over the total rollouts.
+    "lr_schedule": "linear",
+    "lr_min_frac": 0.1,
+
+    # ----- Best-checkpoint tracking --------------------------------------
+    # After every rollout, if ep_stats.mean_return exceeds the previous
+    # best by ``best_ckpt_min_delta``, save the current policy weights
+    # as runs/stage3/<run>/best.pt.  Guards the training peak against
+    # the late-training degradation observed in Phase 3.5/3.6 runs.
+    "best_ckpt_metric":    "mean_return",   # or "mean_caught"
+    "best_ckpt_min_delta": 0.05,
+    "best_ckpt_min_episodes": 32,           # only start tracking after
+                                             # this many completed episodes
+
     # ----- Warm start ---------------------------------------------------
     # Path to the Stage 2 checkpoint whose GNN + critic head we copy
     # into the CTDE critic path at init.  Set to None to skip warm-start.
