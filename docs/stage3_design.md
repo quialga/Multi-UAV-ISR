@@ -426,6 +426,81 @@ either the sensor radius is too aggressive, or the partial-obs
 regime needs an explicit belief-state auxiliary loss (Stage 4's
 concept).  Would inform the Stage 4 spec directly.
 
+## 13. Option 1 — Cross-blue hidden state sharing via GNN (Phase 3.6)
+
+**Status**: 2026-07 follow-up.  Motivated by the Phase 3.5 aux-loss
+experiments (see `docs/stage3_results.md § Phase 3.5`) — option C
+was chosen as Stage 3's final architecture, but its ceiling of 2.92
+catches / 3 vs Run appears to be capped by an architectural
+limitation.
+
+### 13.1 The observation
+
+In the current architecture ([`gnn_ctde_policy.py:272-302`](../isr/agents/gnn_ctde_policy.py:272)):
+
+- The GNN encoder aggregates messages between blues based **only on
+  current-step observations**.
+- The GRU updates each blue's hidden state using **only that blue's
+  own** encoded observation and **only that blue's own** previous
+  hidden state — the GRU is applied per-blue-independently on
+  parameter-shared weights.
+
+Result: cross-blue information sharing happens *within* a step
+(GNN) but not *across* steps (private GRU memory).  If blue A saw a
+red at position X at step t and lost it at step t+1 (masked), blue A
+remembers X but blue B never receives that memory over subsequent
+steps — unless blue A's *current* embedding at t+1 happens to reveal
+it indirectly.
+
+### 13.2 The fix
+
+Feed the previous-step hidden state of each blue as an **additional
+node feature** into the actor's GNN encoder.  Then the GNN's bb
+message passing carries the memory of every blue to every other
+blue.
+
+Concretely:
+```
+augmented_blue_features[i] = concat( blue_features[i], hidden_prev[i] )
+                              # dim = blue_feat_dim + d_hidden
+h_blue = actor_encoder( augmented_blue_features, ... )
+```
+
+### 13.3 What changes
+
+- Actor encoder's `blue_feat_dim` grows from 8 → 8 + d_hidden = 72.
+  Only the actor path is affected; the CTDE critic still takes plain
+  8-dim blue features (the critic sees full state, doesn't need
+  actor hidden as input).
+- One extra `torch.cat` in `actor_forward` before the encoder call.
+- The aux belief-state loss (option C) still targets the critic
+  encoder's output — semantically unchanged.
+- Parameter count grows by ~5 k (actor `blue_input_mlp` gets a wider
+  input layer).
+- Gated on a `--share-hidden-via-gnn` flag, off by default.  Backward
+  compat: old checkpoints load unchanged (default False, encoder
+  input dim stays 8).
+
+### 13.4 Hypothesis
+
+- **Positive result**: option 1 gives blues a memory channel to
+  broadcast belief across time.  If C's 2.92 ceiling is due to the
+  private-hidden bottleneck (not arena geometry or red speed),
+  catches should push toward 3.0/3 vs Run.
+- **Null result**: catches stay at ~2.92.  Then the ceiling is
+  environmental (irreducible), not architectural.  Still a portfolio
+  observation.
+- **Negative result**: unlikely, but if the extra input dim causes
+  optimization instability, we can either regularize or wrap the
+  hidden feed with a dedicated projection.
+
+### 13.5 Acceptance for option 1 vs option C
+
+Option 1 is worth adopting over option C iff **`mean_caught vs Run`
+improves by ≥ 0.03** and the coordination-quality gate (std_return
+≤ 0.85 × Greedy) is preserved.  A ~2.95 / 3 result would clear this
+bar cleanly.
+
 ## 12. References
 
 - **CTDE**: MADDPG (Lowe et al., 2017, NeurIPS), MAPPO (Yu et al.,

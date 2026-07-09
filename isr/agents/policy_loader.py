@@ -73,15 +73,18 @@ def load_policy(
         ).to(device)
     elif policy_type == "gnn_ctde":
         policy = GNNCTDEPolicy(
-            n_blue        = int(args["n_blue"]),
-            n_red         = int(args["n_red"]),
-            blue_feat_dim = 8,
-            red_feat_dim  = 1,
-            edge_feat_dim = 7,
-            action_dim    = 2,
-            d_hidden      = int(args.get("d_hidden", 64)),
-            n_msg_rounds  = int(args.get("n_msg_rounds", 2)),
-            init_log_std  = STAGE1_DEFAULTS["init_log_std"],
+            n_blue            = int(args["n_blue"]),
+            n_red             = int(args["n_red"]),
+            blue_feat_dim     = 8,
+            red_feat_dim      = 1,
+            edge_feat_dim     = 7,
+            action_dim        = 2,
+            d_hidden          = int(args.get("d_hidden", 64)),
+            n_msg_rounds      = int(args.get("n_msg_rounds", 2)),
+            init_log_std      = STAGE1_DEFAULTS["init_log_std"],
+            use_hidden_in_gnn = bool(args.get("share_hidden_via_gnn",
+                                              args.get("use_hidden_in_gnn",
+                                                       False))),
         ).to(device)
     else:
         raise RuntimeError(

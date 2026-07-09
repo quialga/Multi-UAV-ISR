@@ -256,14 +256,11 @@ def ppo_update_ctde(
             # so the metric schema is consistent.
             if aux_hidden_coef > 0.0:
                 # Actor's partial-obs pre-GRU node embeddings (trainable).
-                h_blue_actor, _ = policy.actor_encoder(
-                    partial_obs["blue_features"],
-                    partial_obs["red_features"],
-                    partial_obs["bb_edge_features"],
-                    partial_obs["rb_edge_features"],
-                    bb_visible=partial_obs["bb_edge_visible"],
-                    rb_visible=partial_obs["rb_edge_visible"],
-                )   # (mb, N_blue, d_hidden)
+                # Routes through policy.actor_encode so the hidden-in-GNN
+                # augmentation (Phase 3.6) is handled identically to
+                # actor_forward.
+                h_blue_actor, _ = policy.actor_encode(partial_obs, hidden)
+                # (mb, N_blue, d_hidden)
                 # Critic's full-obs pre-aggregation node embeddings.
                 # Detached — only the actor's encoder is trained by this loss.
                 with torch.no_grad():

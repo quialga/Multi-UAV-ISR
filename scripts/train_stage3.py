@@ -101,6 +101,12 @@ def _parse_args() -> argparse.Namespace:
                         "drifting one.  Requires --warm-start-critic to be "
                         "set to a valid path.  value_loss is still computed "
                         "as a diagnostic but no longer updates the critic.")
+    p.add_argument("--share-hidden-via-gnn", action="store_true",
+                   default=d.get("use_hidden_in_gnn", False),
+                   help="Phase 3.6 option 1: prepend the previous per-blue "
+                        "GRU hidden state to the actor's blue node features "
+                        "so bb messages carry belief state across allies.  "
+                        "See docs/stage3_design.md §13.")
     # Logging / eval
     p.add_argument("--log-interval",   type=int,   default=d["log_interval"])
     p.add_argument("--save-interval",  type=int,   default=d["save_interval"])
@@ -253,15 +259,16 @@ def main() -> None:
 
     # ---- Policy + optimiser ------------------------------------------
     policy = GNNCTDEPolicy(
-        n_blue        = vec_env.n_blue,
-        n_red         = vec_env.n_red,
-        blue_feat_dim = vec_env.blue_feat_dim,
-        red_feat_dim  = vec_env.red_feat_dim,
-        edge_feat_dim = vec_env.edge_feat_dim,
-        action_dim    = action_dim,
-        d_hidden      = args.d_hidden,
-        n_msg_rounds  = args.n_msg_rounds,
-        init_log_std  = STAGE3_DEFAULTS.get("init_log_std", 0.0),
+        n_blue            = vec_env.n_blue,
+        n_red             = vec_env.n_red,
+        blue_feat_dim     = vec_env.blue_feat_dim,
+        red_feat_dim      = vec_env.red_feat_dim,
+        edge_feat_dim     = vec_env.edge_feat_dim,
+        action_dim        = action_dim,
+        d_hidden          = args.d_hidden,
+        n_msg_rounds      = args.n_msg_rounds,
+        init_log_std      = STAGE3_DEFAULTS.get("init_log_std", 0.0),
+        use_hidden_in_gnn = args.share_hidden_via_gnn,
     ).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     n_params = sum(p.numel() for p in policy.parameters())

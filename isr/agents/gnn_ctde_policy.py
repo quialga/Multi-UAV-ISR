@@ -214,27 +214,44 @@ class GNNCTDEPolicy(nn.Module):
 
     def __init__(
         self,
-        n_blue:         int,
-        n_red:          int,
-        blue_feat_dim:  int = 8,
-        red_feat_dim:   int = 1,
-        edge_feat_dim:  int = 7,
-        action_dim:     int = 2,
-        d_hidden:       int = 64,
-        n_msg_rounds:   int = 2,
-        init_log_std:   float = 0.0,
+        n_blue:            int,
+        n_red:             int,
+        blue_feat_dim:     int   = 8,
+        red_feat_dim:      int   = 1,
+        edge_feat_dim:     int   = 7,
+        action_dim:        int   = 2,
+        d_hidden:          int   = 64,
+        n_msg_rounds:      int   = 2,
+        init_log_std:      float = 0.0,
+        use_hidden_in_gnn: bool  = False,
     ) -> None:
+        """
+        ``use_hidden_in_gnn`` (Phase 3.6, docs/stage3_design.md §13):
+        when True, the previous-step per-blue GRU hidden state is
+        concatenated with ``blue_features`` before the actor's GNN
+        encoder is called.  The GNN's bb messages then carry belief
+        state across blues (option 1 for cross-blue coordination).
+        Only the actor path is affected — the CTDE critic still
+        consumes plain blue features on full state.
+        """
         super().__init__()
-        self.n_blue     = n_blue
-        self.n_red      = n_red
-        self.d_hidden   = d_hidden
-        self.action_dim = action_dim
+        self.n_blue            = n_blue
+        self.n_red             = n_red
+        self.d_hidden          = d_hidden
+        self.action_dim        = action_dim
+        self.use_hidden_in_gnn = use_hidden_in_gnn
+
+        # Actor encoder blue-input dim depends on whether we prepend
+        # the previous hidden state to the blue node features.
+        actor_blue_feat_dim = (
+            blue_feat_dim + d_hidden if use_hidden_in_gnn else blue_feat_dim
+        )
 
         # ---- Actor path ----------------------------------------------
         self.actor_encoder = GNNEncoder(
             n_blue        = n_blue,
             n_red         = n_red,
-            blue_feat_dim = blue_feat_dim,
+            blue_feat_dim = actor_blue_feat_dim,
             red_feat_dim  = red_feat_dim,
             edge_feat_dim = edge_feat_dim,
             d_hidden      = d_hidden,
@@ -269,6 +286,35 @@ class GNNCTDEPolicy(nn.Module):
     #  Sub-forwards                                                        #
     # ------------------------------------------------------------------ #
 
+    def actor_encode(
+        self,
+        partial_obs: Dict[str, torch.Tensor],
+        hidden:      torch.Tensor,       # (B, N_blue, d_hidden)
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Run the actor's GNN encoder on ``partial_obs``, optionally
+        with the previous per-blue hidden state prepended to the
+        blue node features (Phase 3.6 cross-blue belief sharing).
+
+        Returns (h_blue, h_red) — the pre-GRU node embeddings.  Shared
+        between ``actor_forward`` and the aux belief-state loss so
+        both paths see the same encoder input.
+        """
+        if self.use_hidden_in_gnn:
+            blue_input = torch.cat(
+                [partial_obs["blue_features"], hidden], dim=-1,
+            )
+        else:
+            blue_input = partial_obs["blue_features"]
+        return self.actor_encoder(
+            blue_input,
+            partial_obs["red_features"],
+            partial_obs["bb_edge_features"],
+            partial_obs["rb_edge_features"],
+            bb_visible=partial_obs["bb_edge_visible"],
+            rb_visible=partial_obs["rb_edge_visible"],
+        )
+
     def actor_forward(
         self,
         partial_obs: Dict[str, torch.Tensor],
@@ -279,14 +325,7 @@ class GNNCTDEPolicy(nn.Module):
 
         Returns (mean, log_std_expanded, new_hidden).
         """
-        h_blue, _ = self.actor_encoder(
-            partial_obs["blue_features"],
-            partial_obs["red_features"],
-            partial_obs["bb_edge_features"],
-            partial_obs["rb_edge_features"],
-            bb_visible=partial_obs["bb_edge_visible"],
-            rb_visible=partial_obs["rb_edge_visible"],
-        )                                             # (B, N_blue, d)
+        h_blue, _ = self.actor_encode(partial_obs, hidden)   # (B, N_blue, d)
         B = h_blue.shape[0]
         d = self.d_hidden
 
