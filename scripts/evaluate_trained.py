@@ -145,8 +145,12 @@ def write_results_md(
     n_red:           int,
     gif_paths:       Dict[str, Path],
     eval_episodes:   int,
+    stage_label:     str = "Stage 2",
+    bar_label:       str = "1.20 × GreedyPursuer",
 ) -> None:
-    """Render the Stage 1 results writeup."""
+    """Render the results writeup.  ``stage_label`` + ``bar_label`` are
+    populated by the caller so the same template serves Stage 1/2 and
+    Stage 3 without a fork."""
     passed = trained_vs_run >= acceptance_bar
     verdict = "PASS" if passed else "FAIL"
     margin = trained_vs_run - acceptance_bar
@@ -166,11 +170,11 @@ def write_results_md(
         f"- [{name}]({path.as_posix()})" for name, path in gif_paths.items()
     )
 
-    md = f"""# Stage 1 — Results
+    md = f"""# {stage_label} — Results
 
 **Acceptance verdict: {verdict}**
 (trained policy mean return vs `run_from_nearest_uav`: **{trained_vs_run:+.2f}**;
-bar = 1.20 × GreedyPursuer = **{acceptance_bar:+.2f}**; margin = **{margin:+.2f}**)
+bar = {bar_label} = **{acceptance_bar:+.2f}**; margin = **{margin:+.2f}**)
 
 Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}
 Checkpoint: `{ckpt_path}`
@@ -382,6 +386,12 @@ def main() -> None:
     md_default = ("docs/stage3_results.md" if policy_type == "gnn_ctde"
                   else "docs/stage2_results.md")
     md_path = Path(args.results_md or md_default).resolve()
+    if policy_type == "gnn_ctde":
+        stage_label = "Stage 3"
+        bar_label = "GreedyPursuer + 5 (Stage 3 §9 return criterion)"
+    else:
+        stage_label = "Stage 2"
+        bar_label = "1.20 × GreedyPursuer"
     write_results_md(
         out_path        = md_path,
         ckpt_path       = ckpt_path,
@@ -395,6 +405,8 @@ def main() -> None:
                               else v
                            for k, v in gif_paths.items()},
         eval_episodes   = args.n_episodes,
+        stage_label     = stage_label,
+        bar_label       = bar_label,
     )
     print(f"Markdown writeup: {md_path}")
 
