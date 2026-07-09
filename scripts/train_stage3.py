@@ -94,6 +94,13 @@ def _parse_args() -> argparse.Namespace:
                    help="Coef for belief-state distillation MSE loss "
                         "(0 disables — baseline Stage 3).  See "
                         "docs/stage3_design.md follow-up.")
+    p.add_argument("--freeze-critic", action="store_true",
+                   help="Freeze the entire CTDE critic (encoder + trunk + "
+                        "head) at the warm-started weights.  The aux target "
+                        "then becomes a stable Stage 2 oracle instead of a "
+                        "drifting one.  Requires --warm-start-critic to be "
+                        "set to a valid path.  value_loss is still computed "
+                        "as a diagnostic but no longer updates the critic.")
     # Logging / eval
     p.add_argument("--log-interval",   type=int,   default=d["log_interval"])
     p.add_argument("--save-interval",  type=int,   default=d["save_interval"])
@@ -263,6 +270,7 @@ def main() -> None:
 
     # ---- Warm-start critic from a Stage 2 checkpoint -----------------
     warm_path = args.warm_start_critic
+    warm_ok = False
     if warm_path and warm_path.lower() not in ("", "none"):
         if not Path(warm_path).exists():
             log(f"WARNING: warm_start_critic path {warm_path} does not exist. "
@@ -270,8 +278,33 @@ def main() -> None:
         else:
             n_copied = policy.load_stage2_critic(warm_path)
             log(f"Warm-started CTDE critic from {warm_path} — copied {n_copied} tensors.")
+            warm_ok = True
     else:
         log("No critic warm-start (random init for the critic path).")
+
+    # ---- Optional: freeze the critic ---------------------------------
+    # When on, the critic is a fixed Stage 2 oracle throughout Stage 3
+    # training.  All aux belief-state distillation runs against this
+    # stable target (option A in docs/stage3_design.md follow-up).
+    if args.freeze_critic:
+        if not warm_ok:
+            raise ValueError(
+                "--freeze-critic requires --warm-start-critic to be a valid "
+                "path (otherwise you would freeze a randomly initialised "
+                "critic, which would produce meaningless value estimates "
+                "and a meaningless aux target)."
+            )
+        for p_ in policy.critic_encoder.parameters():
+            p_.requires_grad = False
+        for p_ in policy.critic_trunk.parameters():
+            p_.requires_grad = False
+        for p_ in policy.critic_head.parameters():
+            p_.requires_grad = False
+        n_frozen    = sum(p_.numel() for p_ in policy.parameters()
+                          if not p_.requires_grad)
+        n_trainable = sum(p_.numel() for p_ in policy.parameters()
+                          if p_.requires_grad)
+        log(f"Critic frozen: {n_frozen} params frozen, {n_trainable} trainable.")
 
     args_dict_saved = {**vars(args), "policy_type": "gnn_ctde"}
 

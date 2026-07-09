@@ -43,12 +43,18 @@ STAGE3_DEFAULTS = {
     "target_kl":      0.03,    # None disables — Stage 3 default is on
 
     # ----- Belief-state distillation (optional) -------------------------
-    # Auxiliary MSE loss regressing the actor's partial-obs GRU hidden
-    # state toward the hidden state that would have been produced under
-    # full observability.  0.0 disables the aux loss — the baseline
+    # Auxiliary MSE loss regressing the actor's partial-obs GNN encoder
+    # output (per-blue node embeddings) toward the CRITIC encoder's
+    # full-obs output.  0.0 disables the aux loss — the baseline
     # Stage 3 run trains without it, and it becomes a controlled
     # experiment (Phase 3.5).  See docs/stage3_design.md follow-up.
     "aux_hidden_coef": 0.0,
+
+    # When True, freezes the entire CTDE critic (encoder + trunk + head)
+    # at the warm-started Stage 2 weights.  Aux target becomes a stable
+    # Stage 2 oracle rather than a drifting one.  Set via --freeze-critic
+    # on the CLI.  Requires warm_start_critic to be a valid path.
+    "freeze_critic": False,
 
     # ----- Warm start ---------------------------------------------------
     # Path to the Stage 2 checkpoint whose GNN + critic head we copy
