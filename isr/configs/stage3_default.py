@@ -42,6 +42,14 @@ STAGE3_DEFAULTS = {
     "ent_coef":       0.018,   # matches scaling_gnn from Stage 2 §2.3
     "target_kl":      0.03,    # None disables — Stage 3 default is on
 
+    # ----- Belief-state distillation (optional) -------------------------
+    # Auxiliary MSE loss regressing the actor's partial-obs GRU hidden
+    # state toward the hidden state that would have been produced under
+    # full observability.  0.0 disables the aux loss — the baseline
+    # Stage 3 run trains without it, and it becomes a controlled
+    # experiment (Phase 3.5).  See docs/stage3_design.md follow-up.
+    "aux_hidden_coef": 0.0,
+
     # ----- Warm start ---------------------------------------------------
     # Path to the Stage 2 checkpoint whose GNN + critic head we copy
     # into the CTDE critic path at init.  Set to None to skip warm-start.

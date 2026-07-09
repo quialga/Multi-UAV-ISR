@@ -89,6 +89,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gae-lambda",     type=float, default=d["gae_lambda"])
     p.add_argument("--target-kl",      type=float, default=d["target_kl"],
                    help="Per-epoch mean-KL early stop.  Pass 0 to disable.")
+    p.add_argument("--aux-hidden-coef", type=float,
+                   default=d["aux_hidden_coef"],
+                   help="Coef for belief-state distillation MSE loss "
+                        "(0 disables — baseline Stage 3).  See "
+                        "docs/stage3_design.md follow-up.")
     # Logging / eval
     p.add_argument("--log-interval",   type=int,   default=d["log_interval"])
     p.add_argument("--save-interval",  type=int,   default=d["save_interval"])
@@ -345,24 +350,27 @@ def main() -> None:
         buffer.compute_gae(last_value, args.gamma, args.gae_lambda)
 
         update_metrics = ppo_update_ctde(
-            policy        = policy,
-            optimizer     = optimizer,
-            buffer        = buffer,
-            clip_eps      = args.clip_eps,
-            ent_coef      = args.ent_coef,
-            vf_coef       = args.vf_coef,
-            max_grad_norm = args.max_grad_norm,
-            n_epochs      = args.n_epochs,
-            mb_size       = args.mb_size,
-            value_clip    = STAGE3_DEFAULTS["value_clip"],
-            normalize_adv = STAGE3_DEFAULTS["normalize_adv"],
-            target_kl     = target_kl_arg,
+            policy          = policy,
+            optimizer       = optimizer,
+            buffer          = buffer,
+            clip_eps        = args.clip_eps,
+            ent_coef        = args.ent_coef,
+            vf_coef         = args.vf_coef,
+            max_grad_norm   = args.max_grad_norm,
+            n_epochs        = args.n_epochs,
+            mb_size         = args.mb_size,
+            value_clip      = STAGE3_DEFAULTS["value_clip"],
+            normalize_adv   = STAGE3_DEFAULTS["normalize_adv"],
+            target_kl       = target_kl_arg,
+            aux_hidden_coef = args.aux_hidden_coef,
         )
 
         ep_stats = vec_env.recent_episode_stats()
         if (rollout + 1) % args.log_interval == 0:
             elapsed = time.time() - t_start
             sps = global_step / max(elapsed, 1e-6)
+            aux_str = (f"  aux={update_metrics['aux_hidden_loss']:.4f}"
+                       if args.aux_hidden_coef > 0 else "")
             log(
                 f"[rollout {rollout+1:>4d}/{args.n_rollouts}]  "
                 f"steps={global_step:>9d}  sps={sps:>6.0f}  "
@@ -374,16 +382,18 @@ def main() -> None:
                 f"kl={update_metrics['approx_kl']:.4f}  "
                 f"clip={update_metrics['clip_frac']:.3f}  "
                 f"eps={update_metrics['n_epochs_run']}"
+                f"{aux_str}"
             )
         writer.add_scalar("rollout/mean_return", ep_stats["mean_return"], global_step)
         writer.add_scalar("rollout/mean_caught", ep_stats["mean_caught"], global_step)
         writer.add_scalar("rollout/mean_length", ep_stats["mean_length"], global_step)
-        writer.add_scalar("ppo/policy_loss",  update_metrics["policy_loss"],  global_step)
-        writer.add_scalar("ppo/value_loss",   update_metrics["value_loss"],   global_step)
-        writer.add_scalar("ppo/entropy",      update_metrics["entropy"],      global_step)
-        writer.add_scalar("ppo/approx_kl",    update_metrics["approx_kl"],    global_step)
-        writer.add_scalar("ppo/clip_frac",    update_metrics["clip_frac"],    global_step)
-        writer.add_scalar("ppo/n_epochs_run", update_metrics["n_epochs_run"], global_step)
+        writer.add_scalar("ppo/policy_loss",     update_metrics["policy_loss"],     global_step)
+        writer.add_scalar("ppo/value_loss",      update_metrics["value_loss"],      global_step)
+        writer.add_scalar("ppo/entropy",         update_metrics["entropy"],         global_step)
+        writer.add_scalar("ppo/approx_kl",       update_metrics["approx_kl"],       global_step)
+        writer.add_scalar("ppo/clip_frac",       update_metrics["clip_frac"],       global_step)
+        writer.add_scalar("ppo/n_epochs_run",    update_metrics["n_epochs_run"],    global_step)
+        writer.add_scalar("ppo/aux_hidden_loss", update_metrics["aux_hidden_loss"], global_step)
 
         if (rollout + 1) % args.save_interval == 0:
             ckpt_path = run_dir / f"checkpoint_{rollout+1:05d}.pt"

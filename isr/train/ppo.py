@@ -122,23 +122,24 @@ def ppo_update(
 
 
 # ---------------------------------------------------------------------------
-# Stage 3: CTDE + recurrent PPO update
+# Stage 3: CTDE + recurrent PPO update (with optional aux hidden loss)
 # ---------------------------------------------------------------------------
 
 def ppo_update_ctde(
     policy,
-    optimizer:     torch.optim.Optimizer,
-    buffer:        RecurrentGraphRolloutBuffer,
+    optimizer:      torch.optim.Optimizer,
+    buffer:         RecurrentGraphRolloutBuffer,
     *,
-    clip_eps:      float,
-    ent_coef:      float,
-    vf_coef:       float,
-    max_grad_norm: float,
-    n_epochs:      int,
-    mb_size:       int,
-    value_clip:    bool = True,
-    normalize_adv: bool = True,
-    target_kl:     float = None,   # optional early stop on epoch mean KL
+    clip_eps:       float,
+    ent_coef:       float,
+    vf_coef:        float,
+    max_grad_norm:  float,
+    n_epochs:       int,
+    mb_size:        int,
+    value_clip:     bool  = True,
+    normalize_adv:  bool  = True,
+    target_kl:      float = None,   # optional early stop on epoch mean KL
+    aux_hidden_coef:float = 0.0,    # 0.0 disables belief-state distillation
 ) -> Dict[str, float]:
     """
     Stage 3 PPO update: recurrent actor + centralised (CTDE) critic.
@@ -155,16 +156,33 @@ def ppo_update_ctde(
     epochs in this call are skipped.  Motivated by the higher
     variance of the recurrent actor at scale.
 
-    Returns averaged diagnostics for logging.
+    Optional belief-state distillation via ``aux_hidden_coef > 0``.
+    When on, we run a second actor forward per minibatch with the
+    edge visibility masks set to all-ones (the "full-obs" oracle)
+    under ``no_grad``, and regress the partial-obs GRU hidden state
+    toward the oracle hidden state via MSE.  The oracle-forward
+    gets no gradients (target-style stop-grad); only the partial-obs
+    hidden state is trained toward it.  This is the "belief-state
+    matching" trick from Chen et al. Learning by Cheating and the
+    POMDP privileged-distillation family — the actor learns to
+    encode observations such that its recurrent state approximates
+    what it would have been if the actor had full information.
+    When ``sensor_radius`` is effectively infinite the aux loss is
+    trivially 0 (partial obs equals full obs), so the coef has no
+    effect on fully-observable envs.
+
+    Returns averaged diagnostics for logging (aux_hidden_loss
+    included as 0.0 when the aux path is disabled).
     """
     metrics = {
-        "policy_loss":  0.0,
-        "value_loss":   0.0,
-        "entropy":      0.0,
-        "approx_kl":    0.0,
-        "clip_frac":    0.0,
-        "n_minibatches": 0,
-        "n_epochs_run": 0,
+        "policy_loss":     0.0,
+        "value_loss":      0.0,
+        "entropy":         0.0,
+        "approx_kl":       0.0,
+        "clip_frac":       0.0,
+        "aux_hidden_loss": 0.0,
+        "n_minibatches":   0,
+        "n_epochs_run":    0,
     }
 
     base_keys = ("blue_features", "red_features",
@@ -195,10 +213,13 @@ def ppo_update_ctde(
             }
             full_state = {k: obs[k] for k in base_keys}
 
-            # New forward pass.  new_hidden is discarded (stateless-at-update).
-            _, new_log_probs, entropy, new_values, _ = policy.get_action_and_value(
-                partial_obs, full_state, hidden, action=old_actions,
-            )
+            # New forward pass.  Keep new_hidden_partial for the aux
+            # belief-state MSE (below); otherwise it's discarded per
+            # the stateless-at-update convention.
+            _, new_log_probs, entropy, new_values, new_hidden_partial = \
+                policy.get_action_and_value(
+                    partial_obs, full_state, hidden, action=old_actions,
+                )
 
             adv_bcast = advantages.unsqueeze(-1)                # (mb, 1)
             log_ratio = new_log_probs - old_log_probs           # (mb, N_blue)
@@ -218,7 +239,30 @@ def ppo_update_ctde(
                 value_loss = 0.5 * (new_values - returns).pow(2).mean()
 
             entropy_loss = -entropy.mean()
-            loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
+
+            # Auxiliary belief-state distillation (Chen et al. 2020 style).
+            # Off when aux_hidden_coef == 0 — the tensor is still
+            # constructed for a clean scalar metric.
+            if aux_hidden_coef > 0.0:
+                with torch.no_grad():
+                    full_partial_obs = {
+                        **full_state,
+                        "bb_edge_visible": torch.ones_like(bb_visible),
+                        "rb_edge_visible": torch.ones_like(rb_visible),
+                    }
+                    _, _, oracle_hidden = policy.actor_forward(
+                        full_partial_obs, hidden,
+                    )
+                aux_hidden_loss = (new_hidden_partial - oracle_hidden).pow(2).mean()
+            else:
+                aux_hidden_loss = torch.zeros((), device=new_values.device)
+
+            loss = (
+                policy_loss
+                + vf_coef  * value_loss
+                + ent_coef * entropy_loss
+                + aux_hidden_coef * aux_hidden_loss
+            )
 
             optimizer.zero_grad()
             loss.backward()
@@ -228,12 +272,13 @@ def ppo_update_ctde(
             with torch.no_grad():
                 approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
                 clip_frac = ((ratio - 1.0).abs() > clip_eps).float().mean().item()
-                metrics["policy_loss"]   += policy_loss.item()
-                metrics["value_loss"]    += value_loss.item()
-                metrics["entropy"]       += (-entropy_loss).item()
-                metrics["approx_kl"]     += approx_kl
-                metrics["clip_frac"]     += clip_frac
-                metrics["n_minibatches"] += 1
+                metrics["policy_loss"]     += policy_loss.item()
+                metrics["value_loss"]      += value_loss.item()
+                metrics["entropy"]         += (-entropy_loss).item()
+                metrics["approx_kl"]       += approx_kl
+                metrics["clip_frac"]       += clip_frac
+                metrics["aux_hidden_loss"] += aux_hidden_loss.item()
+                metrics["n_minibatches"]   += 1
                 epoch_kl_sum   += approx_kl
                 epoch_mb_count += 1
 
@@ -243,6 +288,7 @@ def ppo_update_ctde(
                 break
 
     n = max(metrics["n_minibatches"], 1)
-    for k in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_frac"):
+    for k in ("policy_loss", "value_loss", "entropy", "approx_kl",
+              "clip_frac", "aux_hidden_loss"):
         metrics[k] /= n
     return metrics
