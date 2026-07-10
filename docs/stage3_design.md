@@ -309,6 +309,18 @@ Parameter count estimate: Stage 2 was 64k.  Stage 3 adds:
 
 ## 9. Acceptance criterion
 
+> **Stage 3 status: LANDED and CLOSED (2026-07-10).**  All acceptance
+> criteria — original AND revised — met by
+> `runs/stage3/gpu_opt1_critic_frozen/best.pt`.
+> See [`stage3_results.md`](stage3_results.md) for the final numbers,
+> the exact reproduction command, and the Phase 3.5/3.6 experiment log.
+>
+> Headline vs `RunFromNearest`: **+18.16 return, 2.90 caught, 78.9
+> steps** — beats sensor-aware Greedy (+11.47, 2.28, 136.4) on every
+> metric and clears the original "Greedy + 5" return bar by +1.69.
+> Next: Stage 4 (sensor noise + occlusion + explicit belief-state
+> predictor).  See [`design.md §5`](design.md).
+
 > **Revised 2026-07** after the fair-Greedy correction — see
 > `docs/stage3_results.md §4-5` for the history.  The original text
 > is preserved below the revision as a record.
