@@ -112,15 +112,27 @@ class PursuitEnv(ParallelEnv):
 
     def __init__(
         self,
-        n_blue:         int                = 3,
-        n_red:          int                = 2,
-        arena_size:     float              = 100.0,
-        max_steps:      int                = 200,
-        capture_radius: float              = 3.0,
-        dt:             float              = 1.0,
-        red_policy:     Optional[Callable] = None,
-        seed:           Optional[int]      = None,
-        sensor_radius:  Optional[float]    = None,
+        n_blue:                   int                = 3,
+        n_red:                    int                = 2,
+        arena_size:               float              = 100.0,
+        max_steps:                int                = 200,
+        capture_radius:           float              = 3.0,
+        dt:                       float              = 1.0,
+        red_policy:               Optional[Callable] = None,
+        seed:                     Optional[int]      = None,
+        sensor_radius:            Optional[float]    = None,
+        # ---- Stage 4: obstacles + belief map (all optional) --------------
+        n_obstacles:              int   = 0,
+        obstacle_radius_min:      float = 5.0,
+        obstacle_radius_max:      float = 15.0,
+        obstacle_spawn_clearance: float = 10.0,
+        use_belief_maps:          bool  = False,
+        belief_grid_size:         int   = 26,
+        belief_channels:          int   = 2,
+        belief_clip:              float = 10.0,
+        p_TP:                     float = 0.85,
+        p_FP:                     float = 0.15,
+        ray_step_size:            float = 2.5,
     ):
         """
         sensor_radius: Stage 3 partial-observability knob.  When None
@@ -132,6 +144,31 @@ class PursuitEnv(ParallelEnv):
             the graph tensor shape stays constant across timesteps.
             The full-state ``structured_observation()`` remains
             unaffected — used by the CTDE critic.
+
+        Stage 4 params
+        --------------
+        n_obstacles                Number of static circular obstacles
+                                   placed at reset.  Default 0 = no
+                                   obstacles (Stage 1-3 behaviour byte-
+                                   preserved).
+        obstacle_radius_min / _max Uniform sampling range for obstacle
+                                   radii, in metres.
+        obstacle_spawn_clearance   Minimum distance blues and reds must
+                                   spawn from any obstacle boundary.
+        use_belief_maps            When True, allocate and update per-UAV
+                                   log-odds belief maps every step.
+                                   Costs some compute; default False.
+        belief_grid_size           H = W for the belief tensor.  With
+                                   arena_size = 130 and default 26,
+                                   each cell is 5 m across.
+        belief_channels            Number of channels in the belief
+                                   tensor.  Convention: ch 0 = enemy,
+                                   ch 1 = obstacle.
+        belief_clip                Absolute cap on stored log-odds.
+                                   ±10 -> P in ~[5e-5, 1 - 5e-5].
+        p_TP, p_FP                 Sensor detection reliability.
+                                   Same values for both channels in v1.
+        ray_step_size              Ray-cast step for occlusion, in metres.
         """
         super().__init__()
         self.n_blue         = int(n_blue)
@@ -144,6 +181,30 @@ class PursuitEnv(ParallelEnv):
         self.sensor_radius: Optional[float] = (
             float(sensor_radius) if sensor_radius is not None else None
         )
+
+        # ---- Stage 4 knobs ------------------------------------------------
+        self.n_obstacles              = int(n_obstacles)
+        self.obstacle_radius_min      = float(obstacle_radius_min)
+        self.obstacle_radius_max      = float(obstacle_radius_max)
+        self.obstacle_spawn_clearance = float(obstacle_spawn_clearance)
+        self.use_belief_maps          = bool(use_belief_maps)
+        self.belief_grid_size         = int(belief_grid_size)
+        self.belief_channels          = int(belief_channels)
+        self.belief_clip              = float(belief_clip)
+        self.p_TP                     = float(p_TP)
+        self.p_FP                     = float(p_FP)
+        self.ray_step_size            = float(ray_step_size)
+        # Derived quantities.
+        self.belief_cell_size = self.arena_size / max(1, self.belief_grid_size)
+        # Log-odds evidence constants — same for both channels in v1.
+        # Clamp to (eps, 1-eps) so a degenerate p_TP or p_FP passed by
+        # tests / users doesn't blow up log arithmetic.  The tiny
+        # clamp does not change behaviour in normal operating ranges.
+        _eps = 1e-6
+        p_tp_c = min(max(self.p_TP, _eps), 1.0 - _eps)
+        p_fp_c = min(max(self.p_FP, _eps), 1.0 - _eps)
+        self._L_detect    = float(np.log(p_tp_c / p_fp_c))
+        self._L_no_detect = float(np.log((1.0 - p_tp_c) / (1.0 - p_fp_c)))
 
         self._rng = np.random.default_rng(seed)
 
@@ -201,6 +262,15 @@ class PursuitEnv(ParallelEnv):
         # Diagnostic captured from the last step (rendering / logging).
         self._last_n_caught: int = 0
 
+        # ---- Stage 4 mutable state (obstacles + belief) ------------------
+        # ``_obstacle_pos``  (n_obs, 2)   float32 -- centres
+        # ``_obstacle_r``    (n_obs,)     float32 -- radii
+        # ``_belief_maps``   (n_blue, C, H, W) float32 -- per-UAV log-odds
+        # All None when Stage 4 features are disabled.
+        self._obstacle_pos: Optional[np.ndarray] = None
+        self._obstacle_r:   Optional[np.ndarray] = None
+        self._belief_maps:  Optional[np.ndarray] = None
+
     # ------------------------------------------------------------------ #
     #  PettingZoo API                                                     #
     # ------------------------------------------------------------------ #
@@ -220,21 +290,35 @@ class PursuitEnv(ParallelEnv):
             self._rng = np.random.default_rng(seed)
 
         L = self.arena_size
-        # Uniform random initial positions, zero initial velocities.
+
+        # Stage 4: place obstacles BEFORE sampling entity positions so
+        # spawn clearance can reject bad draws.
+        self._place_obstacles()
+
+        # Uniform random initial positions with obstacle clearance.
         # No minimum-separation constraint between blue and red in
         # Stage 1 — caught-at-spawn is rare given typical L/r ratios
         # and the policy will learn to handle it.  We can add a
         # min-separation constraint later if it matters empirically.
-        self._blue_pos = self._rng.uniform(0.0, L,
-                                           size=(self.n_blue, 2)).astype(np.float32)
+        self._blue_pos = self._sample_free_positions(self.n_blue)
         self._blue_vel = np.zeros((self.n_blue, 2), dtype=np.float32)
-        self._red_pos  = self._rng.uniform(0.0, L,
-                                           size=(self.n_red, 2)).astype(np.float32)
+        self._red_pos  = self._sample_free_positions(self.n_red)
         self._red_vel  = np.zeros((self.n_red, 2), dtype=np.float32)
         self._red_active = np.ones(self.n_red, dtype=bool)
         self._t = 0
         self._last_n_caught = 0
         self.agents = list(self.possible_agents)
+
+        # Stage 4: zero belief maps.
+        if self.use_belief_maps:
+            self._belief_maps = np.zeros(
+                (self.n_blue, self.belief_channels,
+                 self.belief_grid_size, self.belief_grid_size),
+                dtype=np.float32,
+            )
+            # First observation update happens before returning obs so
+            # the initial belief map reflects step-0 observations.
+            self._update_belief_maps()
 
         obs = {a: self._build_obs(i) for i, a in enumerate(self.possible_agents)}
         info = {a: {} for a in self.possible_agents}
@@ -268,14 +352,27 @@ class PursuitEnv(ParallelEnv):
 
         # 3. Integrate blue kinematics (double-integrator with axis-wise
         #    velocity cap and arena wall stop).
+        prev_blue_pos = self._blue_pos.copy()
         self._blue_pos, self._blue_vel = self._integrate(
             self._blue_pos, self._blue_vel, blue_a, BLUE_UAV.v_max,
         )
+        # Stage 4: reject moves that land inside any obstacle (soft
+        # crash — position rolled back, velocity zeroed; explicit crash
+        # penalty is a backlog item, see docs/stage4_backlog.md §1).
+        if self.n_obstacles > 0:
+            self._blue_pos, self._blue_vel = self._clip_positions_from_obstacles(
+                self._blue_pos, prev_blue_pos, self._blue_vel,
+            )
 
         # 4. Integrate red kinematics.
+        prev_red_pos = self._red_pos.copy()
         self._red_pos, self._red_vel = self._integrate(
             self._red_pos, self._red_vel, red_a, RED_TARGET.v_max,
         )
+        if self.n_obstacles > 0:
+            self._red_pos, self._red_vel = self._clip_positions_from_obstacles(
+                self._red_pos, prev_red_pos, self._red_vel,
+            )
         # Caught reds stay frozen at their last position.
         self._red_vel[~self._red_active] = 0.0
 
@@ -313,6 +410,13 @@ class PursuitEnv(ParallelEnv):
             r += -5.0 * n_uncaught                          # terminal penalty
             self.agents = []                                # PettingZoo convention
 
+        # Stage 4: update belief maps AFTER movement + capture so
+        # observations reflect the new state.  A caught red will no
+        # longer contribute to the enemy channel's ground truth this
+        # step, so its cells' P(enemy) will decay from now on.
+        if self.use_belief_maps:
+            self._update_belief_maps()
+
         # 8. Pack the per-agent dicts.  Shared team reward — every
         #    blue agent gets the same r.
         rewards     = {a: float(r) for a in self.possible_agents}
@@ -345,7 +449,7 @@ class PursuitEnv(ParallelEnv):
         Read-only snapshot of full env state.  Used by the renderer and
         by tests that need to assert on positions / velocities directly.
         """
-        return {
+        snap = {
             "t":           self._t,
             "blue_pos":    self._blue_pos.copy(),
             "blue_vel":    self._blue_vel.copy(),
@@ -354,6 +458,13 @@ class PursuitEnv(ParallelEnv):
             "red_active":  self._red_active.copy(),
             "n_caught_last_step": self._last_n_caught,
         }
+        # Stage 4: obstacles + belief maps (only when populated).
+        if self._obstacle_pos is not None:
+            snap["obstacle_pos"] = self._obstacle_pos.copy()
+            snap["obstacle_r"]   = self._obstacle_r.copy()
+        if self._belief_maps is not None:
+            snap["belief_maps"] = self._belief_maps.copy()
+        return snap
 
     # ------------------------------------------------------------------ #
     #  Internals                                                          #
@@ -757,6 +868,311 @@ class PursuitEnv(ParallelEnv):
         rb_visible = rb_visible * self._red_active[self.rb_edge_src].astype(np.float32)
 
         return bb_visible, rb_visible
+
+    # ------------------------------------------------------------------ #
+    #  Stage 4: obstacles + belief maps                                    #
+    # ------------------------------------------------------------------ #
+
+    def _place_obstacles(self) -> None:
+        """
+        Rejection-sample ``n_obstacles`` non-overlapping circular
+        obstacles inside the arena.  Called from ``reset()``.
+
+        Placement rules:
+        - Radius drawn uniformly from
+          ``[obstacle_radius_min, obstacle_radius_max]``.
+        - Position sampled uniformly with a wall clearance of
+          ``obstacle_radius_max`` metres.
+        - New obstacle rejected if it overlaps an existing one (a 1 m
+          minimum gap between boundaries).
+        - Up to 200 attempts per obstacle; if placement fails, fewer
+          obstacles land -- exposed via ``len(self._obstacle_pos)``.
+        """
+        if self.n_obstacles <= 0:
+            self._obstacle_pos = np.zeros((0, 2), dtype=np.float32)
+            self._obstacle_r   = np.zeros((0,),   dtype=np.float32)
+            return
+
+        L = self.arena_size
+        max_r = self.obstacle_radius_max
+        placed_pos: list = []
+        placed_r:   list = []
+
+        max_attempts = 200
+        for _ in range(self.n_obstacles):
+            for _attempt in range(max_attempts):
+                r = float(self._rng.uniform(
+                    self.obstacle_radius_min, self.obstacle_radius_max,
+                ))
+                # Position with wall clearance.
+                lo = max_r
+                hi = L - max_r
+                if hi <= lo:
+                    break   # arena too small for the requested radius range
+                pos = self._rng.uniform(lo, hi, size=2).astype(np.float32)
+                ok = True
+                for pp, pr in zip(placed_pos, placed_r):
+                    if float(np.linalg.norm(pos - pp)) < r + pr + 1.0:
+                        ok = False
+                        break
+                if ok:
+                    placed_pos.append(pos)
+                    placed_r.append(r)
+                    break
+
+        if placed_pos:
+            self._obstacle_pos = np.stack(placed_pos, axis=0).astype(np.float32)
+            self._obstacle_r   = np.asarray(placed_r, dtype=np.float32)
+        else:
+            self._obstacle_pos = np.zeros((0, 2), dtype=np.float32)
+            self._obstacle_r   = np.zeros((0,),   dtype=np.float32)
+
+    def _positions_in_any_obstacle(self, positions: np.ndarray) -> np.ndarray:
+        """
+        Vectorised: return a boolean mask (K,) that's True iff the
+        corresponding position lies inside any obstacle disk.  Empty
+        obstacle list returns all-False.
+        """
+        if self._obstacle_pos is None or len(self._obstacle_pos) == 0:
+            return np.zeros(positions.shape[0], dtype=bool)
+        # (K, n_obs) distances
+        diffs = positions[:, None, :] - self._obstacle_pos[None, :, :]
+        dists = np.linalg.norm(diffs, axis=-1)
+        # Inside iff dist <= r for any obstacle.
+        return np.any(dists <= self._obstacle_r[None, :], axis=1)
+
+    def _sample_free_positions(self, k: int) -> np.ndarray:
+        """
+        Uniformly sample ``k`` positions in the arena that are outside
+        every obstacle by at least ``obstacle_spawn_clearance`` metres.
+        Falls back to unclearance-checked uniform sampling after
+        ``max_attempts`` if the obstacle geometry is pathological.
+        """
+        L = self.arena_size
+        if self._obstacle_pos is None or len(self._obstacle_pos) == 0:
+            return self._rng.uniform(0.0, L, size=(k, 2)).astype(np.float32)
+
+        out = np.zeros((k, 2), dtype=np.float32)
+        max_attempts = 100
+        for i in range(k):
+            for _ in range(max_attempts):
+                p = self._rng.uniform(0.0, L, size=2).astype(np.float32)
+                # Clearance check against all obstacles.
+                diffs = p[None, :] - self._obstacle_pos
+                dists = np.linalg.norm(diffs, axis=1)
+                if bool(np.all(dists >= self._obstacle_r + self.obstacle_spawn_clearance)):
+                    out[i] = p
+                    break
+            else:
+                # Fallback: accept any position not literally inside an obstacle.
+                out[i] = self._rng.uniform(0.0, L, size=2).astype(np.float32)
+        return out
+
+    def _clip_positions_from_obstacles(
+        self,
+        new_pos:  np.ndarray,   # (K, 2) post-integration
+        prev_pos: np.ndarray,   # (K, 2) pre-integration
+        vel:      np.ndarray,   # (K, 2) post-integration velocity
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        For each entity whose new position lies inside any obstacle,
+        roll the position back to its previous position and zero the
+        velocity.  Simple "hit an obstacle, stop" model.  Crash penalty
+        is a backlog item.
+        """
+        collided = self._positions_in_any_obstacle(new_pos)
+        if bool(np.any(collided)):
+            new_pos = new_pos.copy()
+            vel     = vel.copy()
+            new_pos[collided] = prev_pos[collided]
+            vel[collided]     = 0.0
+        return new_pos, vel
+
+    def _true_occupancy(self) -> np.ndarray:
+        """
+        Ground-truth occupancy grid of shape
+        ``(belief_channels, belief_grid_size, belief_grid_size)``.
+        Channel 0 = enemy (active reds), channel 1 = obstacle.
+        """
+        H = W = self.belief_grid_size
+        C = self.belief_channels
+        cs = self.belief_cell_size
+        grid = np.zeros((C, H, W), dtype=np.float32)
+
+        # Channel 0: enemy (active reds).
+        for r in range(self.n_red):
+            if not self._red_active[r]:
+                continue
+            cx = int(self._red_pos[r, 0] / cs)
+            cy = int(self._red_pos[r, 1] / cs)
+            if 0 <= cx < W and 0 <= cy < H:
+                grid[0, cx, cy] = 1.0
+
+        # Channel 1: obstacle.  A cell is "obstacle" iff its centre is
+        # inside any obstacle disk (simple and consistent with the
+        # occlusion test).
+        if C >= 2 and self._obstacle_pos is not None and len(self._obstacle_pos) > 0:
+            # Build a (H*W, 2) array of cell centres.
+            xs = (np.arange(W) + 0.5) * cs
+            ys = (np.arange(H) + 0.5) * cs
+            gx, gy = np.meshgrid(xs, ys, indexing="ij")   # (H, W) each
+            centres = np.stack([gx.ravel(), gy.ravel()], axis=1)   # (H*W, 2)
+            diffs = centres[:, None, :] - self._obstacle_pos[None, :, :]
+            dists = np.linalg.norm(diffs, axis=-1)                  # (H*W, n_obs)
+            inside = np.any(dists <= self._obstacle_r[None, :], axis=1)
+            grid[1] = inside.reshape(W, H).astype(np.float32)
+        return grid
+
+    def _cell_occluded_by_obstacle(
+        self,
+        uav_pos:     np.ndarray,   # (2,)
+        cell_centre: np.ndarray,   # (2,)
+    ) -> bool:
+        """
+        Return True iff the straight line from ``uav_pos`` to
+        ``cell_centre`` passes through any obstacle (strictly between
+        the endpoints).  The cell centre itself is allowed to be an
+        obstacle -- the sensor CAN observe obstacle cells to add
+        evidence to the obstacle channel; only cells BEHIND another
+        obstacle along the ray are hidden.
+        """
+        if self._obstacle_pos is None or len(self._obstacle_pos) == 0:
+            return False
+        diff = cell_centre - uav_pos
+        dist = float(np.linalg.norm(diff))
+        if dist < 1e-6:
+            return False
+        n_steps = max(2, int(np.ceil(dist / self.ray_step_size)) + 1)
+        # Sample points strictly between the endpoints.  We EXCLUDE k=n_steps-1
+        # (the endpoint) so the sensor can observe the first obstacle cell it
+        # sees; we EXCLUDE k=0 (the UAV) trivially.
+        ts = np.linspace(0.0, 1.0, n_steps + 1)[1:-1]   # (n_steps - 1,)
+        pts = uav_pos[None, :] + ts[:, None] * diff[None, :]   # (n_steps-1, 2)
+        # For each interior point, distance to all obstacles.
+        # (n_pts, n_obs)
+        dists = np.linalg.norm(
+            pts[:, None, :] - self._obstacle_pos[None, :, :], axis=-1,
+        )
+        # Occluded if ANY interior point is inside ANY obstacle.
+        return bool(np.any(dists < self._obstacle_r[None, :]))
+
+    def _update_belief_maps(self) -> None:
+        """
+        Bayesian log-odds update on ``self._belief_maps`` for every
+        UAV and every observable cell.  See docs/stage4_design.md §3.4
+        for the algorithm.
+
+        No-op when belief maps are disabled or ``sensor_radius`` is not
+        set (the sensor disk is undefined without a radius).
+        """
+        if self._belief_maps is None or self.sensor_radius is None:
+            return
+
+        R  = self.sensor_radius
+        cs = self.belief_cell_size
+        H  = W = self.belief_grid_size
+        C  = self.belief_channels
+
+        # Precompute cell centres and the ground truth grid ONCE per step.
+        xs = (np.arange(W) + 0.5) * cs
+        ys = (np.arange(H) + 0.5) * cs
+        gx, gy = np.meshgrid(xs, ys, indexing="ij")
+        centres = np.stack([gx, gy], axis=-1).astype(np.float32)   # (W, H, 2)
+        truth = self._true_occupancy()                              # (C, W, H)
+
+        for i in range(self.n_blue):
+            uav_pos = self._blue_pos[i]
+
+            # 1. Which cells are inside the sensor disk?  (W, H) bool.
+            dist_to_cells = np.linalg.norm(centres - uav_pos, axis=-1)
+            in_disk = dist_to_cells <= R
+
+            if not bool(np.any(in_disk)):
+                continue
+
+            # 2. Occlusion check per candidate cell.  Only ray-cast for
+            #    cells inside the disk to keep the work bounded (~50
+            #    cells for R=40, cell=5m).
+            cx_idx, cy_idx = np.where(in_disk)
+            for k in range(cx_idx.shape[0]):
+                cxi, cyi = int(cx_idx[k]), int(cy_idx[k])
+                if self._cell_occluded_by_obstacle(uav_pos, centres[cxi, cyi]):
+                    continue
+
+                # 3. For each channel, Bernoulli detection based on truth.
+                for c in range(C):
+                    t = bool(truth[c, cxi, cyi] > 0.5)
+                    if t:
+                        detected = bool(self._rng.random() < self.p_TP)
+                    else:
+                        detected = bool(self._rng.random() < self.p_FP)
+                    self._belief_maps[i, c, cxi, cyi] += (
+                        self._L_detect if detected else self._L_no_detect
+                    )
+
+        # 4. Clip log-odds to prevent divergence.  Done once at the end
+        #    to avoid the per-cell numpy overhead of a scalar clip inside
+        #    the inner loop.
+        np.clip(
+            self._belief_maps,
+            -self.belief_clip, self.belief_clip,
+            out=self._belief_maps,
+        )
+
+    def structured_belief_observation(self) -> Dict[str, np.ndarray]:
+        """
+        Stage 4 observation dict.  Extends the Stage 2/3 fully-observable
+        structured obs with per-UAV belief maps, obstacle positions, and
+        ground-truth occupancy (training-only key).
+
+        Notable removals versus Stage 3:
+        - ``red_features`` and ``rb_edge_features`` -- reds live only in
+          the belief map's enemy channel.
+        - ``bb_edge_visible`` and ``rb_edge_visible`` -- no per-edge
+          gating in Stage 4 (allies communicate via GPS-style
+          continuous comms; enemies enter via the belief map).
+
+        Kept from Stage 3:
+        - ``blue_features`` and ``bb_edge_features`` -- unchanged
+          semantics.
+
+        New keys:
+        - ``belief_maps``       : (N_blue, C, H, W) float32 log-odds
+        - ``obstacle_positions``: (N_obs, 3) float32 = (x, y, radius)
+        - ``true_occupancy``    : (C, H, W) float32 binary,
+          training-only.  The actor must NOT read this key.
+        """
+        base = self._build_structured_obs()
+        # Drop the red-side fields.
+        out: Dict[str, np.ndarray] = {
+            "blue_features":    base["blue_features"],
+            "bb_edge_features": base["bb_edge_features"],
+        }
+
+        # Belief maps.  If disabled, still return a zero-filled tensor
+        # so downstream callers can rely on the schema.
+        if self._belief_maps is not None:
+            out["belief_maps"] = self._belief_maps.copy()
+        else:
+            out["belief_maps"] = np.zeros(
+                (self.n_blue, self.belief_channels,
+                 self.belief_grid_size, self.belief_grid_size),
+                dtype=np.float32,
+            )
+
+        # Obstacle positions in (x, y, r) form.
+        if self._obstacle_pos is not None and len(self._obstacle_pos) > 0:
+            out["obstacle_positions"] = np.concatenate([
+                self._obstacle_pos,
+                self._obstacle_r.reshape(-1, 1),
+            ], axis=1).astype(np.float32)
+        else:
+            out["obstacle_positions"] = np.zeros((0, 3), dtype=np.float32)
+
+        # Ground-truth occupancy for the CTDE critic + diagnostic BCE.
+        out["true_occupancy"] = self._true_occupancy()
+
+        return out
 
     def structured_partial_observation(self) -> Dict[str, np.ndarray]:
         """

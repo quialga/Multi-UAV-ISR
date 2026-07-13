@@ -504,3 +504,217 @@ def test_velocities_respect_class_cap():
         snap = env.state_snapshot()
         assert (np.abs(snap["blue_vel"]) <= BLUE_UAV.v_max + 1e-6).all()
         assert (np.abs(snap["red_vel"])  <= RED_TARGET.v_max + 1e-6).all()
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: obstacles + belief maps
+# ---------------------------------------------------------------------------
+
+def _stage4_env(**overrides):
+    """Convenience factory for Stage 4 configs used by several tests."""
+    kwargs = dict(
+        n_blue=5, n_red=3, arena_size=130.0, capture_radius=3.0,
+        sensor_radius=40.0,
+        n_obstacles=4, obstacle_radius_min=5.0, obstacle_radius_max=15.0,
+        use_belief_maps=True, belief_grid_size=26, belief_channels=2,
+        red_policy=stationary_red, seed=0,
+    )
+    kwargs.update(overrides)
+    return PursuitEnv(**kwargs)
+
+
+def test_stage4_obstacles_are_placed_and_non_overlapping():
+    env = _stage4_env(n_obstacles=4)
+    env.reset(seed=0)
+    assert env._obstacle_pos.shape == (4, 2)
+    assert env._obstacle_r.shape == (4,)
+    # Non-overlapping (allow a small overlap tolerance since placement
+    # uses "≥ r1+r2+1.0" so the actual minimum gap is 1 m).
+    for i in range(4):
+        for j in range(i + 1, 4):
+            dist = float(np.linalg.norm(
+                env._obstacle_pos[i] - env._obstacle_pos[j]))
+            assert dist >= env._obstacle_r[i] + env._obstacle_r[j], (
+                f"Obstacles {i}, {j} overlap: dist={dist:.2f}, "
+                f"r_sum={env._obstacle_r[i] + env._obstacle_r[j]:.2f}"
+            )
+    # Obstacles are inside the arena (with the requested wall clearance).
+    for i in range(4):
+        pos = env._obstacle_pos[i]
+        assert env.obstacle_radius_max <= pos[0] <= env.arena_size - env.obstacle_radius_max
+        assert env.obstacle_radius_max <= pos[1] <= env.arena_size - env.obstacle_radius_max
+    # Radii within the requested range.
+    assert (env._obstacle_r >= env.obstacle_radius_min).all()
+    assert (env._obstacle_r <= env.obstacle_radius_max).all()
+
+
+def test_stage4_spawn_positions_clear_of_obstacles():
+    env = _stage4_env()
+    env.reset(seed=0)
+    # Every blue and red position is outside every obstacle by at least
+    # the requested spawn clearance.
+    for pos in np.concatenate([env._blue_pos, env._red_pos], axis=0):
+        for op, orad in zip(env._obstacle_pos, env._obstacle_r):
+            assert float(np.linalg.norm(pos - op)) >= orad + env.obstacle_spawn_clearance, (
+                f"Entity at {pos} too close to obstacle at {op} (r={orad})"
+            )
+
+
+def test_stage4_blue_cannot_move_into_obstacle():
+    env = _stage4_env()
+    env.reset(seed=0)
+    # Force blue_0 to sit near an obstacle and try to move straight
+    # into it.  Position should be rolled back and velocity zeroed.
+    obs_pos = env._obstacle_pos[0]
+    obs_r   = env._obstacle_r[0]
+    # Place blue_0 just outside the obstacle boundary along +x.
+    env._blue_pos[0] = obs_pos + np.array([obs_r + 1.0, 0.0], dtype=np.float32)
+    env._blue_vel[0] = np.zeros(2, dtype=np.float32)
+    prev_pos = env._blue_pos[0].copy()
+    # Aggressive left action → would step into the obstacle.
+    actions = {a: np.zeros(2, dtype=np.float32) for a in env.agents}
+    actions["blue_0"] = np.array([-1.0, 0.0], dtype=np.float32)
+    for _ in range(5):
+        env.step(actions)
+        # Blue should never end up inside an obstacle.
+        for op, orad in zip(env._obstacle_pos, env._obstacle_r):
+            d = float(np.linalg.norm(env._blue_pos[0] - op))
+            assert d >= orad - 1e-3, (
+                f"blue_0 penetrated obstacle: dist={d:.3f}, r={orad:.3f}"
+            )
+
+
+def test_stage4_belief_maps_shape_and_no_nans_after_200_steps():
+    env = _stage4_env(max_steps=250)
+    env.reset(seed=0)
+    assert env._belief_maps.shape == (5, 2, 26, 26)
+    for _ in range(200):
+        if not env.agents:
+            env.reset(seed=1)
+        actions = {a: np.zeros(2, dtype=np.float32) for a in env.agents}
+        env.step(actions)
+    assert not np.isnan(env._belief_maps).any()
+    assert not np.isinf(env._belief_maps).any()
+    assert (env._belief_maps <= env.belief_clip + 1e-3).all()
+    assert (env._belief_maps >= -env.belief_clip - 1e-3).all()
+
+
+def test_stage4_occluded_cells_never_updated():
+    """
+    Place a blue with an obstacle directly between it and a candidate
+    cell.  The occluded cell's log-odds MUST stay at 0 regardless of
+    how many sensor updates fire.
+    """
+    env = _stage4_env()
+    env.reset(seed=0)
+    # Force a known obstacle geometry: single disk at (65, 65) r=10.
+    env._obstacle_pos = np.array([[65.0, 65.0]], dtype=np.float32)
+    env._obstacle_r   = np.array([10.0],        dtype=np.float32)
+    # Blue at (45, 65).  Cell (16, 13) centres at (82.5, 67.5), dist
+    # ~37.5 m < R=40.  The straight ray (45,65) → (82.5,67.5) passes
+    # near (65, 66) which is inside the obstacle → occluded.
+    env._blue_pos[0] = np.array([45.0, 65.0], dtype=np.float32)
+    cxi_occ, cyi_occ = 16, 13
+    # A near cell (10, 13) centred at (52.5, 67.5) is unobstructed.
+    cxi_free, cyi_free = 10, 13
+
+    env._belief_maps[:] = 0.0
+    for _ in range(20):
+        env._update_belief_maps()
+
+    # Occluded cell: must be exactly 0.
+    assert env._belief_maps[0, 0, cxi_occ, cyi_occ] == 0.0, (
+        f"Occluded cell got updated: log-odds = "
+        f"{env._belief_maps[0, 0, cxi_occ, cyi_occ]}"
+    )
+    # Un-occluded cell: after 20 updates, log-odds should be
+    # measurably non-zero with high probability.
+    assert env._belief_maps[0, 0, cxi_free, cyi_free] != 0.0, (
+        "Un-occluded cell should have accumulated evidence"
+    )
+
+
+def test_stage4_caught_red_decays_from_belief_map():
+    """
+    Once a red is caught, the true_occupancy channel drops it to 0.
+    Subsequent observations then add negative log-odds evidence, so
+    P(enemy) decays.
+    """
+    env = _stage4_env()
+    env.reset(seed=0)
+    # Place blue_0 and red_0 close so capture fires this step.
+    env._blue_pos[0] = np.array([50.0, 50.0], dtype=np.float32)
+    env._red_pos[0]  = np.array([52.0, 50.0], dtype=np.float32)
+    actions = {a: np.zeros(2, dtype=np.float32) for a in env.agents}
+    env.step(actions)
+    assert not env._red_active[0], "red_0 should be caught after step"
+    # Record the log-odds of the cell centred near red_0's last known
+    # position.
+    cs = env.belief_cell_size
+    cxi = int(52.0 / cs)   # 10 for cs=5
+    cyi = int(50.0 / cs)   # 10
+    initial_L = float(env._belief_maps[0, 0, cxi, cyi])
+    # Run ~15 more steps; because the red is gone, the sensor now sees
+    # "no enemy" at that cell most of the time -> log-odds should
+    # decrease from ``initial_L``.  Enough noise means we assert
+    # monotone-with-slack rather than strict monotone.
+    final_L = initial_L
+    for _ in range(15):
+        env.step(actions)
+        final_L = float(env._belief_maps[0, 0, cxi, cyi])
+    assert final_L < initial_L, (
+        f"Caught red's cell log-odds should decay: initial={initial_L:.3f} "
+        f"final={final_L:.3f}"
+    )
+
+
+def test_stage4_true_occupancy_matches_ground_truth():
+    env = _stage4_env()
+    env.reset(seed=0)
+    truth = env._true_occupancy()
+    assert truth.shape == (2, 26, 26)
+    # Enemy channel: every active red maps to exactly one cell = 1.
+    n_ones_enemy = int(truth[0].sum())
+    assert n_ones_enemy == int(env._red_active.sum())
+    # Obstacle channel: at least a few cells are marked (obstacle
+    # centres and near-centres).
+    assert int(truth[1].sum()) > 0
+
+
+def test_stage4_obs_dict_schema():
+    env = _stage4_env()
+    env.reset(seed=0)
+    obs = env.structured_belief_observation()
+    expected_keys = {
+        "blue_features", "bb_edge_features",
+        "belief_maps", "obstacle_positions", "true_occupancy",
+    }
+    assert set(obs.keys()) == expected_keys
+    assert obs["blue_features"].shape    == (5, 8)
+    assert obs["bb_edge_features"].shape == (env.n_bb_edges, 7)
+    assert obs["belief_maps"].shape      == (5, 2, 26, 26)
+    assert obs["obstacle_positions"].shape[1] == 3
+    assert obs["true_occupancy"].shape   == (2, 26, 26)
+    # Ensure we did NOT accidentally leak Stage 3 keys.
+    for stage3_key in ("red_features", "rb_edge_features",
+                       "bb_edge_visible", "rb_edge_visible"):
+        assert stage3_key not in obs
+
+
+def test_stage4_backward_compat_when_flags_off():
+    """
+    Stage 1/2/3 behaviour must be byte-preserved when
+    ``n_obstacles=0`` and ``use_belief_maps=False``.
+    """
+    env = PursuitEnv(n_blue=5, n_red=3, arena_size=130.0,
+                     sensor_radius=40.0, seed=0)
+    env.reset(seed=0)
+    # No obstacles, no belief maps.
+    assert env._obstacle_pos is not None   # populated as empty array
+    assert env._obstacle_pos.shape == (0, 2)
+    assert env._belief_maps is None
+    # Stage 3 obs dict still works.
+    obs = env.structured_partial_observation()
+    assert "belief_maps" not in obs
+    assert "obstacle_positions" not in obs
+    assert "true_occupancy" not in obs
