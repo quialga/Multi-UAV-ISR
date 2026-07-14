@@ -289,3 +289,181 @@ class RecurrentGraphRolloutBuffer(GraphRolloutBuffer):
                 "rb_visible": flat_rb_vis[idx],
                 "hidden":     flat_hidden[idx],
             }
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: belief-map buffer
+# ---------------------------------------------------------------------------
+
+class Stage4RolloutBuffer:
+    """
+    Buffer for the Stage 4 CTDE + belief-map + recurrent policy.
+
+    Layout differences vs Stage 3's ``RecurrentGraphRolloutBuffer``:
+    - No red-side obs fields, no per-edge visibility masks.
+    - New per-UAV log-odds ``belief_maps`` field
+      shape (T, E, N_blue, C, H, W).
+    - New per-env ``true_occupancy`` field shape (T, E, C, H, W).
+    - Same actions / log_probs / values / rewards / dones / hidden
+      layout as the Stage 3 buffer.
+
+    Minibatch item = one env-timestep transition (stateless-at-update).
+    """
+
+    def __init__(
+        self,
+        rollout_steps:  int,
+        n_envs:         int,
+        n_agents:       int,
+        action_dim:     int,
+        blue_feat_dim:  int,
+        edge_feat_dim:  int,
+        n_bb_edges:     int,
+        belief_channels:int,
+        belief_grid:    int,
+        d_hidden:       int,
+        device:         torch.device,
+    ) -> None:
+        self.T = int(rollout_steps)
+        self.E = int(n_envs)
+        self.A = int(n_agents)
+        self.action_dim      = int(action_dim)
+        self.blue_feat_dim   = int(blue_feat_dim)
+        self.edge_feat_dim   = int(edge_feat_dim)
+        self.n_bb_edges      = int(n_bb_edges)
+        self.belief_channels = int(belief_channels)
+        self.belief_grid     = int(belief_grid)
+        self.d_hidden        = int(d_hidden)
+        self.device          = device
+
+        H = W = self.belief_grid
+        C   = self.belief_channels
+
+        # Obs — the two graph-side tensors.
+        self.blue_features = torch.zeros(
+            (self.T, self.E, self.A, self.blue_feat_dim),
+            dtype=torch.float32, device=device,
+        )
+        self.bb_edge_features = torch.zeros(
+            (self.T, self.E, self.n_bb_edges, self.edge_feat_dim),
+            dtype=torch.float32, device=device,
+        )
+        # Belief-map inputs.
+        self.belief_maps = torch.zeros(
+            (self.T, self.E, self.A, C, H, W),
+            dtype=torch.float32, device=device,
+        )
+        self.true_occupancy = torch.zeros(
+            (self.T, self.E, C, H, W),
+            dtype=torch.float32, device=device,
+        )
+
+        # Agent-level tensors.
+        self.actions   = torch.zeros((self.T, self.E, self.A, self.action_dim),
+                                     dtype=torch.float32, device=device)
+        self.log_probs = torch.zeros((self.T, self.E, self.A),
+                                     dtype=torch.float32, device=device)
+        self.hidden    = torch.zeros((self.T, self.E, self.A, self.d_hidden),
+                                     dtype=torch.float32, device=device)
+
+        # Env-level (centralised) tensors.
+        self.values     = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
+        self.rewards    = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
+        self.dones      = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
+        self.advantages = torch.zeros_like(self.rewards)
+        self.returns    = torch.zeros_like(self.rewards)
+
+        self.ptr = 0
+
+    def reset(self) -> None:
+        self.ptr = 0
+
+    def add(
+        self,
+        blue_features:    torch.Tensor,   # (E, A, blue_feat_dim)
+        bb_edge_features: torch.Tensor,   # (E, n_bb, edge_feat_dim)
+        belief_maps:      torch.Tensor,   # (E, A, C, H, W)
+        true_occupancy:   torch.Tensor,   # (E, C, H, W)
+        actions:          torch.Tensor,   # (E, A, action_dim)
+        log_probs:        torch.Tensor,   # (E, A)
+        values:           torch.Tensor,   # (E,)
+        rewards:          torch.Tensor,   # (E,)
+        dones:            torch.Tensor,   # (E,)
+        hidden:           torch.Tensor,   # (E, A, d_hidden)
+    ) -> None:
+        assert self.ptr < self.T, "Buffer full — call reset() between rollouts."
+        self.blue_features[self.ptr]    = blue_features
+        self.bb_edge_features[self.ptr] = bb_edge_features
+        self.belief_maps[self.ptr]      = belief_maps
+        self.true_occupancy[self.ptr]   = true_occupancy
+        self.actions[self.ptr]          = actions
+        self.log_probs[self.ptr]        = log_probs
+        self.values[self.ptr]           = values
+        self.rewards[self.ptr]          = rewards
+        self.dones[self.ptr]            = dones
+        self.hidden[self.ptr]           = hidden
+        self.ptr += 1
+
+    def compute_gae(
+        self,
+        last_value: torch.Tensor,   # (E,)
+        gamma:      float,
+        gae_lambda: float,
+    ) -> None:
+        assert self.ptr == self.T
+        adv = torch.zeros(self.E, dtype=torch.float32, device=self.device)
+        for t in reversed(range(self.T)):
+            next_value = last_value if t == self.T - 1 else self.values[t + 1]
+            not_done   = 1.0 - self.dones[t]
+            delta = self.rewards[t] + gamma * next_value * not_done - self.values[t]
+            adv   = delta + gamma * gae_lambda * not_done * adv
+            self.advantages[t] = adv
+        self.returns = self.advantages + self.values
+
+    def iter_minibatches(
+        self, mb_size: int,
+    ) -> Iterator[Dict[str, object]]:
+        """
+        Same shuffling as the base buffer; each minibatch item is one
+        (env-timestep) transition.  Caller assembles the two obs dicts:
+            partial_obs = {
+                "blue_features":    mb["blue_features"],
+                "bb_edge_features": mb["bb_edge_features"],
+                "belief_maps":      mb["belief_maps"],
+            }
+            full_state = {
+                "blue_features":    mb["blue_features"],
+                "bb_edge_features": mb["bb_edge_features"],
+                "true_occupancy":   mb["true_occupancy"],
+            }
+        """
+        N = self.T * self.E
+        H = W = self.belief_grid
+        C   = self.belief_channels
+
+        flat_blue = self.blue_features.reshape(N, self.A, self.blue_feat_dim)
+        flat_bb   = self.bb_edge_features.reshape(N, self.n_bb_edges, self.edge_feat_dim)
+        flat_bm   = self.belief_maps.reshape(N, self.A, C, H, W)
+        flat_to   = self.true_occupancy.reshape(N, C, H, W)
+        flat_act  = self.actions.reshape(N, self.A, self.action_dim)
+        flat_lp   = self.log_probs.reshape(N, self.A)
+        flat_val  = self.values.reshape(N)
+        flat_adv  = self.advantages.reshape(N)
+        flat_ret  = self.returns.reshape(N)
+        flat_hid  = self.hidden.reshape(N, self.A, self.d_hidden)
+
+        perm = torch.randperm(N, device=self.device)
+        for start in range(0, N, mb_size):
+            idx = perm[start:start + mb_size]
+            yield {
+                "blue_features":    flat_blue[idx],
+                "bb_edge_features": flat_bb[idx],
+                "belief_maps":      flat_bm[idx],
+                "true_occupancy":   flat_to[idx],
+                "actions":          flat_act[idx],
+                "log_probs":        flat_lp[idx],
+                "values":           flat_val[idx],
+                "advantages":       flat_adv[idx],
+                "returns":          flat_ret[idx],
+                "hidden":           flat_hid[idx],
+            }

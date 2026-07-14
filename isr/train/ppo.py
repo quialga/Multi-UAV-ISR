@@ -29,7 +29,9 @@ from typing import Dict
 import torch
 import torch.nn as nn
 
-from isr.train.graph_buffer import GraphRolloutBuffer, RecurrentGraphRolloutBuffer
+from isr.train.graph_buffer import (
+    GraphRolloutBuffer, RecurrentGraphRolloutBuffer, Stage4RolloutBuffer,
+)
 
 
 def ppo_update(
@@ -308,5 +310,142 @@ def ppo_update_ctde(
     n = max(metrics["n_minibatches"], 1)
     for k in ("policy_loss", "value_loss", "entropy", "approx_kl",
               "clip_frac", "aux_hidden_loss"):
+        metrics[k] /= n
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: belief-map + CTDE + recurrent PPO update
+# ---------------------------------------------------------------------------
+
+def ppo_update_stage4(
+    policy,
+    optimizer:      torch.optim.Optimizer,
+    buffer:         Stage4RolloutBuffer,
+    *,
+    clip_eps:       float,
+    ent_coef:       float,
+    vf_coef:        float,
+    max_grad_norm:  float,
+    n_epochs:       int,
+    mb_size:        int,
+    value_clip:     bool  = True,
+    normalize_adv:  bool  = True,
+    target_kl:      float = None,
+) -> Dict[str, float]:
+    """
+    Stage 4 PPO update.  Same clipped-objective PPO as
+    ``ppo_update_ctde``, but the minibatch layout is the belief-map
+    schema (``blue_features``, ``bb_edge_features``, ``belief_maps``,
+    ``true_occupancy``) instead of the Stage 3 (visibility-mask +
+    red-side) schema.
+
+    Also logs a diagnostic BCE(sigmoid(fused belief), true_occupancy)
+    — a no-gradient metric that measures how well the classical
+    Bayesian log-odds fusion is approximating the ground truth.  Two
+    variants: per-UAV mean, and log-odds-summed team belief.  Both are
+    detached; no signal flows into the policy from these.
+    """
+    metrics = {
+        "policy_loss":     0.0,
+        "value_loss":      0.0,
+        "entropy":         0.0,
+        "approx_kl":       0.0,
+        "clip_frac":       0.0,
+        "per_uav_bce":     0.0,
+        "fused_bce":       0.0,
+        "n_minibatches":   0,
+        "n_epochs_run":    0,
+    }
+
+    for epoch in range(n_epochs):
+        epoch_kl_sum = 0.0
+        epoch_mb_count = 0
+        for batch in buffer.iter_minibatches(mb_size):
+            partial_obs = {
+                "blue_features":    batch["blue_features"],
+                "bb_edge_features": batch["bb_edge_features"],
+                "belief_maps":      batch["belief_maps"],
+            }
+            full_state = {
+                "blue_features":    batch["blue_features"],
+                "bb_edge_features": batch["bb_edge_features"],
+                "true_occupancy":   batch["true_occupancy"],
+            }
+            old_actions   = batch["actions"]
+            old_log_probs = batch["log_probs"]
+            old_values    = batch["values"]
+            advantages    = batch["advantages"]
+            returns       = batch["returns"]
+            hidden        = batch["hidden"]
+
+            if normalize_adv:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            _, new_log_probs, entropy, new_values, _ = \
+                policy.get_action_and_value(
+                    partial_obs, full_state, hidden, action=old_actions,
+                )
+
+            adv_bcast = advantages.unsqueeze(-1)
+            log_ratio = new_log_probs - old_log_probs
+            ratio     = log_ratio.exp()
+            surr1     = ratio * adv_bcast
+            surr2     = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_bcast
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            if value_clip:
+                v_clipped = old_values + torch.clamp(
+                    new_values - old_values, -clip_eps, clip_eps,
+                )
+                v_loss_u = (new_values - returns).pow(2)
+                v_loss_c = (v_clipped - returns).pow(2)
+                value_loss = 0.5 * torch.max(v_loss_u, v_loss_c).mean()
+            else:
+                value_loss = 0.5 * (new_values - returns).pow(2).mean()
+
+            entropy_loss = -entropy.mean()
+            loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
+
+            optimizer.zero_grad()
+            loss.backward()
+            nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
+            optimizer.step()
+
+            # Diagnostic BCE — no gradient, just observability.
+            with torch.no_grad():
+                # per_uav_bce: BCE per UAV per cell, averaged.
+                bm = batch["belief_maps"]                   # (mb, A, C, H, W)
+                truth = batch["true_occupancy"].unsqueeze(1) \
+                          .expand_as(bm)                    # (mb, A, C, H, W)
+                per_uav_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                    bm, truth,
+                )
+                fused = bm.sum(dim=1)                       # log-odds addition
+                fused_bce = torch.nn.functional.binary_cross_entropy_with_logits(
+                    fused, batch["true_occupancy"],
+                )
+
+                approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
+                clip_frac = ((ratio - 1.0).abs() > clip_eps).float().mean().item()
+                metrics["policy_loss"]  += policy_loss.item()
+                metrics["value_loss"]   += value_loss.item()
+                metrics["entropy"]      += (-entropy_loss).item()
+                metrics["approx_kl"]    += approx_kl
+                metrics["clip_frac"]    += clip_frac
+                metrics["per_uav_bce"]  += per_uav_bce.item()
+                metrics["fused_bce"]    += fused_bce.item()
+                metrics["n_minibatches"] += 1
+                epoch_kl_sum   += approx_kl
+                epoch_mb_count += 1
+
+        metrics["n_epochs_run"] = epoch + 1
+        if target_kl is not None and epoch_mb_count > 0:
+            if (epoch_kl_sum / epoch_mb_count) > target_kl:
+                break
+
+    n = max(metrics["n_minibatches"], 1)
+    for k in ("policy_loss", "value_loss", "entropy", "approx_kl",
+              "clip_frac", "per_uav_bce", "fused_bce"):
         metrics[k] /= n
     return metrics

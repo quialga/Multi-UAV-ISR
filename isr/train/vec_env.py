@@ -333,3 +333,97 @@ class RecurrentVectorPursuitEnv(VectorPursuitEnv):
     ) -> None:
         for k, arr in env.structured_partial_observation().items():
             batch[k][idx] = arr
+
+
+# ---------------------------------------------------------------------------
+# Stage 4: belief-map variant
+# ---------------------------------------------------------------------------
+
+class Stage4VectorPursuitEnv(VectorPursuitEnv):
+    """
+    Stage 4 vectorised env.  Same reset/step signatures as the Stage 3
+    variant, but the obs dict is the Stage 4 schema
+    (``structured_belief_observation()``): drops the red-side and
+    visibility keys, adds ``belief_maps``, ``obstacle_positions``,
+    ``true_occupancy``.
+
+    Requires ``env_kwargs`` to have both ``sensor_radius`` set (so the
+    sensor step has a defined disk) and ``use_belief_maps=True`` (so
+    the log-odds tensor is actually maintained).
+    """
+
+    def __init__(
+        self,
+        n_envs:              int,
+        env_kwargs:          Dict[str, Any],
+        base_seed:           int = 0,
+        episode_buffer_size: int = 128,
+        red_policy_mix:      Optional[Sequence[Tuple[str, float]]] = None,
+    ) -> None:
+        if env_kwargs.get("sensor_radius", None) is None:
+            raise ValueError(
+                "Stage4VectorPursuitEnv requires env_kwargs['sensor_radius'] "
+                "to be set (belief update needs a defined sensor disk)."
+            )
+        if not env_kwargs.get("use_belief_maps", False):
+            raise ValueError(
+                "Stage4VectorPursuitEnv requires "
+                "env_kwargs['use_belief_maps']=True."
+            )
+        super().__init__(
+            n_envs               = n_envs,
+            env_kwargs           = env_kwargs,
+            base_seed            = base_seed,
+            episode_buffer_size  = episode_buffer_size,
+            red_policy_mix       = red_policy_mix,
+        )
+        # Pull Stage 4 sizing from the first env for convenience.
+        e0 = self.envs[0]
+        self.belief_channels  = e0.belief_channels
+        self.belief_grid_size = e0.belief_grid_size
+        self.n_obstacles      = e0.n_obstacles
+        # Reserve batch space for the requested obstacle count.  A
+        # rejection-sampled reset may drop below this if placement
+        # fails; ``_fill_row`` pads with zeros in that case.
+        self._obs_n_obstacles = int(e0.n_obstacles)
+
+    # ------------------------------------------------------------------ #
+    #  Structured-obs override                                             #
+    # ------------------------------------------------------------------ #
+
+    def _empty_batch(self) -> Dict[str, np.ndarray]:  # type: ignore[override]
+        H = W = self.belief_grid_size
+        C   = self.belief_channels
+        nob = self._obs_n_obstacles
+        return {
+            "blue_features":    np.zeros(
+                (self.n_envs, self.n_blue, self.blue_feat_dim),
+                dtype=np.float32),
+            "bb_edge_features": np.zeros(
+                (self.n_envs, self.n_bb_edges, self.edge_feat_dim),
+                dtype=np.float32),
+            "belief_maps":      np.zeros(
+                (self.n_envs, self.n_blue, C, H, W),
+                dtype=np.float32),
+            "obstacle_positions": np.zeros(
+                (self.n_envs, nob, 3), dtype=np.float32),
+            "true_occupancy":   np.zeros(
+                (self.n_envs, C, H, W), dtype=np.float32),
+        }
+
+    def _fill_row(  # type: ignore[override]
+        self, batch: Dict[str, np.ndarray], idx: int, env: PursuitEnv,
+    ) -> None:
+        obs = env.structured_belief_observation()
+        for k in ("blue_features", "bb_edge_features",
+                  "belief_maps", "true_occupancy"):
+            batch[k][idx] = obs[k]
+        # obstacle_positions might have differed per-env at reset (if
+        # rejection sampling gave fewer than requested).  Pad or clip to
+        # the batch's declared size.
+        op = obs["obstacle_positions"]
+        nob_batch = batch["obstacle_positions"].shape[1]
+        if op.shape[0] >= nob_batch:
+            batch["obstacle_positions"][idx] = op[:nob_batch]
+        else:
+            batch["obstacle_positions"][idx, :op.shape[0]] = op
