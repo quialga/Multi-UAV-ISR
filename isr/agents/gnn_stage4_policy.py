@@ -82,18 +82,30 @@ class BeliefEncoder(nn.Module):
     Shared weights are applied per UAV: the caller reshapes
     (B, N_blue, C, H, W) to (B * N_blue, C, H, W), runs the encoder,
     and reshapes back.
+
+    ``input_is_logits`` (default True): when True, the encoder applies
+    ``torch.sigmoid`` at the input so the CNN sees probability values
+    in [0, 1] instead of raw (clipped) log-odds in ~[-10, +10].
+    Well-conditioned CNN input; also collapses "essentially certain"
+    cells (log-odds 8 vs 10) to nearly identical values -- the network
+    then devotes capacity to distinguishing "unknown" vs "possibly"
+    vs "definitely" instead of wasting it near sigmoid saturation.
+    For the critic path (which reads ``true_occupancy`` already in
+    [0, 1] binary), pass ``input_is_logits=False`` to skip the sigmoid.
     """
 
     def __init__(
         self,
-        in_channels:      int = 2,
-        grid_size:        int = 26,
-        out_dim:          int = 64,
+        in_channels:      int  = 2,
+        grid_size:        int  = 26,
+        out_dim:          int  = 64,
+        input_is_logits:  bool = True,
     ) -> None:
         super().__init__()
-        self.in_channels = in_channels
-        self.grid_size   = grid_size
-        self.out_dim     = out_dim
+        self.in_channels    = in_channels
+        self.grid_size      = grid_size
+        self.out_dim        = out_dim
+        self.input_is_logits = input_is_logits
 
         self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3,
                                stride=2, padding=1)
@@ -113,7 +125,13 @@ class BeliefEncoder(nn.Module):
         """
         x : (B, C, H, W) or (B, N_blue, C, H, W)
         Returns (B, out_dim) or (B, N_blue, out_dim).
+
+        If ``input_is_logits`` was set at construction, ``x`` is passed
+        through ``sigmoid`` first to map log-odds to probability.
         """
+        if self.input_is_logits:
+            x = torch.sigmoid(x)
+
         if x.dim() == 5:
             B, N, C, H, W = x.shape
             x = x.reshape(B * N, C, H, W)
@@ -237,10 +255,12 @@ class GNNStage4Policy(nn.Module):
         self.belief_dim        = belief_encoder_out_dim
 
         # ---- Actor belief encoder ----------------------------------------
+        # Actor's input is per-UAV log-odds -> sigmoid inside encoder.
         self.actor_belief_encoder = BeliefEncoder(
             in_channels=belief_channels,
             grid_size=belief_grid_size,
             out_dim=belief_encoder_out_dim,
+            input_is_logits=True,
         )
 
         # Actor node feature dim: base blue + optional hidden + belief.
@@ -263,10 +283,13 @@ class GNNStage4Policy(nn.Module):
         )
 
         # ---- Critic belief encoder + GNN + head --------------------------
+        # Critic input is ``true_occupancy`` which is already binary
+        # in [0, 1] -- skip the sigmoid input transform.
         self.critic_belief_encoder = BeliefEncoder(
             in_channels=belief_channels,
             grid_size=belief_grid_size,
             out_dim=belief_encoder_out_dim,
+            input_is_logits=False,
         )
         self.critic_encoder = BlueGNNEncoder(
             n_blue        = n_blue,
