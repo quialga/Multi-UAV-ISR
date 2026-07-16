@@ -133,6 +133,7 @@ class PursuitEnv(ParallelEnv):
         p_TP:                     float = 0.85,
         p_FP:                     float = 0.15,
         ray_step_size:            float = 2.5,
+        belief_window_size:       int   = 0,   # 0 = ego-centric windows disabled
     ):
         """
         sensor_radius: Stage 3 partial-observability knob.  When None
@@ -194,6 +195,7 @@ class PursuitEnv(ParallelEnv):
         self.p_TP                     = float(p_TP)
         self.p_FP                     = float(p_FP)
         self.ray_step_size            = float(ray_step_size)
+        self.belief_window_size       = int(belief_window_size)
         # Derived quantities.
         self.belief_cell_size = self.arena_size / max(1, self.belief_grid_size)
         # Log-odds evidence constants — same for both channels in v1.
@@ -1205,6 +1207,41 @@ class PursuitEnv(ParallelEnv):
                 if 0 <= cx < W and 0 <= cy < H:
                     self._belief_maps[i, 3, cx, cy] = 1.0
 
+    def _extract_belief_windows(self, K: int) -> np.ndarray:
+        """
+        Ego-centric KxK crop of each UAV's belief map centred on that
+        UAV's own cell.  Cells outside the arena are zero-padded (so a
+        UAV near a wall gets zeros filling the out-of-bounds portion of
+        its window).
+
+        Returns
+        -------
+        windows : (N_blue, C, K, K) float32
+        """
+        assert self._belief_maps is not None
+        assert K >= 1
+        r = K // 2
+        C = self.belief_channels
+        H = W = self.belief_grid_size
+        cs = self.belief_cell_size
+
+        # Zero-pad the belief tensor spatially by r on each side.
+        padded = np.pad(
+            self._belief_maps,
+            ((0, 0), (0, 0), (r, r), (r, r)),
+            mode="constant", constant_values=0.0,
+        )                                     # (N_blue, C, H+2r, W+2r)
+
+        out = np.zeros((self.n_blue, C, K, K), dtype=np.float32)
+        for i in range(self.n_blue):
+            cx = int(np.clip(self._blue_pos[i, 0] / cs, 0, W - 1))
+            cy = int(np.clip(self._blue_pos[i, 1] / cs, 0, H - 1))
+            # In padded coords the UAV cell is at (cx + r, cy + r);
+            # window starts r cells before that -> at (cx, cy) in
+            # padded coords -- so the window slice is [cx:cx+K, cy:cy+K].
+            out[i] = padded[i, :, cx:cx + K, cy:cy + K]
+        return out
+
     def structured_belief_observation(self) -> Dict[str, np.ndarray]:
         """
         Stage 4 observation dict.  Extends the Stage 2/3 fully-observable
@@ -1257,6 +1294,16 @@ class PursuitEnv(ParallelEnv):
 
         # Ground-truth occupancy for the CTDE critic + diagnostic BCE.
         out["true_occupancy"] = self._true_occupancy()
+
+        # Ego-centric belief windows (Phase 4 v3).  Only included when
+        # belief_window_size > 0.  Downstream: actor consumes
+        # ``belief_windows`` in place of ``belief_maps``; belief_maps
+        # is still returned for the diagnostic BCE + the CTDE critic
+        # can still see it if needed.
+        if self.belief_window_size > 0 and self._belief_maps is not None:
+            out["belief_windows"] = self._extract_belief_windows(
+                self.belief_window_size,
+            )
 
         return out
 

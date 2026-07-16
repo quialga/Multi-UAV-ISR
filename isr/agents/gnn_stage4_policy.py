@@ -110,11 +110,20 @@ class BeliefEncoder(nn.Module):
         grid_size:         int = 26,
         out_dim:           int = 64,
         num_logit_channels:int = None,   # type: ignore[assignment]
+        conv_strides: Tuple[int, int] = (2, 2),
     ) -> None:
+        """
+        ``conv_strides``: stride for each of the two conv layers.
+        Default ``(2, 2)`` matches the original heavy downsampling
+        pattern used on the 26x26 global belief map.  For the small
+        ego-centric window (e.g. 17x17), pass ``(1, 2)`` -- keep
+        the first layer at full resolution, downsample only once.
+        """
         super().__init__()
         self.in_channels    = in_channels
         self.grid_size      = grid_size
         self.out_dim        = out_dim
+        self.conv_strides   = tuple(conv_strides)
         # Default: all channels are logits (backward-compat with the
         # 2-channel Bayesian-only design pre-4-channel-split).
         self.num_logit_channels = (
@@ -124,9 +133,9 @@ class BeliefEncoder(nn.Module):
         assert 0 <= self.num_logit_channels <= in_channels
 
         self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3,
-                               stride=2, padding=1)
+                               stride=self.conv_strides[0], padding=1)
         self.conv2 = nn.Conv2d(16, 32, kernel_size=3,
-                               stride=2, padding=1)
+                               stride=self.conv_strides[1], padding=1)
         self.act   = nn.ReLU(inplace=True)
         # Compute flattened size dynamically so grid_size != 26 still works.
         with torch.no_grad():
@@ -264,37 +273,51 @@ class GNNStage4Policy(nn.Module):
         d_hidden:              int   = 64,
         n_msg_rounds:          int   = 2,
         init_log_std:          float = 0.0,
-        belief_channels:       int   = 4,
+        belief_channels:       int   = 3,
         belief_grid_size:      int   = 26,
-        belief_encoder_out_dim:int   = 64,
+        belief_encoder_out_dim:int   = 128,
         actor_bayesian_channels:int  = 2,
+        belief_window_size:    int   = 17,
         use_hidden_in_gnn:     bool  = True,
     ) -> None:
         """
-        ``actor_bayesian_channels``: number of belief-map channels that
-        are noisy log-odds (defaults to 2 for Stage 4: enemy +
-        obstacle).  These get ``sigmoid`` at the CNN input.  Any
-        additional channels (allies, self position, etc.) are treated
-        as already in [0, 1] and pass through unchanged.
+        Args:
+          actor_bayesian_channels: number of belief-map channels that
+            are noisy log-odds (defaults to 2 for Stage 4: enemy +
+            obstacle).  These get ``sigmoid`` at the CNN input.  Any
+            additional channels (e.g. deterministic ally overlay) are
+            treated as already in [0, 1] and pass through unchanged.
+
+          belief_window_size: side length K of the ego-centric window
+            fed to the actor's belief CNN.  The actor consumes a
+            (belief_channels, K, K) crop centred on the UAV's cell,
+            NOT the global (belief_channels, H, W) map.  Fixes the
+            "CNN can't produce ego-centric features" problem
+            observed in Stage 4 v1/v2.
         """
         super().__init__()
-        self.n_blue            = n_blue
-        self.d_hidden          = d_hidden
-        self.action_dim        = action_dim
-        self.use_hidden_in_gnn = use_hidden_in_gnn
-        self.belief_channels   = belief_channels
-        self.belief_grid_size  = belief_grid_size
-        self.belief_dim        = belief_encoder_out_dim
+        self.n_blue             = n_blue
+        self.d_hidden           = d_hidden
+        self.action_dim         = action_dim
+        self.use_hidden_in_gnn  = use_hidden_in_gnn
+        self.belief_channels    = belief_channels
+        self.belief_grid_size   = belief_grid_size
+        self.belief_window_size = belief_window_size
+        self.belief_dim         = belief_encoder_out_dim
 
         # ---- Actor belief encoder ----------------------------------------
         # Actor's input:
         #   channels [0..actor_bayesian_channels): log-odds  -> sigmoid.
         #   channels [actor_bayesian_channels..):  binary    -> passthrough.
+        # Input is now the KxK ego-centric window, not the global map --
+        # so we downsample only ONCE (first conv stride=1, second stride=2)
+        # to preserve spatial info in this smaller tensor.
         self.actor_belief_encoder = BeliefEncoder(
             in_channels=belief_channels,
-            grid_size=belief_grid_size,
+            grid_size=belief_window_size,
             out_dim=belief_encoder_out_dim,
             num_logit_channels=min(actor_bayesian_channels, belief_channels),
+            conv_strides=(1, 2),
         )
 
         # Actor node feature dim: base blue + optional hidden + belief.
@@ -351,8 +374,15 @@ class GNNStage4Policy(nn.Module):
         Build the actor's per-blue node embedding by concatenating
         blue_features, hidden (if enabled), and belief-encoded features,
         then running the actor GNN.  Returns h_blue (B, N, d_hidden).
+
+        Belief input: reads ``belief_windows`` (ego-centric, per-UAV KxK
+        crops) if present in ``partial_obs``, else falls back to the
+        global ``belief_maps`` for backward compatibility.
         """
-        belief_emb = self.actor_belief_encoder(partial_obs["belief_maps"])
+        belief_input = partial_obs.get(
+            "belief_windows", partial_obs.get("belief_maps"),
+        )
+        belief_emb = self.actor_belief_encoder(belief_input)
         parts = [partial_obs["blue_features"]]
         if self.use_hidden_in_gnn:
             parts.append(hidden)

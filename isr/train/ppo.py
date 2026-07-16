@@ -367,6 +367,11 @@ def ppo_update_stage4(
                 "bb_edge_features": batch["bb_edge_features"],
                 "belief_maps":      batch["belief_maps"],
             }
+            # If ego-centric windows are stored, expose them so the
+            # actor's belief encoder uses them in place of the global
+            # belief_maps (see GNNStage4Policy.actor_encode).
+            if "belief_windows" in batch:
+                partial_obs["belief_windows"] = batch["belief_windows"]
             full_state = {
                 "blue_features":    batch["blue_features"],
                 "bb_edge_features": batch["bb_edge_features"],

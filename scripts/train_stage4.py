@@ -82,6 +82,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ray-step-size",    type=float, default=d["ray_step_size"])
     p.add_argument("--belief-encoder-out-dim",
                    type=int, default=d["belief_encoder_out_dim"])
+    p.add_argument("--belief-window-size", type=int,
+                   default=d.get("belief_window_size", 0),
+                   help="Side K of the ego-centric window fed to the "
+                        "actor's belief CNN.  0 -> disabled (fall back "
+                        "to global belief_maps).")
     # PPO
     p.add_argument("--n-envs",         type=int,   default=d["n_envs"])
     p.add_argument("--rollout-steps",  type=int,   default=d["rollout_steps"])
@@ -201,6 +206,7 @@ def main() -> None:
         p_TP                    = args.p_tp,
         p_FP                    = args.p_fp,
         ray_step_size           = args.ray_step_size,
+        belief_window_size      = args.belief_window_size,
     )
 
     # Red policy mix parsing.
@@ -262,6 +268,7 @@ def main() -> None:
         belief_channels       = args.belief_channels,
         belief_grid_size      = args.belief_grid_size,
         belief_encoder_out_dim= args.belief_encoder_out_dim,
+        belief_window_size    = args.belief_window_size,
         use_hidden_in_gnn     = args.share_hidden_via_gnn,
     ).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
@@ -284,6 +291,7 @@ def main() -> None:
         n_bb_edges     = vec_env.n_bb_edges,
         belief_channels= args.belief_channels,
         belief_grid    = args.belief_grid_size,
+        belief_window  = args.belief_window_size,
         d_hidden       = args.d_hidden,
         device         = device,
     )
@@ -322,6 +330,10 @@ def main() -> None:
                 "bb_edge_features": _to_device(obs_np["bb_edge_features"], device),
                 "belief_maps":      _to_device(obs_np["belief_maps"], device),
             }
+            if "belief_windows" in obs_np:
+                partial_obs["belief_windows"] = _to_device(
+                    obs_np["belief_windows"], device,
+                )
             full_state = {
                 "blue_features":    partial_obs["blue_features"],
                 "bb_edge_features": partial_obs["bb_edge_features"],
@@ -346,6 +358,7 @@ def main() -> None:
                 rewards          = torch.from_numpy(reward_np).to(device),
                 dones            = torch.from_numpy(done_np).to(device),
                 hidden           = hidden,
+                belief_windows   = partial_obs.get("belief_windows", None),
             )
 
             done_t = torch.from_numpy(done_np).to(device).view(-1, 1, 1)

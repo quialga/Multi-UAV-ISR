@@ -379,9 +379,10 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
         )
         # Pull Stage 4 sizing from the first env for convenience.
         e0 = self.envs[0]
-        self.belief_channels  = e0.belief_channels
-        self.belief_grid_size = e0.belief_grid_size
-        self.n_obstacles      = e0.n_obstacles
+        self.belief_channels    = e0.belief_channels
+        self.belief_grid_size   = e0.belief_grid_size
+        self.belief_window_size = getattr(e0, "belief_window_size", 0)
+        self.n_obstacles        = e0.n_obstacles
         # Reserve batch space for the requested obstacle count.  A
         # rejection-sampled reset may drop below this if placement
         # fails; ``_fill_row`` pads with zeros in that case.
@@ -395,7 +396,8 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
         H = W = self.belief_grid_size
         C   = self.belief_channels
         nob = self._obs_n_obstacles
-        return {
+        K   = self.belief_window_size
+        batch = {
             "blue_features":    np.zeros(
                 (self.n_envs, self.n_blue, self.blue_feat_dim),
                 dtype=np.float32),
@@ -411,6 +413,13 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
             "true_occupancy":   np.zeros(
                 (self.n_envs, 2, H, W), dtype=np.float32),
         }
+        # Ego-centric windows (Stage 4 v3).  Allocated only when the
+        # underlying env exposes them.
+        if K > 0:
+            batch["belief_windows"] = np.zeros(
+                (self.n_envs, self.n_blue, C, K, K), dtype=np.float32,
+            )
+        return batch
 
     def _fill_row(  # type: ignore[override]
         self, batch: Dict[str, np.ndarray], idx: int, env: PursuitEnv,
@@ -419,6 +428,8 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
         for k in ("blue_features", "bb_edge_features",
                   "belief_maps", "true_occupancy"):
             batch[k][idx] = obs[k]
+        if "belief_windows" in batch and "belief_windows" in obs:
+            batch["belief_windows"][idx] = obs["belief_windows"]
         # obstacle_positions might have differed per-env at reset (if
         # rejection sampling gave fewer than requested).  Pad or clip to
         # the batch's declared size.

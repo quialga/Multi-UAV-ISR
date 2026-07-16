@@ -516,7 +516,9 @@ def _stage4_env(**overrides):
         n_blue=5, n_red=3, arena_size=130.0, capture_radius=3.0,
         sensor_radius=40.0,
         n_obstacles=4, obstacle_radius_min=5.0, obstacle_radius_max=15.0,
-        use_belief_maps=True, belief_grid_size=26, belief_channels=4,
+        # v3: 3 channels (enemy, obstacle, ally) -- self dropped since
+        # ego-centric window is inherently centred on self.
+        use_belief_maps=True, belief_grid_size=26, belief_channels=3,
         red_policy=stationary_red, seed=0,
     )
     kwargs.update(overrides)
@@ -587,7 +589,7 @@ def test_stage4_blue_cannot_move_into_obstacle():
 def test_stage4_belief_maps_shape_and_no_nans_after_200_steps():
     env = _stage4_env(max_steps=250)
     env.reset(seed=0)
-    assert env._belief_maps.shape == (5, 4, 26, 26)
+    assert env._belief_maps.shape == (5, 3, 26, 26)
     for _ in range(200):
         if not env.agents:
             env.reset(seed=1)
@@ -708,9 +710,11 @@ def test_stage4_ally_channel_is_deterministic_and_shared():
 def test_stage4_self_channel_is_per_uav():
     """
     Channel 3 (self position) is DIFFERENT per UAV: only THIS UAV's
-    cell is marked in its own belief map.
+    cell is marked in its own belief map.  Requires belief_channels=4;
+    the default Stage 4 v3 config drops this channel since the actor
+    now consumes ego-centric windows.
     """
-    env = _stage4_env()
+    env = _stage4_env(belief_channels=4)
     env.reset(seed=0)
     cs = env.belief_cell_size
     self_ch = env._belief_maps[:, 3]                    # (N_blue, H, W)
@@ -734,7 +738,7 @@ def test_stage4_deterministic_channels_unaffected_by_clip():
     all blues moving toward the same corner and confirm channels
     2-3 are still {0, 1}, not clipped weirdly.
     """
-    env = _stage4_env(max_steps=350)
+    env = _stage4_env(max_steps=350, belief_channels=4)
     env.reset(seed=0)
     actions = {a: np.array([1.0, 1.0], dtype=np.float32) for a in env.agents}
     for _ in range(300):
@@ -764,13 +768,65 @@ def test_stage4_obs_dict_schema():
     assert set(obs.keys()) == expected_keys
     assert obs["blue_features"].shape    == (5, 8)
     assert obs["bb_edge_features"].shape == (env.n_bb_edges, 7)
-    assert obs["belief_maps"].shape      == (5, 4, 26, 26)
+    assert obs["belief_maps"].shape      == (5, 3, 26, 26)
     assert obs["obstacle_positions"].shape[1] == 3
     assert obs["true_occupancy"].shape   == (2, 26, 26)
     # Ensure we did NOT accidentally leak Stage 3 keys.
     for stage3_key in ("red_features", "rb_edge_features",
                        "bb_edge_visible", "rb_edge_visible"):
         assert stage3_key not in obs
+
+
+def test_stage4_belief_window_shape_and_ego_centric():
+    """
+    ``_extract_belief_windows(K)`` returns per-UAV (C, K, K) crops
+    centred on each UAV's own cell.  Verified by planting a marker
+    log-odds value at the UAV's own cell and confirming it lands at
+    the window centre.
+    """
+    K = 17
+    env = _stage4_env(belief_window_size=K, belief_channels=3)
+    env.reset(seed=0)
+    # Force UAV 0 to (50, 50) which at cs=5 is cell (10, 10).
+    env._blue_pos[0] = np.array([50.0, 50.0], dtype=np.float32)
+    env._belief_maps[0, 0, 10, 10] = 4.2
+    windows = env._extract_belief_windows(K)
+    assert windows.shape == (env.n_blue, env.belief_channels, K, K)
+    centre = K // 2
+    assert windows[0, 0, centre, centre] == pytest.approx(4.2)
+
+
+def test_stage4_belief_window_edge_padding():
+    """
+    A UAV placed at (0, 0) has half its window outside the arena;
+    those out-of-bounds cells must be zero-padded (never garbage).
+    """
+    K = 17
+    env = _stage4_env(belief_window_size=K, belief_channels=3)
+    env.reset(seed=0)
+    env._blue_pos[0] = np.array([0.0, 0.0], dtype=np.float32)
+    # Fill belief map channel 0 with 1 everywhere so any non-padded
+    # cell inside the window would show 1.
+    env._belief_maps[0, 0, :, :] = 1.0
+    windows = env._extract_belief_windows(K)
+    # Cells above-left of the UAV's own cell (0, 0) are OOB -> must be 0.
+    # UAV's own cell lands at (K//2, K//2) in the window.
+    r = K // 2
+    # Everything at window-coords < r on either axis is OOB.
+    assert np.all(windows[0, 0, :r, :] == 0.0), "top-left rows not zero-padded"
+    assert np.all(windows[0, 0, :, :r] == 0.0), "top-left cols not zero-padded"
+    # Everything at window-coords >= r must equal 1 (in-arena).
+    assert np.all(windows[0, 0, r:, r:] == 1.0), \
+        "in-arena portion should show the log-odds we planted"
+
+
+def test_stage4_obs_dict_includes_belief_windows_when_enabled():
+    env = _stage4_env(belief_window_size=17)
+    env.reset(seed=0)
+    obs = env.structured_belief_observation()
+    assert "belief_windows" in obs
+    assert obs["belief_windows"].shape == (env.n_blue,
+                                            env.belief_channels, 17, 17)
 
 
 def test_stage4_backward_compat_when_flags_off():

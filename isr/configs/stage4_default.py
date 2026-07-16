@@ -16,13 +16,27 @@ STAGE4_DEFAULTS = {
     # ----- Belief map ----------------------------------------------------
     "use_belief_maps":     True,
     "belief_grid_size":    26,     # H = W (arena_size / cell_size)
-    # 4 channels: {P(enemy) Bayesian, P(obstacle) Bayesian,
-    #              ally_positions deterministic, self_position deterministic}
-    # Channels 0-1 use log-odds; channels 2-3 are direct binary
-    # overlays computed from ground truth (perfect self-GPS + TDL uplink
-    # for allies).  Only channels 0-1 pass through sigmoid at the CNN.
-    "belief_channels":     4,
+    # 3 channels: {P(enemy) Bayesian, P(obstacle) Bayesian,
+    #              ally_positions deterministic}
+    # Channels 0-1 use log-odds (sigmoid at CNN input); channel 2 is
+    # a direct binary overlay from ground truth (TDL uplink model).
+    # The self-position channel from v2 is DROPPED because the actor
+    # now consumes ego-centric windows (see ``belief_window_size``),
+    # so the window is inherently centred on the UAV -- redundant to
+    # also mark it with a "1" channel.
+    "belief_channels":     3,
     "belief_clip":         10.0,   # log-odds clip (channels 0-1 only)
+
+    # ----- Ego-centric window (Phase 4 v3) -------------------------------
+    # For each UAV, extract a KxK crop of the belief map centred on
+    # its own cell (zero-padded at arena edges), and feed THAT to the
+    # actor's belief CNN instead of the global (26x26) map.  Fixes
+    # the "CNN can't produce ego-centric features" problem that stalled
+    # v1/v2 at the random-policy baseline.  See docs/stage4_backlog.md
+    # discussion.
+    # K = 17 at cell_size 5m covers 42.5m radius, encompassing the
+    # sensor_radius=40m disk with one cell margin.
+    "belief_window_size":  17,
 
     # ----- Sensor model --------------------------------------------------
     "p_TP":                0.85,

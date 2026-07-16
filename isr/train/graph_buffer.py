@@ -323,6 +323,7 @@ class Stage4RolloutBuffer:
         belief_grid:    int,
         d_hidden:       int,
         device:         torch.device,
+        belief_window:  int = 0,   # 0 -> ego-centric windows disabled
     ) -> None:
         self.T = int(rollout_steps)
         self.E = int(n_envs)
@@ -333,6 +334,7 @@ class Stage4RolloutBuffer:
         self.n_bb_edges      = int(n_bb_edges)
         self.belief_channels = int(belief_channels)
         self.belief_grid     = int(belief_grid)
+        self.belief_window   = int(belief_window)
         self.d_hidden        = int(d_hidden)
         self.device          = device
 
@@ -360,6 +362,16 @@ class Stage4RolloutBuffer:
             (self.T, self.E, 2, H, W),
             dtype=torch.float32, device=device,
         )
+        # Ego-centric belief windows (Stage 4 v3).  Only allocated when
+        # belief_window > 0.  None sentinel used to signal "not present".
+        if self.belief_window > 0:
+            K = self.belief_window
+            self.belief_windows = torch.zeros(
+                (self.T, self.E, self.A, C, K, K),
+                dtype=torch.float32, device=device,
+            )
+        else:
+            self.belief_windows = None
 
         # Agent-level tensors.
         self.actions   = torch.zeros((self.T, self.E, self.A, self.action_dim),
@@ -386,15 +398,19 @@ class Stage4RolloutBuffer:
         blue_features:    torch.Tensor,   # (E, A, blue_feat_dim)
         bb_edge_features: torch.Tensor,   # (E, n_bb, edge_feat_dim)
         belief_maps:      torch.Tensor,   # (E, A, C, H, W)
-        true_occupancy:   torch.Tensor,   # (E, C, H, W)
+        true_occupancy:   torch.Tensor,   # (E, 2, H, W)
         actions:          torch.Tensor,   # (E, A, action_dim)
         log_probs:        torch.Tensor,   # (E, A)
         values:           torch.Tensor,   # (E,)
         rewards:          torch.Tensor,   # (E,)
         dones:            torch.Tensor,   # (E,)
         hidden:           torch.Tensor,   # (E, A, d_hidden)
+        belief_windows:   torch.Tensor = None,   # (E, A, C, K, K) or None
     ) -> None:
         assert self.ptr < self.T, "Buffer full — call reset() between rollouts."
+        if self.belief_windows is not None:
+            assert belief_windows is not None
+            self.belief_windows[self.ptr] = belief_windows
         self.blue_features[self.ptr]    = blue_features
         self.bb_edge_features[self.ptr] = bb_edge_features
         self.belief_maps[self.ptr]      = belief_maps
@@ -455,10 +471,16 @@ class Stage4RolloutBuffer:
         flat_ret  = self.returns.reshape(N)
         flat_hid  = self.hidden.reshape(N, self.A, self.d_hidden)
 
+        # Ego-centric windows if present.
+        flat_bw = None
+        if self.belief_windows is not None:
+            K = self.belief_window
+            flat_bw = self.belief_windows.reshape(N, self.A, C, K, K)
+
         perm = torch.randperm(N, device=self.device)
         for start in range(0, N, mb_size):
             idx = perm[start:start + mb_size]
-            yield {
+            out = {
                 "blue_features":    flat_blue[idx],
                 "bb_edge_features": flat_bb[idx],
                 "belief_maps":      flat_bm[idx],
@@ -470,3 +492,6 @@ class Stage4RolloutBuffer:
                 "returns":          flat_ret[idx],
                 "hidden":           flat_hid[idx],
             }
+            if flat_bw is not None:
+                out["belief_windows"] = flat_bw[idx]
+            yield out
