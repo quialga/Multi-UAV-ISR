@@ -890,41 +890,39 @@ class PursuitEnv(ParallelEnv):
         - Up to 200 attempts per obstacle; if placement fails, fewer
           obstacles land -- exposed via ``len(self._obstacle_pos)``.
         """
-        if self.n_obstacles <= 0:
-            self._obstacle_pos = np.zeros((0, 2), dtype=np.float32)
-            self._obstacle_r   = np.zeros((0,),   dtype=np.float32)
-            return
+        if self.n_obstacles > 0:
+            L = self.arena_size
+            max_r = self.obstacle_radius_max
+            placed_pos: list = []
+            placed_r:   list = []
 
-        L = self.arena_size
-        max_r = self.obstacle_radius_max
-        placed_pos: list = []
-        placed_r:   list = []
-
-        max_attempts = 200
-        for _ in range(self.n_obstacles):
-            for _attempt in range(max_attempts):
-                r = float(self._rng.uniform(
-                    self.obstacle_radius_min, self.obstacle_radius_max,
-                ))
-                # Position with wall clearance.
-                lo = max_r
-                hi = L - max_r
-                if hi <= lo:
-                    break   # arena too small for the requested radius range
-                pos = self._rng.uniform(lo, hi, size=2).astype(np.float32)
-                ok = True
-                for pp, pr in zip(placed_pos, placed_r):
-                    if float(np.linalg.norm(pos - pp)) < r + pr + 1.0:
-                        ok = False
+            max_attempts = 200
+            for _ in range(self.n_obstacles):
+                for _attempt in range(max_attempts):
+                    r = float(self._rng.uniform(
+                        self.obstacle_radius_min, self.obstacle_radius_max,
+                    ))
+                    lo = max_r
+                    hi = L - max_r
+                    if hi <= lo:
                         break
-                if ok:
-                    placed_pos.append(pos)
-                    placed_r.append(r)
-                    break
+                    pos = self._rng.uniform(lo, hi, size=2).astype(np.float32)
+                    ok = True
+                    for pp, pr in zip(placed_pos, placed_r):
+                        if float(np.linalg.norm(pos - pp)) < r + pr + 1.0:
+                            ok = False
+                            break
+                    if ok:
+                        placed_pos.append(pos)
+                        placed_r.append(r)
+                        break
 
-        if placed_pos:
-            self._obstacle_pos = np.stack(placed_pos, axis=0).astype(np.float32)
-            self._obstacle_r   = np.asarray(placed_r, dtype=np.float32)
+            if placed_pos:
+                self._obstacle_pos = np.stack(placed_pos, axis=0).astype(np.float32)
+                self._obstacle_r   = np.asarray(placed_r, dtype=np.float32)
+            else:
+                self._obstacle_pos = np.zeros((0, 2), dtype=np.float32)
+                self._obstacle_r   = np.zeros((0,),   dtype=np.float32)
         else:
             self._obstacle_pos = np.zeros((0, 2), dtype=np.float32)
             self._obstacle_r   = np.zeros((0,),   dtype=np.float32)
