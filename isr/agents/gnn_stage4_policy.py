@@ -107,41 +107,42 @@ class BeliefEncoder(nn.Module):
     def __init__(
         self,
         in_channels:       int = 2,
-        grid_size:         int = 26,
+        grid_size:         int = 33,
         out_dim:           int = 64,
         num_logit_channels:int = None,   # type: ignore[assignment]
-        conv_strides: Tuple[int, int] = (2, 2),
     ) -> None:
-        """
-        ``conv_strides``: stride for each of the two conv layers.
-        Default ``(2, 2)`` matches the original heavy downsampling
-        pattern used on the 26x26 global belief map.  For the small
-        ego-centric window (e.g. 17x17), pass ``(1, 2)`` -- keep
-        the first layer at full resolution, downsample only once.
-        """
         super().__init__()
         self.in_channels    = in_channels
         self.grid_size      = grid_size
         self.out_dim        = out_dim
-        self.conv_strides   = tuple(conv_strides)
-        # Default: all channels are logits (backward-compat with the
-        # 2-channel Bayesian-only design pre-4-channel-split).
         self.num_logit_channels = (
             in_channels if num_logit_channels is None
             else int(num_logit_channels)
         )
         assert 0 <= self.num_logit_channels <= in_channels
 
-        self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3,
-                               stride=self.conv_strides[0], padding=1)
-        self.conv2 = nn.Conv2d(16, 32, kernel_size=3,
-                               stride=self.conv_strides[1], padding=1)
-        self.act   = nn.ReLU(inplace=True)
-        # Compute flattened size dynamically so grid_size != 26 still works.
+        # Build a conv stack that progressively halves the spatial dims.
+        # For grid_size <= 17: 2 convs  (C->16 s1, 16->32 s2)  -> ~9x9
+        # For grid_size >  17: 3 convs  (C->16 s1, 16->32 s2, 32->32 s2) -> ~9x9
+        # This keeps the flatten dim reasonable (~2500-3200) for any
+        # grid size in the [17, 52] range.
+        layers = []
+        layers.append(nn.Conv2d(in_channels, 16, kernel_size=3,
+                                stride=1, padding=1))
+        layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.Conv2d(16, 32, kernel_size=3,
+                                stride=2, padding=1))
+        layers.append(nn.ReLU(inplace=True))
+        if grid_size > 17:
+            layers.append(nn.Conv2d(32, 32, kernel_size=3,
+                                    stride=2, padding=1))
+            layers.append(nn.ReLU(inplace=True))
+        self.convs = nn.Sequential(*layers)
+        self.act = nn.ReLU(inplace=True)
+
         with torch.no_grad():
             dummy = torch.zeros(1, in_channels, grid_size, grid_size)
-            h = self.act(self.conv1(dummy))
-            h = self.act(self.conv2(h))
+            h = self.convs(dummy)
             flat_dim = int(h.reshape(1, -1).shape[1])
         self.flat_dim = flat_dim
         self.proj = _layer_init(nn.Linear(flat_dim, out_dim))
@@ -168,14 +169,12 @@ class BeliefEncoder(nn.Module):
         if x.dim() == 5:
             B, N, C, H, W = x.shape
             x = x.reshape(B * N, C, H, W)
-            h = self.act(self.conv1(x))
-            h = self.act(self.conv2(h))
+            h = self.convs(x)
             h = h.reshape(B * N, self.flat_dim)
             emb = self.proj(h)
             return emb.reshape(B, N, self.out_dim)
 
-        h = self.act(self.conv1(x))
-        h = self.act(self.conv2(h))
+        h = self.convs(x)
         h = h.reshape(x.shape[0], self.flat_dim)
         return self.proj(h)
 
@@ -306,18 +305,14 @@ class GNNStage4Policy(nn.Module):
         self.belief_dim         = belief_encoder_out_dim
 
         # ---- Actor belief encoder ----------------------------------------
-        # Actor's input:
-        #   channels [0..actor_bayesian_channels): log-odds  -> sigmoid.
-        #   channels [actor_bayesian_channels..):  binary    -> passthrough.
-        # Input is now the KxK ego-centric window, not the global map --
-        # so we downsample only ONCE (first conv stride=1, second stride=2)
-        # to preserve spatial info in this smaller tensor.
+        # Actor's input: KxK ego-centric window per UAV.
+        #   channels [0..actor_bayesian_channels): log-odds -> sigmoid.
+        #   channels [actor_bayesian_channels..):  binary -> passthrough.
         self.actor_belief_encoder = BeliefEncoder(
             in_channels=belief_channels,
             grid_size=belief_window_size,
             out_dim=belief_encoder_out_dim,
             num_logit_channels=min(actor_bayesian_channels, belief_channels),
-            conv_strides=(1, 2),
         )
 
         # Actor node feature dim: base blue + optional hidden + belief.
@@ -340,9 +335,8 @@ class GNNStage4Policy(nn.Module):
         )
 
         # ---- Critic belief encoder + GNN + head --------------------------
-        # Critic input is ``true_occupancy`` (2 channels always: enemy
-        # + obstacle) -- already binary in [0, 1] so no sigmoid.
-        # Note the fixed 2 channels regardless of actor belief_channels.
+        # Critic reads global true_occupancy (2 channels: enemy +
+        # obstacle, grid_size × grid_size) -- already binary [0,1].
         self.critic_belief_encoder = BeliefEncoder(
             in_channels=2,
             grid_size=belief_grid_size,

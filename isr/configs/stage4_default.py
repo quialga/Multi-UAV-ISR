@@ -15,7 +15,7 @@ STAGE4_DEFAULTS = {
 
     # ----- Belief map ----------------------------------------------------
     "use_belief_maps":     True,
-    "belief_grid_size":    26,     # H = W (arena_size / cell_size)
+    "belief_grid_size":    52,     # H = W (arena_size / cell_size = 130 / 2.5)
     # 3 channels: {P(enemy) Bayesian, P(obstacle) Bayesian,
     #              ally_positions deterministic}
     # Channels 0-1 use log-odds (sigmoid at CNN input); channel 2 is
@@ -34,9 +34,9 @@ STAGE4_DEFAULTS = {
     # the "CNN can't produce ego-centric features" problem that stalled
     # v1/v2 at the random-policy baseline.  See docs/stage4_backlog.md
     # discussion.
-    # K = 17 at cell_size 5m covers 42.5m radius, encompassing the
-    # sensor_radius=40m disk with one cell margin.
-    "belief_window_size":  17,
+    # K = 33 at cell_size 2.5m covers 41.25m radius, encompassing the
+    # sensor_radius=40m disk with ~1 cell margin.
+    "belief_window_size":  33,
 
     # ----- Sensor model --------------------------------------------------
     "p_TP":                0.85,

@@ -518,7 +518,8 @@ def _stage4_env(**overrides):
         n_obstacles=4, obstacle_radius_min=5.0, obstacle_radius_max=15.0,
         # v3: 3 channels (enemy, obstacle, ally) -- self dropped since
         # ego-centric window is inherently centred on self.
-        use_belief_maps=True, belief_grid_size=26, belief_channels=3,
+        # v4: cell_size 2.5m -> grid 52x52 for sub-cell precision.
+        use_belief_maps=True, belief_grid_size=52, belief_channels=3,
         red_policy=stationary_red, seed=0,
     )
     kwargs.update(overrides)
@@ -589,7 +590,7 @@ def test_stage4_blue_cannot_move_into_obstacle():
 def test_stage4_belief_maps_shape_and_no_nans_after_200_steps():
     env = _stage4_env(max_steps=250)
     env.reset(seed=0)
-    assert env._belief_maps.shape == (5, 3, 26, 26)
+    assert env._belief_maps.shape == (5, 3, 52, 52)
     for _ in range(200):
         if not env.agents:
             env.reset(seed=1)
@@ -609,28 +610,29 @@ def test_stage4_occluded_cells_never_updated():
     """
     env = _stage4_env()
     env.reset(seed=0)
+    cs = env.belief_cell_size
     # Force a known obstacle geometry: single disk at (65, 65) r=10.
     env._obstacle_pos = np.array([[65.0, 65.0]], dtype=np.float32)
     env._obstacle_r   = np.array([10.0],        dtype=np.float32)
-    # Blue at (45, 65).  Cell (16, 13) centres at (82.5, 67.5), dist
-    # ~37.5 m < R=40.  The straight ray (45,65) → (82.5,67.5) passes
-    # near (65, 66) which is inside the obstacle → occluded.
+    # Blue at (45, 65).  Pick an occluded cell behind the obstacle at
+    # (82, 65) — directly through the obstacle centre.
     env._blue_pos[0] = np.array([45.0, 65.0], dtype=np.float32)
-    cxi_occ, cyi_occ = 16, 13
-    # A near cell (10, 13) centred at (52.5, 67.5) is unobstructed.
-    cxi_free, cyi_free = 10, 13
+    occ_x, occ_y = 82.0, 65.0
+    cxi_occ = int(occ_x / cs)
+    cyi_occ = int(occ_y / cs)
+    # A near cell at (48, 65) — in front of the obstacle, unoccluded.
+    free_x, free_y = 48.0, 65.0
+    cxi_free = int(free_x / cs)
+    cyi_free = int(free_y / cs)
 
     env._belief_maps[:] = 0.0
     for _ in range(20):
         env._update_belief_maps()
 
-    # Occluded cell: must be exactly 0.
     assert env._belief_maps[0, 0, cxi_occ, cyi_occ] == 0.0, (
         f"Occluded cell got updated: log-odds = "
         f"{env._belief_maps[0, 0, cxi_occ, cyi_occ]}"
     )
-    # Un-occluded cell: after 20 updates, log-odds should be
-    # measurably non-zero with high probability.
     assert env._belief_maps[0, 0, cxi_free, cyi_free] != 0.0, (
         "Un-occluded cell should have accumulated evidence"
     )
@@ -674,7 +676,7 @@ def test_stage4_true_occupancy_matches_ground_truth():
     env = _stage4_env()
     env.reset(seed=0)
     truth = env._true_occupancy()
-    assert truth.shape == (2, 26, 26)
+    assert truth.shape == (2, 52, 52)
     # Enemy channel: every active red maps to exactly one cell = 1.
     n_ones_enemy = int(truth[0].sum())
     assert n_ones_enemy == int(env._red_active.sum())
@@ -768,9 +770,9 @@ def test_stage4_obs_dict_schema():
     assert set(obs.keys()) == expected_keys
     assert obs["blue_features"].shape    == (5, 8)
     assert obs["bb_edge_features"].shape == (env.n_bb_edges, 7)
-    assert obs["belief_maps"].shape      == (5, 3, 26, 26)
+    assert obs["belief_maps"].shape      == (5, 3, 52, 52)
     assert obs["obstacle_positions"].shape[1] == 3
-    assert obs["true_occupancy"].shape   == (2, 26, 26)
+    assert obs["true_occupancy"].shape   == (2, 52, 52)
     # Ensure we did NOT accidentally leak Stage 3 keys.
     for stage3_key in ("red_features", "rb_edge_features",
                        "bb_edge_visible", "rb_edge_visible"):
@@ -784,12 +786,15 @@ def test_stage4_belief_window_shape_and_ego_centric():
     log-odds value at the UAV's own cell and confirming it lands at
     the window centre.
     """
-    K = 17
+    K = 33
     env = _stage4_env(belief_window_size=K, belief_channels=3)
     env.reset(seed=0)
-    # Force UAV 0 to (50, 50) which at cs=5 is cell (10, 10).
+    cs = env.belief_cell_size   # 2.5 m at grid_size=52
+    # Force UAV 0 to (50, 50) → cell (50/cs, 50/cs) = (20, 20).
     env._blue_pos[0] = np.array([50.0, 50.0], dtype=np.float32)
-    env._belief_maps[0, 0, 10, 10] = 4.2
+    cx = int(50.0 / cs)
+    cy = int(50.0 / cs)
+    env._belief_maps[0, 0, cx, cy] = 4.2
     windows = env._extract_belief_windows(K)
     assert windows.shape == (env.n_blue, env.belief_channels, K, K)
     centre = K // 2
@@ -801,32 +806,27 @@ def test_stage4_belief_window_edge_padding():
     A UAV placed at (0, 0) has half its window outside the arena;
     those out-of-bounds cells must be zero-padded (never garbage).
     """
-    K = 17
+    K = 33
     env = _stage4_env(belief_window_size=K, belief_channels=3)
     env.reset(seed=0)
     env._blue_pos[0] = np.array([0.0, 0.0], dtype=np.float32)
-    # Fill belief map channel 0 with 1 everywhere so any non-padded
-    # cell inside the window would show 1.
     env._belief_maps[0, 0, :, :] = 1.0
     windows = env._extract_belief_windows(K)
-    # Cells above-left of the UAV's own cell (0, 0) are OOB -> must be 0.
-    # UAV's own cell lands at (K//2, K//2) in the window.
     r = K // 2
-    # Everything at window-coords < r on either axis is OOB.
     assert np.all(windows[0, 0, :r, :] == 0.0), "top-left rows not zero-padded"
     assert np.all(windows[0, 0, :, :r] == 0.0), "top-left cols not zero-padded"
-    # Everything at window-coords >= r must equal 1 (in-arena).
     assert np.all(windows[0, 0, r:, r:] == 1.0), \
         "in-arena portion should show the log-odds we planted"
 
 
 def test_stage4_obs_dict_includes_belief_windows_when_enabled():
-    env = _stage4_env(belief_window_size=17)
+    K = 33
+    env = _stage4_env(belief_window_size=K)
     env.reset(seed=0)
     obs = env.structured_belief_observation()
     assert "belief_windows" in obs
     assert obs["belief_windows"].shape == (env.n_blue,
-                                            env.belief_channels, 17, 17)
+                                            env.belief_channels, K, K)
 
 
 def test_stage4_backward_compat_when_flags_off():
