@@ -1014,15 +1014,16 @@ class PursuitEnv(ParallelEnv):
 
     def _true_occupancy(self) -> np.ndarray:
         """
-        Ground-truth occupancy grid of shape
-        ``(belief_channels, belief_grid_size, belief_grid_size)``.
-        Channel 0 = enemy (active reds), channel 1 = obstacle.
-        Uses the ``_obstacle_grid`` cache populated at reset.
+        Ground-truth occupancy grid of shape ``(2, H, W)`` -- always
+        exactly 2 channels: enemy + obstacle.  Used by the critic and
+        by the diagnostic BCE.  It does NOT track the deterministic
+        ally / self channels that live in the actor's belief tensor
+        (channels 2-3), because those are already fully known and
+        the critic reads ally positions via ``blue_features`` anyway.
         """
         H = W = self.belief_grid_size
-        C = self.belief_channels
         cs = self.belief_cell_size
-        grid = np.zeros((C, H, W), dtype=np.float32)
+        grid = np.zeros((2, H, W), dtype=np.float32)
 
         # Channel 0: enemy (active reds).
         for r in range(self.n_red):
@@ -1034,8 +1035,7 @@ class PursuitEnv(ParallelEnv):
                 grid[0, cx, cy] = 1.0
 
         # Channel 1: obstacle -- cached once at reset (obstacles static).
-        if C >= 2:
-            grid[1] = self._obstacle_grid
+        grid[1] = self._obstacle_grid
         return grid
 
     def _cell_occluded_by_obstacle(
@@ -1076,21 +1076,26 @@ class PursuitEnv(ParallelEnv):
         Vectorised Bayesian log-odds update on ``self._belief_maps``.
         See ``docs/stage4_design.md §3.4`` for the algorithm.
 
-        Vs the original per-cell Python-loop version: replaces the
-        inner loops over candidate cells and channels with NumPy
-        vectorised ops.  Ray-casting for occlusion is batched:
-        interior sample points along every candidate ray are stacked
-        into a single (K, S, 2) tensor and checked against all
-        obstacles at once.  ~10-30x faster on the default 5v3 /
-        R=40 / cell=5 config.
+        Channel layout (v2, 4 channels by default):
+        - 0: P(enemy)    -- Bayesian log-odds from noisy sensor
+        - 1: P(obstacle) -- Bayesian log-odds from noisy sensor
+        - 2: ally_positions -- DETERMINISTIC overlay (perfect GPS via TDL)
+        - 3: self_position  -- DETERMINISTIC overlay (own GPS)
+
+        Only channels 0-1 are updated by Bayesian log-odds and clipped
+        to ``[-belief_clip, +belief_clip]``.  Channels 2-3 are reset
+        each step and written directly from ground-truth positions --
+        they represent perfect self and ally position knowledge, which
+        is what modern ISR drones have from GPS + Tactical Data Link.
         """
         if self._belief_maps is None or self.sensor_radius is None:
             return
 
         R  = self.sensor_radius
         centres = self._cell_centres                # (W, H, 2)  cached at reset
-        C = self.belief_channels
-        truth = self._true_occupancy()              # (C, W, H)
+        C_total    = self.belief_channels
+        C_bayesian = min(2, C_total)                # channels 0..1 if present
+        truth = self._true_occupancy()              # (2, W, H) -- always 2
 
         n_obs = 0 if self._obstacle_pos is None else int(self._obstacle_pos.shape[0])
 
@@ -1146,31 +1151,59 @@ class PursuitEnv(ParallelEnv):
                 if K == 0:
                     continue
 
-            # 3. Vectorised Bernoulli sensor sampling across channels.
-            truth_vis = truth[:, cx_idx, cy_idx]              # (C, K)
-            uniforms  = self._rng.random((C, K)).astype(np.float32)
-            p_detect  = np.where(
-                truth_vis > 0.5,
-                np.float32(self.p_TP),
-                np.float32(self.p_FP),
-            )                                                 # (C, K)
-            detected = uniforms < p_detect                    # (C, K) bool
-            evidence = np.where(
-                detected,
-                np.float32(self._L_detect),
-                np.float32(self._L_no_detect),
-            )                                                 # (C, K)
+            # 3. Vectorised Bernoulli sensor sampling across BAYESIAN channels only.
+            if C_bayesian > 0:
+                truth_vis = truth[:C_bayesian, cx_idx, cy_idx]     # (C_b, K)
+                uniforms  = self._rng.random((C_bayesian, K)).astype(np.float32)
+                p_detect  = np.where(
+                    truth_vis > 0.5,
+                    np.float32(self.p_TP),
+                    np.float32(self.p_FP),
+                )                                                   # (C_b, K)
+                detected = uniforms < p_detect                      # (C_b, K) bool
+                evidence = np.where(
+                    detected,
+                    np.float32(self._L_detect),
+                    np.float32(self._L_no_detect),
+                )                                                   # (C_b, K)
 
-            # 4. Apply evidence to this UAV's belief map (per channel).
-            for c in range(C):
-                self._belief_maps[i, c, cx_idx, cy_idx] += evidence[c]
+                # 4. Apply evidence to this UAV's belief map (Bayesian channels).
+                for c in range(C_bayesian):
+                    self._belief_maps[i, c, cx_idx, cy_idx] += evidence[c]
 
-        # Clip log-odds once at the end.
-        np.clip(
-            self._belief_maps,
-            -self.belief_clip, self.belief_clip,
-            out=self._belief_maps,
-        )
+        # Clip log-odds -- ONLY on Bayesian channels; deterministic
+        # channels 2-3 stay in {0, 1} untouched.
+        if C_bayesian > 0:
+            np.clip(
+                self._belief_maps[:, :C_bayesian],
+                -self.belief_clip, self.belief_clip,
+                out=self._belief_maps[:, :C_bayesian],
+            )
+
+        # 5. Deterministic overlays for channels 2 (allies) and 3 (self).
+        #    Each is reset to zero every step, then set to 1.0 at the
+        #    ground-truth cell(s) -- perfect GPS + TDL model.
+        if C_total >= 3:
+            self._belief_maps[:, 2] = 0.0
+            cs = self.belief_cell_size
+            H = W = self.belief_grid_size
+            # Ally channel: same for every UAV -- all allies visible on TDL.
+            for j in range(self.n_blue):
+                cx = int(self._blue_pos[j, 0] / cs)
+                cy = int(self._blue_pos[j, 1] / cs)
+                if 0 <= cx < W and 0 <= cy < H:
+                    self._belief_maps[:, 2, cx, cy] = 1.0
+
+        if C_total >= 4:
+            self._belief_maps[:, 3] = 0.0
+            cs = self.belief_cell_size
+            H = W = self.belief_grid_size
+            # Self channel: DIFFERENT per UAV -- each sees only itself.
+            for i in range(self.n_blue):
+                cx = int(self._blue_pos[i, 0] / cs)
+                cy = int(self._blue_pos[i, 1] / cs)
+                if 0 <= cx < W and 0 <= cy < H:
+                    self._belief_maps[i, 3, cx, cy] = 1.0
 
     def structured_belief_observation(self) -> Dict[str, np.ndarray]:
         """

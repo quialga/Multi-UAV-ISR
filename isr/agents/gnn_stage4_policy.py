@@ -83,29 +83,45 @@ class BeliefEncoder(nn.Module):
     (B, N_blue, C, H, W) to (B * N_blue, C, H, W), runs the encoder,
     and reshapes back.
 
-    ``input_is_logits`` (default True): when True, the encoder applies
-    ``torch.sigmoid`` at the input so the CNN sees probability values
-    in [0, 1] instead of raw (clipped) log-odds in ~[-10, +10].
-    Well-conditioned CNN input; also collapses "essentially certain"
-    cells (log-odds 8 vs 10) to nearly identical values -- the network
-    then devotes capacity to distinguishing "unknown" vs "possibly"
-    vs "definitely" instead of wasting it near sigmoid saturation.
-    For the critic path (which reads ``true_occupancy`` already in
-    [0, 1] binary), pass ``input_is_logits=False`` to skip the sigmoid.
+    ``num_logit_channels`` controls per-channel input pre-processing:
+    the first ``num_logit_channels`` channels are treated as raw log-
+    odds and passed through ``torch.sigmoid`` at the input (so the CNN
+    sees probabilities in [0, 1]); the remaining channels are passed
+    through unchanged (they're already in [0, 1] -- e.g. deterministic
+    ally / self position overlays, or the critic's ``true_occupancy``
+    which is binary).
+
+    Rationale for the split: cells with log-odds 8 vs 10 both mean
+    "essentially certain" -- sigmoid collapses them so the CNN devotes
+    capacity to distinguishing "unknown" vs "possibly" vs "definitely"
+    instead of wasting it near saturation.  But deterministic channels
+    (values in {0, 1}) would be uselessly compressed to {0.5, 0.73} by
+    sigmoid, so they bypass it.
+
+    Special values:
+    - ``num_logit_channels = 0``: no sigmoid at all (all channels
+      pass through -- use this for the critic on true_occupancy).
+    - ``num_logit_channels = in_channels``: sigmoid every channel.
     """
 
     def __init__(
         self,
-        in_channels:      int  = 2,
-        grid_size:        int  = 26,
-        out_dim:          int  = 64,
-        input_is_logits:  bool = True,
+        in_channels:       int = 2,
+        grid_size:         int = 26,
+        out_dim:           int = 64,
+        num_logit_channels:int = None,   # type: ignore[assignment]
     ) -> None:
         super().__init__()
         self.in_channels    = in_channels
         self.grid_size      = grid_size
         self.out_dim        = out_dim
-        self.input_is_logits = input_is_logits
+        # Default: all channels are logits (backward-compat with the
+        # 2-channel Bayesian-only design pre-4-channel-split).
+        self.num_logit_channels = (
+            in_channels if num_logit_channels is None
+            else int(num_logit_channels)
+        )
+        assert 0 <= self.num_logit_channels <= in_channels
 
         self.conv1 = nn.Conv2d(in_channels, 16, kernel_size=3,
                                stride=2, padding=1)
@@ -121,16 +137,24 @@ class BeliefEncoder(nn.Module):
         self.flat_dim = flat_dim
         self.proj = _layer_init(nn.Linear(flat_dim, out_dim))
 
+    def _apply_input_transform(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply sigmoid to the first ``num_logit_channels`` only."""
+        k = self.num_logit_channels
+        if k == 0:
+            return x
+        if k == self.in_channels:
+            return torch.sigmoid(x)
+        # Split, sigmoid the first k, concat.  Channel dim is -3.
+        logit_part = torch.sigmoid(x[..., :k, :, :])
+        pass_part  = x[..., k:, :, :]
+        return torch.cat([logit_part, pass_part], dim=-3)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         x : (B, C, H, W) or (B, N_blue, C, H, W)
         Returns (B, out_dim) or (B, N_blue, out_dim).
-
-        If ``input_is_logits`` was set at construction, ``x`` is passed
-        through ``sigmoid`` first to map log-odds to probability.
         """
-        if self.input_is_logits:
-            x = torch.sigmoid(x)
+        x = self._apply_input_transform(x)
 
         if x.dim() == 5:
             B, N, C, H, W = x.shape
@@ -240,11 +264,19 @@ class GNNStage4Policy(nn.Module):
         d_hidden:              int   = 64,
         n_msg_rounds:          int   = 2,
         init_log_std:          float = 0.0,
-        belief_channels:       int   = 2,
+        belief_channels:       int   = 4,
         belief_grid_size:      int   = 26,
         belief_encoder_out_dim:int   = 64,
+        actor_bayesian_channels:int  = 2,
         use_hidden_in_gnn:     bool  = True,
     ) -> None:
+        """
+        ``actor_bayesian_channels``: number of belief-map channels that
+        are noisy log-odds (defaults to 2 for Stage 4: enemy +
+        obstacle).  These get ``sigmoid`` at the CNN input.  Any
+        additional channels (allies, self position, etc.) are treated
+        as already in [0, 1] and pass through unchanged.
+        """
         super().__init__()
         self.n_blue            = n_blue
         self.d_hidden          = d_hidden
@@ -255,12 +287,14 @@ class GNNStage4Policy(nn.Module):
         self.belief_dim        = belief_encoder_out_dim
 
         # ---- Actor belief encoder ----------------------------------------
-        # Actor's input is per-UAV log-odds -> sigmoid inside encoder.
+        # Actor's input:
+        #   channels [0..actor_bayesian_channels): log-odds  -> sigmoid.
+        #   channels [actor_bayesian_channels..):  binary    -> passthrough.
         self.actor_belief_encoder = BeliefEncoder(
             in_channels=belief_channels,
             grid_size=belief_grid_size,
             out_dim=belief_encoder_out_dim,
-            input_is_logits=True,
+            num_logit_channels=min(actor_bayesian_channels, belief_channels),
         )
 
         # Actor node feature dim: base blue + optional hidden + belief.
@@ -283,13 +317,14 @@ class GNNStage4Policy(nn.Module):
         )
 
         # ---- Critic belief encoder + GNN + head --------------------------
-        # Critic input is ``true_occupancy`` which is already binary
-        # in [0, 1] -- skip the sigmoid input transform.
+        # Critic input is ``true_occupancy`` (2 channels always: enemy
+        # + obstacle) -- already binary in [0, 1] so no sigmoid.
+        # Note the fixed 2 channels regardless of actor belief_channels.
         self.critic_belief_encoder = BeliefEncoder(
-            in_channels=belief_channels,
+            in_channels=2,
             grid_size=belief_grid_size,
             out_dim=belief_encoder_out_dim,
-            input_is_logits=False,
+            num_logit_channels=0,
         )
         self.critic_encoder = BlueGNNEncoder(
             n_blue        = n_blue,

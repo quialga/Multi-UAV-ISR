@@ -353,8 +353,11 @@ class Stage4RolloutBuffer:
             (self.T, self.E, self.A, C, H, W),
             dtype=torch.float32, device=device,
         )
+        # true_occupancy always 2 channels (enemy + obstacle); it does
+        # not track deterministic ally/self overlays that live in the
+        # actor's belief tensor.
         self.true_occupancy = torch.zeros(
-            (self.T, self.E, C, H, W),
+            (self.T, self.E, 2, H, W),
             dtype=torch.float32, device=device,
         )
 
@@ -444,7 +447,7 @@ class Stage4RolloutBuffer:
         flat_blue = self.blue_features.reshape(N, self.A, self.blue_feat_dim)
         flat_bb   = self.bb_edge_features.reshape(N, self.n_bb_edges, self.edge_feat_dim)
         flat_bm   = self.belief_maps.reshape(N, self.A, C, H, W)
-        flat_to   = self.true_occupancy.reshape(N, C, H, W)
+        flat_to   = self.true_occupancy.reshape(N, 2, H, W)
         flat_act  = self.actions.reshape(N, self.A, self.action_dim)
         flat_lp   = self.log_probs.reshape(N, self.A)
         flat_val  = self.values.reshape(N)

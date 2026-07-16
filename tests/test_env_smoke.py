@@ -516,7 +516,7 @@ def _stage4_env(**overrides):
         n_blue=5, n_red=3, arena_size=130.0, capture_radius=3.0,
         sensor_radius=40.0,
         n_obstacles=4, obstacle_radius_min=5.0, obstacle_radius_max=15.0,
-        use_belief_maps=True, belief_grid_size=26, belief_channels=2,
+        use_belief_maps=True, belief_grid_size=26, belief_channels=4,
         red_policy=stationary_red, seed=0,
     )
     kwargs.update(overrides)
@@ -587,7 +587,7 @@ def test_stage4_blue_cannot_move_into_obstacle():
 def test_stage4_belief_maps_shape_and_no_nans_after_200_steps():
     env = _stage4_env(max_steps=250)
     env.reset(seed=0)
-    assert env._belief_maps.shape == (5, 2, 26, 26)
+    assert env._belief_maps.shape == (5, 4, 26, 26)
     for _ in range(200):
         if not env.agents:
             env.reset(seed=1)
@@ -681,6 +681,78 @@ def test_stage4_true_occupancy_matches_ground_truth():
     assert int(truth[1].sum()) > 0
 
 
+def test_stage4_ally_channel_is_deterministic_and_shared():
+    """
+    Channel 2 (ally positions) must equal 1.0 at every active blue's
+    cell and be IDENTICAL across all UAVs' belief maps (all-blues
+    view via TDL uplink).
+    """
+    env = _stage4_env()
+    env.reset(seed=0)
+    cs = env.belief_cell_size
+    ally_ch = env._belief_maps[:, 2]                    # (N_blue, H, W)
+    # All UAVs see the same ally channel.
+    for i in range(1, env.n_blue):
+        assert np.allclose(ally_ch[i], ally_ch[0]), (
+            f"Ally channel differs for UAV {i} vs UAV 0"
+        )
+    # Every blue's cell is marked = 1.
+    for i in range(env.n_blue):
+        cx = int(env._blue_pos[i, 0] / cs)
+        cy = int(env._blue_pos[i, 1] / cs)
+        assert ally_ch[0, cx, cy] == 1.0, (
+            f"Blue {i}'s cell ({cx},{cy}) not marked in ally channel"
+        )
+
+
+def test_stage4_self_channel_is_per_uav():
+    """
+    Channel 3 (self position) is DIFFERENT per UAV: only THIS UAV's
+    cell is marked in its own belief map.
+    """
+    env = _stage4_env()
+    env.reset(seed=0)
+    cs = env.belief_cell_size
+    self_ch = env._belief_maps[:, 3]                    # (N_blue, H, W)
+    for i in range(env.n_blue):
+        cx = int(env._blue_pos[i, 0] / cs)
+        cy = int(env._blue_pos[i, 1] / cs)
+        # UAV i sees a 1 at its own cell...
+        assert self_ch[i, cx, cy] == 1.0, (
+            f"UAV {i}'s own cell not marked in self channel"
+        )
+        # ...and no more than a single 1 in its self channel.
+        assert self_ch[i].sum() == pytest.approx(1.0), (
+            f"UAV {i}'s self channel has multiple non-zero cells"
+        )
+
+
+def test_stage4_deterministic_channels_unaffected_by_clip():
+    """
+    ``belief_clip`` should only apply to log-odds channels (0-1);
+    the deterministic channels stay in {0, 1}.  Run 300 steps with
+    all blues moving toward the same corner and confirm channels
+    2-3 are still {0, 1}, not clipped weirdly.
+    """
+    env = _stage4_env(max_steps=350)
+    env.reset(seed=0)
+    actions = {a: np.array([1.0, 1.0], dtype=np.float32) for a in env.agents}
+    for _ in range(300):
+        if not env.agents:
+            env.reset(seed=1)
+        env.step(actions)
+    ally_ch = env._belief_maps[:, 2]
+    self_ch = env._belief_maps[:, 3]
+    unique_ally = np.unique(ally_ch)
+    unique_self = np.unique(self_ch)
+    assert set(unique_ally.tolist()).issubset({0.0, 1.0}), (
+        f"Ally channel has non-binary values: {unique_ally}"
+    )
+    assert set(unique_self.tolist()).issubset({0.0, 1.0}), (
+        f"Self channel has non-binary values: {unique_self}"
+    )
+
+
 def test_stage4_obs_dict_schema():
     env = _stage4_env()
     env.reset(seed=0)
@@ -692,7 +764,7 @@ def test_stage4_obs_dict_schema():
     assert set(obs.keys()) == expected_keys
     assert obs["blue_features"].shape    == (5, 8)
     assert obs["bb_edge_features"].shape == (env.n_bb_edges, 7)
-    assert obs["belief_maps"].shape      == (5, 2, 26, 26)
+    assert obs["belief_maps"].shape      == (5, 4, 26, 26)
     assert obs["obstacle_positions"].shape[1] == 3
     assert obs["true_occupancy"].shape   == (2, 26, 26)
     # Ensure we did NOT accidentally leak Stage 3 keys.

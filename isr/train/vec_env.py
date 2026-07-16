@@ -407,8 +407,9 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
                 dtype=np.float32),
             "obstacle_positions": np.zeros(
                 (self.n_envs, nob, 3), dtype=np.float32),
+            # true_occupancy always 2 channels: enemy + obstacle.
             "true_occupancy":   np.zeros(
-                (self.n_envs, C, H, W), dtype=np.float32),
+                (self.n_envs, 2, H, W), dtype=np.float32),
         }
 
     def _fill_row(  # type: ignore[override]

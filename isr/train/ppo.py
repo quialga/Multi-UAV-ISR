@@ -412,12 +412,13 @@ def ppo_update_stage4(
             nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             optimizer.step()
 
-            # Diagnostic BCE — no gradient, just observability.
+            # Diagnostic BCE — no gradient, just observability.  Only
+            # computed on the Bayesian channels (first 2 of belief_maps)
+            # since true_occupancy is always 2-channel.
             with torch.no_grad():
-                # per_uav_bce: BCE per UAV per cell, averaged.
-                bm = batch["belief_maps"]                   # (mb, A, C, H, W)
+                bm = batch["belief_maps"][:, :, :2, :, :]   # (mb, A, 2, H, W)
                 truth = batch["true_occupancy"].unsqueeze(1) \
-                          .expand_as(bm)                    # (mb, A, C, H, W)
+                          .expand_as(bm)                    # (mb, A, 2, H, W)
                 per_uav_bce = torch.nn.functional.binary_cross_entropy_with_logits(
                     bm, truth,
                 )
