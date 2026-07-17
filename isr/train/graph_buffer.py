@@ -330,6 +330,8 @@ class Stage4RolloutBuffer:
         red_feat_dim:   int = 1,
         n_rb_edges:     int = 0,
         rb_edge_feat_dim:int = 4,
+        # Stage 4 v5.3 obstacle peaks sizing.
+        n_obstacle_peaks:int = 1,
     ) -> None:
         self.T = int(rollout_steps)
         self.E = int(n_envs)
@@ -402,14 +404,20 @@ class Stage4RolloutBuffer:
             self.rb_edge_features = None
             self.rb_edge_visible  = None
 
-        # v5.2 belief peak detections per UAV (top-K = n_red).
+        # v5.3 belief peak detections per UAV (two channels).
+        self.n_obstacle_peaks = int(n_obstacle_peaks)
         if self.n_red > 0:
-            self.belief_peaks = torch.zeros(
+            self.belief_peaks_enemy = torch.zeros(
                 (self.T, self.E, self.A, self.n_red, 3),
                 dtype=torch.float32, device=device,
             )
+            self.belief_peaks_obstacle = torch.zeros(
+                (self.T, self.E, self.A, self.n_obstacle_peaks, 3),
+                dtype=torch.float32, device=device,
+            )
         else:
-            self.belief_peaks = None
+            self.belief_peaks_enemy    = None
+            self.belief_peaks_obstacle = None
 
         # Agent-level tensors.
         self.actions   = torch.zeros((self.T, self.E, self.A, self.action_dim),
@@ -448,8 +456,9 @@ class Stage4RolloutBuffer:
         red_features:     torch.Tensor = None,
         rb_edge_features_v5: torch.Tensor = None,
         rb_edge_visible:  torch.Tensor = None,
-        # v5.2 belief peaks
-        belief_peaks:     torch.Tensor = None,
+        # v5.3 belief peaks (two channels)
+        belief_peaks_enemy:    torch.Tensor = None,
+        belief_peaks_obstacle: torch.Tensor = None,
     ) -> None:
         assert self.ptr < self.T, "Buffer full — call reset() between rollouts."
         if self.belief_windows is not None:
@@ -462,9 +471,11 @@ class Stage4RolloutBuffer:
             self.red_features[self.ptr]     = red_features
             self.rb_edge_features[self.ptr] = rb_edge_features_v5
             self.rb_edge_visible[self.ptr]  = rb_edge_visible
-        if self.belief_peaks is not None:
-            assert belief_peaks is not None
-            self.belief_peaks[self.ptr] = belief_peaks
+        if self.belief_peaks_enemy is not None:
+            assert belief_peaks_enemy is not None
+            assert belief_peaks_obstacle is not None
+            self.belief_peaks_enemy[self.ptr]    = belief_peaks_enemy
+            self.belief_peaks_obstacle[self.ptr] = belief_peaks_obstacle
         self.blue_features[self.ptr]    = blue_features
         self.bb_edge_features[self.ptr] = bb_edge_features
         self.belief_maps[self.ptr]      = belief_maps
@@ -540,10 +551,15 @@ class Stage4RolloutBuffer:
             )
             flat_rv = self.rb_edge_visible.reshape(N, self.n_rb_edges)
 
-        # v5.2 belief peaks flat view.
-        flat_bp = None
-        if self.belief_peaks is not None:
-            flat_bp = self.belief_peaks.reshape(N, self.A, self.n_red, 3)
+        # v5.3 belief peaks flat views.
+        flat_bpe = flat_bpo = None
+        if self.belief_peaks_enemy is not None:
+            flat_bpe = self.belief_peaks_enemy.reshape(
+                N, self.A, self.n_red, 3,
+            )
+            flat_bpo = self.belief_peaks_obstacle.reshape(
+                N, self.A, self.n_obstacle_peaks, 3,
+            )
 
         perm = torch.randperm(N, device=self.device)
         for start in range(0, N, mb_size):
@@ -566,6 +582,7 @@ class Stage4RolloutBuffer:
                 out["red_features"]     = flat_rf[idx]
                 out["rb_edge_features"] = flat_rb[idx]
                 out["rb_edge_visible"]  = flat_rv[idx]
-            if flat_bp is not None:
-                out["belief_peaks"] = flat_bp[idx]
+            if flat_bpe is not None:
+                out["belief_peaks_enemy"]    = flat_bpe[idx]
+                out["belief_peaks_obstacle"] = flat_bpo[idx]
             yield out

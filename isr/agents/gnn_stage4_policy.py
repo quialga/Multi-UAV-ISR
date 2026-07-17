@@ -284,13 +284,21 @@ class GNNStage4Policy(nn.Module):
         red_feat_dim:          int   = 1,
         rb_edge_feat_dim:      int   = 4,
         red_msg_dim:           int   = 64,
-        # ----- Belief peak branch (Stage 4 v5.2) --------------------
-        # Top-K (dx, dy, confidence) peaks per UAV, extracted from the
-        # belief map.  Gives the policy explicit position estimates
-        # that the CNN couldn't reliably produce.  n_belief_peaks
-        # defaults to n_red; peak_msg_dim controls the encoder output.
-        n_belief_peaks:        int   = 3,
+        # ----- Belief peak branch (Stage 4 v5.3) --------------------
+        # Explicit peak detections from the belief map.  Two channels:
+        #   - enemy peaks    : top-K from log-odds channel 0
+        #     (K = n_red)
+        #   - obstacle peaks : top-K from log-odds channel 1
+        #     (K = n_obstacles)
+        # Both come from the noisy Bayesian belief map -- consistent
+        # sensor-physics story.  Replaces the actor's belief CNN
+        # (dropped in v5.3 -- the CNN wasn't extracting usable info
+        # anyway; peaks are the tracker output the policy should
+        # actually see, as in real ISR systems).
+        n_enemy_peaks:         int   = 3,
+        n_obstacle_peaks:      int   = 4,
         peak_msg_dim:          int   = 32,
+        use_actor_belief_cnn:  bool  = False,  # v5.3: default off
     ) -> None:
         """
         Args:
@@ -317,16 +325,22 @@ class GNNStage4Policy(nn.Module):
         self.belief_window_size = belief_window_size
         self.belief_dim         = belief_encoder_out_dim
 
-        # ---- Actor belief encoder ----------------------------------------
-        # Actor's input: KxK ego-centric window per UAV.
-        #   channels [0..actor_bayesian_channels): log-odds -> sigmoid.
-        #   channels [actor_bayesian_channels..):  binary -> passthrough.
-        self.actor_belief_encoder = BeliefEncoder(
-            in_channels=belief_channels,
-            grid_size=belief_window_size,
-            out_dim=belief_encoder_out_dim,
-            num_logit_channels=min(actor_bayesian_channels, belief_channels),
-        )
+        # ---- Actor belief encoder (v5.3: OPTIONAL) -----------------------
+        # v5.3: dropped by default -- the CNN wasn't extracting usable
+        # positional info from the belief map (ablation-confirmed by
+        # the user).  Belief peaks + rb_edges + bb_edges together
+        # carry all the actionable info.  Set use_actor_belief_cnn=True
+        # to re-enable for ablation purposes.
+        self.use_actor_belief_cnn = use_actor_belief_cnn
+        if use_actor_belief_cnn:
+            self.actor_belief_encoder = BeliefEncoder(
+                in_channels=belief_channels,
+                grid_size=belief_window_size,
+                out_dim=belief_encoder_out_dim,
+                num_logit_channels=min(actor_bayesian_channels, belief_channels),
+            )
+        else:
+            self.actor_belief_encoder = None
 
         # ---- Red-to-blue message branch (Stage 4 v5) ---------------------
         # Restores the intercept signal that v1-v4 lacked.  For each
@@ -348,22 +362,25 @@ class GNNStage4Policy(nn.Module):
         self.register_buffer("rb_src", rb_src.long(), persistent=False)
         self.register_buffer("rb_dst", rb_dst.long(), persistent=False)
 
-        # ---- Belief peak encoder (Stage 4 v5.2) --------------------------
-        # Explicit (dx, dy, confidence) triples per UAV, top-K per belief
-        # map.  Encoded per-peak by a small MLP, then sum-aggregated so
-        # each UAV gets a fixed-size peak-context vector.
-        self.n_belief_peaks = n_belief_peaks
-        self.peak_msg_dim   = peak_msg_dim
-        self.peak_encoder = _mlp(3, [peak_msg_dim], peak_msg_dim)
+        # ---- Belief peak encoders (Stage 4 v5.3) -------------------------
+        # Two separate small MLPs -- enemies mean "pursue", obstacles
+        # mean "avoid", so distinct encoders let each learn its own
+        # semantics.  Aggregated per-UAV via sum-pool.
+        self.n_enemy_peaks    = n_enemy_peaks
+        self.n_obstacle_peaks = n_obstacle_peaks
+        self.peak_msg_dim     = peak_msg_dim
+        self.enemy_peak_encoder    = _mlp(3, [peak_msg_dim], peak_msg_dim)
+        self.obstacle_peak_encoder = _mlp(3, [peak_msg_dim], peak_msg_dim)
 
-        # Actor node feature dim: blue + optional hidden + belief_cnn
-        # + red_context + peak_context.
+        # Actor node feature dim: blue + optional hidden + optional
+        # belief_cnn + red_context + enemy_peaks + obstacle_peaks.
         actor_node_feat_dim = (
             blue_feat_dim
-            + belief_encoder_out_dim
             + red_msg_dim
-            + peak_msg_dim
+            + 2 * peak_msg_dim              # enemy + obstacle peaks
         )
+        if use_actor_belief_cnn:
+            actor_node_feat_dim += belief_encoder_out_dim
         if use_hidden_in_gnn:
             actor_node_feat_dim += d_hidden
 
@@ -452,25 +469,19 @@ class GNNStage4Policy(nn.Module):
     ) -> torch.Tensor:
         """
         Build the actor's per-blue node embedding by concatenating
-        blue_features, hidden (if enabled), belief-encoded features,
-        and aggregated red context (from visible rb_edges), then
-        running the actor GNN.  Returns h_blue (B, N, d_hidden).
-
-        Belief input: reads ``belief_windows`` (ego-centric, per-UAV KxK
-        crops) if present in ``partial_obs``, else falls back to the
-        global ``belief_maps`` for backward compatibility.
+        blue_features, hidden (if enabled), belief-peak contexts
+        (enemy + obstacle), aggregated red context (velocity from
+        visible rb_edges), and optionally CNN-encoded belief windows.
+        Runs the actor GNN.  Returns h_blue (B, N, d_hidden).
 
         Red context: from ``red_features`` + ``rb_edge_features`` gated
-        by ``rb_edge_visible``.  If any of those keys are missing (e.g.
-        legacy Stage 4 v1-v4 obs dict without red-side), we substitute
-        zeros -- the actor gracefully degrades to belief-only behaviour.
+        by ``rb_edge_visible``.  Zero fallback for missing keys.
         """
-        belief_input = partial_obs.get(
-            "belief_windows", partial_obs.get("belief_maps"),
-        )
-        belief_emb = self.actor_belief_encoder(belief_input)
+        B      = partial_obs["blue_features"].shape[0]
+        device = partial_obs["blue_features"].device
+        dtype  = partial_obs["blue_features"].dtype
 
-        # Red context aggregation (v5).  Zero fallback for missing keys.
+        # Red context aggregation (v5).
         if all(k in partial_obs for k in (
             "red_features", "rb_edge_features", "rb_edge_visible",
         )):
@@ -480,31 +491,43 @@ class GNNStage4Policy(nn.Module):
                 partial_obs["rb_edge_visible"],
             )
         else:
-            B = partial_obs["blue_features"].shape[0]
             red_ctx = torch.zeros(
                 B, self.n_blue, self.red_msg_dim,
-                device=belief_emb.device, dtype=belief_emb.dtype,
+                device=device, dtype=dtype,
             )
 
-        # Belief peak context (v5.2).  Encode each of the top-K peaks
-        # and sum-aggregate per UAV.  Zero fallback if not present.
-        if "belief_peaks" in partial_obs:
-            peaks = partial_obs["belief_peaks"]           # (B, N_blue, K, 3)
-            peak_emb = self.peak_encoder(peaks)           # (B, N_blue, K, D)
-            peak_ctx = peak_emb.sum(dim=2)                # (B, N_blue, D)
+        # Enemy peak context (v5.2).
+        if "belief_peaks_enemy" in partial_obs:
+            peaks_e   = partial_obs["belief_peaks_enemy"]  # (B, N, Ke, 3)
+            enemy_ctx = self.enemy_peak_encoder(peaks_e).sum(dim=2)
         else:
-            B = partial_obs["blue_features"].shape[0]
-            peak_ctx = torch.zeros(
+            enemy_ctx = torch.zeros(
                 B, self.n_blue, self.peak_msg_dim,
-                device=belief_emb.device, dtype=belief_emb.dtype,
+                device=device, dtype=dtype,
+            )
+
+        # Obstacle peak context (v5.3).
+        if "belief_peaks_obstacle" in partial_obs:
+            peaks_o  = partial_obs["belief_peaks_obstacle"] # (B, N, Ko, 3)
+            obst_ctx = self.obstacle_peak_encoder(peaks_o).sum(dim=2)
+        else:
+            obst_ctx = torch.zeros(
+                B, self.n_blue, self.peak_msg_dim,
+                device=device, dtype=dtype,
             )
 
         parts = [partial_obs["blue_features"]]
         if self.use_hidden_in_gnn:
             parts.append(hidden)
-        parts.append(belief_emb)
+        if self.use_actor_belief_cnn:
+            belief_input = partial_obs.get(
+                "belief_windows", partial_obs.get("belief_maps"),
+            )
+            belief_emb = self.actor_belief_encoder(belief_input)
+            parts.append(belief_emb)
         parts.append(red_ctx)
-        parts.append(peak_ctx)
+        parts.append(enemy_ctx)
+        parts.append(obst_ctx)
         blue_input = torch.cat(parts, dim=-1)
         return self.actor_encoder(blue_input, partial_obs["bb_edge_features"])
 

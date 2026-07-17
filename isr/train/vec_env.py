@@ -438,9 +438,13 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
         batch["rb_edge_visible"] = np.zeros(
             (self.n_envs, self.n_rb_edges), dtype=np.float32,
         )
-        # Stage 4 v5.2: belief-peak detections per UAV (top-K = n_red).
-        batch["belief_peaks"] = np.zeros(
+        # Stage 4 v5.3: two-channel belief peaks per UAV.
+        batch["belief_peaks_enemy"] = np.zeros(
             (self.n_envs, self.n_blue, self.n_red, 3), dtype=np.float32,
+        )
+        n_obs_peaks = max(1, self.n_obstacles)
+        batch["belief_peaks_obstacle"] = np.zeros(
+            (self.n_envs, self.n_blue, n_obs_peaks, 3), dtype=np.float32,
         )
         return batch
 
@@ -451,7 +455,7 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
         for k in ("blue_features", "bb_edge_features",
                   "belief_maps", "true_occupancy",
                   "red_features", "rb_edge_features", "rb_edge_visible",
-                  "belief_peaks"):
+                  "belief_peaks_enemy", "belief_peaks_obstacle"):
             if k in batch and k in obs:
                 batch[k][idx] = obs[k]
         if "belief_windows" in batch and "belief_windows" in obs:

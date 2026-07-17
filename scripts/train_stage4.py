@@ -303,6 +303,8 @@ def main() -> None:
         red_feat_dim     = vec_env.red_feat_dim,
         n_rb_edges       = vec_env.n_rb_edges,
         rb_edge_feat_dim = vec_env.rb_edge_feat_dim,
+        # v5.3 obstacle peaks slot count (matches env's max(1, n_obstacles)).
+        n_obstacle_peaks = max(1, vec_env.n_obstacles),
     )
 
     log(f"\nStarting Stage 4 training: {args.n_rollouts} rollouts x "
@@ -343,9 +345,9 @@ def main() -> None:
                 partial_obs["belief_windows"] = _to_device(
                     obs_np["belief_windows"], device,
                 )
-            # v5 red-side branch + v5.2 belief peaks.
+            # v5 red-side branch + v5.3 two-channel belief peaks.
             for k in ("red_features", "rb_edge_features", "rb_edge_visible",
-                      "belief_peaks"):
+                      "belief_peaks_enemy", "belief_peaks_obstacle"):
                 if k in obs_np:
                     partial_obs[k] = _to_device(obs_np[k], device)
             full_state = {
@@ -376,7 +378,8 @@ def main() -> None:
                 red_features        = partial_obs.get("red_features", None),
                 rb_edge_features_v5 = partial_obs.get("rb_edge_features", None),
                 rb_edge_visible     = partial_obs.get("rb_edge_visible", None),
-                belief_peaks        = partial_obs.get("belief_peaks", None),
+                belief_peaks_enemy    = partial_obs.get("belief_peaks_enemy",    None),
+                belief_peaks_obstacle = partial_obs.get("belief_peaks_obstacle", None),
             )
 
             done_t = torch.from_numpy(done_np).to(device).view(-1, 1, 1)

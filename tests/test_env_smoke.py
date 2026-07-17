@@ -774,8 +774,8 @@ def test_stage4_obs_dict_schema():
         "obstacle_positions", "true_occupancy",
         # v5 red-side.
         "red_features", "rb_edge_features", "rb_edge_visible",
-        # v5.2 belief peak detections.
-        "belief_peaks",
+        # v5.3 two-channel belief peak detections.
+        "belief_peaks_enemy", "belief_peaks_obstacle",
     }
     assert set(obs.keys()) == expected_keys
     assert obs["blue_features"].shape    == (5, 8)
@@ -789,9 +789,9 @@ def test_stage4_obs_dict_schema():
     assert obs["rb_edge_visible"].shape  == (env.n_rb_edges,)
 
 
-def test_stage4_belief_peaks_shape_and_ordering():
+def test_stage4_belief_peaks_enemy_shape_and_ordering():
     """
-    v5.2 belief peaks: (N_blue, K, 3) with K = n_red, confidence
+    v5.3 enemy belief peaks: (N_blue, K, 3) with K = n_red, confidence
     monotonically non-increasing across the K slots (peaks sorted).
     """
     env = _stage4_env()
@@ -801,15 +801,32 @@ def test_stage4_belief_peaks_shape_and_ordering():
     env._belief_maps[0, 0, 20, 20] = 3.0
     env._belief_maps[0, 0, 30, 30] = 1.5
     obs = env.structured_belief_observation()
-    peaks = obs["belief_peaks"]
+    peaks = obs["belief_peaks_enemy"]
     assert peaks.shape == (env.n_blue, env.n_red, 3)
-    # UAV 0's top-3 confidences must be monotonically non-increasing.
     confs = peaks[0, :, 2]
-    assert confs[0] >= confs[1] >= confs[2], (
-        f"peak confidences not sorted: {confs}"
-    )
-    # Highest confidence peak should be near sigmoid(5) ~ 0.993.
+    assert confs[0] >= confs[1] >= confs[2]
     assert confs[0] > 0.99
+
+
+def test_stage4_belief_peaks_obstacle_from_channel_1():
+    """
+    v5.3 obstacle peaks come from belief map channel 1 (P(obstacle)),
+    NOT from ground-truth obstacle_positions.  Verify by planting
+    obstacle-channel evidence and confirming it surfaces as peaks
+    with correct confidence.
+    """
+    env = _stage4_env()
+    env.reset(seed=0)
+    # Plant strong evidence in obstacle channel of UAV 0.
+    env._belief_maps[0, 1, 5, 5]   = 4.5
+    env._belief_maps[0, 1, 15, 15] = 3.5
+    obs = env.structured_belief_observation()
+    assert "belief_peaks_obstacle" in obs
+    peaks = obs["belief_peaks_obstacle"]
+    # UAV 0's top obstacle-peak should have high confidence.
+    assert peaks[0, 0, 2] > 0.98, (
+        f"UAV 0 top obstacle peak conf {peaks[0, 0, 2]} not > 0.98"
+    )
 
 
 def test_stage4_rb_edges_are_velocity_only_no_position_leak():

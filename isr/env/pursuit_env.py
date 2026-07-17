@@ -1231,11 +1231,11 @@ class PursuitEnv(ParallelEnv):
                 if 0 <= cx < W and 0 <= cy < H:
                     self._belief_maps[i, 3, cx, cy] = 1.0
 
-    def _extract_belief_peaks(self, K: int) -> np.ndarray:
+    def _extract_belief_peaks(self, K: int, channel_idx: int = 0) -> np.ndarray:
         """
-        Vectorised top-K peak extraction from each UAV's belief map
-        channel 0.  Returns per-detection (rel_dx, rel_dy, P_conf)
-        triples in normalised units.
+        Vectorised top-K peak extraction from a specified channel of
+        each UAV's belief map.  Returns per-detection (rel_dx, rel_dy,
+        P_conf) triples in normalised units.
 
         Rationale: v5.1 showed the CNN can't extract usable position
         info from the belief-map tensor.  Explicit peak detection is
@@ -1244,6 +1244,14 @@ class PursuitEnv(ParallelEnv):
         inherit the belief map's noise), so the sensor-physics story
         holds; we just give the policy a more digestible form.
 
+        Parameters
+        ----------
+        K : int
+          Number of peaks to extract per UAV.
+        channel_idx : int
+          Which belief map channel to extract from.  0 = P(enemy),
+          1 = P(obstacle) in the v5.2+ layout.
+
         Returns
         -------
         peaks : (N_blue, K, 3) float32
@@ -1251,14 +1259,15 @@ class PursuitEnv(ParallelEnv):
           dx, dy are relative from the UAV to the peak cell centre.
         """
         assert self._belief_maps is not None
+        assert 0 <= channel_idx < self._belief_maps.shape[1]
         L = self.arena_size
         cs = self.belief_cell_size
         H = W = self.belief_grid_size
 
-        # Channel 0 = P(enemy) in log-odds; sigmoid to get [0, 1].
-        enemy_lo = self._belief_maps[:, 0, :, :]
-        enemy_p  = 1.0 / (1.0 + np.exp(-enemy_lo))
-        flat = enemy_p.reshape(self.n_blue, -1)              # (N, H*W)
+        # Extract log-odds for the requested channel and sigmoid to prob.
+        chan_lo = self._belief_maps[:, channel_idx, :, :]
+        chan_p  = 1.0 / (1.0 + np.exp(-chan_lo))
+        flat = chan_p.reshape(self.n_blue, -1)              # (N, H*W)
 
         # Top-K per UAV (vectorised across UAVs).
         if flat.shape[1] <= K:
@@ -1399,13 +1408,30 @@ class PursuitEnv(ParallelEnv):
                 self.belief_window_size,
             )
 
-        # Belief-map peak detections (Phase 4 v5.2).  Top-K cells with
-        # highest P(enemy) per UAV, as (dx, dy, conf) triples.  Gives
-        # the policy explicit position estimates the CNN couldn't
-        # produce reliably.  K = n_red by convention (one detection
-        # slot per real target).
+        # Belief-map peak detections (Phase 4 v5.3).  Top-K cells with
+        # highest P per UAV, as (dx, dy, conf) triples.  Two channels:
+        #   - belief_peaks_enemy    : from log-odds channel 0
+        #     (K = n_red -- one detection slot per real target)
+        #   - belief_peaks_obstacle : from log-odds channel 1
+        #     (K = n_obstacles -- one slot per real obstacle)
+        # Both come from the noisy Bayesian belief map -- consistent
+        # sensor-physics story.  The former ``obstacle_positions``
+        # ground-truth field is deliberately NOT consumed by the
+        # actor, only kept in the obs for logging / diagnostics.
         if self._belief_maps is not None:
-            out["belief_peaks"] = self._extract_belief_peaks(self.n_red)
+            out["belief_peaks_enemy"] = self._extract_belief_peaks(
+                self.n_red, channel_idx=0,
+            )
+            # Obstacles: ensure we always emit at least 1 slot even
+            # in the n_obstacles=0 case so downstream tensor shapes
+            # stay consistent within a training run.  The confidence
+            # channel signals "nothing here" when there are no real
+            # obstacles (P → 0 as sensor keeps observing "no obstacle").
+            n_obs_peaks = max(1, self.n_obstacles)
+            if self._belief_maps.shape[1] >= 2:
+                out["belief_peaks_obstacle"] = self._extract_belief_peaks(
+                    n_obs_peaks, channel_idx=1,
+                )
 
         return out
 
