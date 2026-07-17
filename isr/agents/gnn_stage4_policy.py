@@ -1,24 +1,39 @@
 """
 isr/agents/gnn_stage4_policy.py — Stage 4 belief-map CTDE policy.
 
-Extends the Stage 3 CTDE + recurrent architecture with:
+Architecture as of v5.3 (see the version log in docs/stage4_design.md
+for how it got here — the belief-map paradigm went through several
+revisions before landing on explicit peak detections).
 
-- A per-UAV CNN encoder over the (C=2, H=26, W=26) log-odds belief
-  tensor.  Its 64-dim output is concatenated with the existing
-  ``blue_features`` (8) and the Stage 3-opt-1 hidden state (64) to
-  form a 136-dim actor node feature.
-- A separate CNN encoder in the critic path that reads the
-  ``true_occupancy`` (available at training time — CTDE) and produces
-  a 64-dim global belief embedding.
-- No red nodes in the GNN — enemies live only in the belief map.
-- No `bb_edge_visible` mask — ally comms via GPS uplink always on.
+Actor (partial-obs, decentralised) per-UAV node feature is a
+concatenation of:
+- ``blue_features``       (8)   — own kinematics (precise, GPS/IMU)
+- hidden state            (64)  — Stage 3-opt-1 cross-blue channel
+- red context             (64)  — aggregated messages from VISIBLE
+  rb_edges, which carry precise enemy VELOCITY only (Doppler radar);
+  enemy position is deliberately excluded from the edges.
+- enemy peak context      (32)  — encoded top-K (dx, dy, conf)
+  detections from belief-map channel 0 (noisy P(enemy)).
+- obstacle peak context   (32)  — encoded top-K detections from
+  belief-map channel 1 (noisy P(obstacle)).
+= 200-dim actor node feature (with hidden-in-GNN on).
 
-See ``docs/stage4_design.md`` §5 for the full architecture rationale
-and §6 for the (aux-off) PPO integration.
+The per-UAV belief CNN present in v1–v5.2 is DROPPED by default
+(``use_actor_belief_cnn=False``): an ablation showed the CNN never
+learned to recover position from the log-odds tensor.  Explicit
+peak detections — the tracker output a real ISR operator sees — are
+what the policy consumes instead.  The CNN can be re-enabled for
+ablation via the constructor flag; ``BeliefEncoder`` is retained
+for that path and for the critic.
 
-Cold-started: the critic is randomly initialised; the Stage 3
-checkpoint's critic has red-side tensors and a differently-shaped
-input, so byte-safe copy is not possible.
+Critic (full-obs, centralised, CTDE) keeps a ``BeliefEncoder`` CNN
+over ``true_occupancy`` (available only at training time) plus a
+blue-only GNN.  It is cold-started — the Stage 3 checkpoint's critic
+has red-side tensors and a differently-shaped input.
+
+Sensor-physics split maintained throughout: precise self/ally state
+and enemy velocity flow through the graph; noisy enemy/obstacle
+positions flow only through the Bayesian belief map's peak output.
 """
 from __future__ import annotations
 
@@ -64,24 +79,29 @@ def _build_bb_edges(n_blue: int) -> Tuple[torch.Tensor, torch.Tensor]:
 
 
 # ---------------------------------------------------------------------------
-# Belief CNN encoder (shared per-UAV weights)
+# Belief CNN encoder
 # ---------------------------------------------------------------------------
 
 class BeliefEncoder(nn.Module):
     """
-    Small conv net that reduces a (C, H, W) log-odds belief tensor to
+    Small conv net that reduces a (C, H, W) belief/occupancy tensor to
     a fixed ``out_dim`` embedding.
 
-    Default architecture matches docs/stage4_design.md §5.1:
-        Conv2d(2 → 16, k=3, s=2, p=1)   → (16, 13, 13)
-        Conv2d(16 → 32, k=3, s=2, p=1)  → (32, 7, 7)
-        Flatten                          → (1568,)
-        Linear(1568, 64)                 → (64,)
-    ~110 k params.
+    As of v5.3 this is used only by the CRITIC (over the full-state
+    ``true_occupancy`` grid).  The actor's per-UAV belief CNN is
+    dropped by default in favour of explicit peak detections; the
+    encoder remains available for the ``use_actor_belief_cnn=True``
+    ablation path.
 
-    Shared weights are applied per UAV: the caller reshapes
-    (B, N_blue, C, H, W) to (B * N_blue, C, H, W), runs the encoder,
-    and reshapes back.
+    Conv stack auto-adapts to the input grid so the flatten dim stays
+    bounded across grid sizes:
+        grid_size <= 17:  Conv(C→16, s1) → Conv(16→32, s2)         → ~9×9
+        grid_size >  17:  … + Conv(32→32, s2)                       → ~9×9
+    Followed by Flatten → Linear(flat_dim, out_dim).  ``flat_dim`` is
+    computed dynamically at construction from a dummy forward pass.
+
+    When applied per UAV, the caller reshapes (B, N_blue, C, H, W) to
+    (B * N_blue, C, H, W), runs the encoder, and reshapes back.
 
     ``num_logit_channels`` controls per-channel input pre-processing:
     the first ``num_logit_channels`` channels are treated as raw log-
@@ -186,8 +206,10 @@ class BlueGNNEncoder(nn.Module):
     """
     2-round message passing over the blue-only graph.  Same edge-
     conditioned message + residual-update pattern as the Stage 3
-    encoder, but without the red-blue path (reds live in the belief
-    map, not the graph).
+    encoder, but with no red NODES in the graph — red context
+    (velocity from rb_edges, position from belief-map peaks) is
+    aggregated per UAV and folded into each blue's INPUT node feature
+    upstream, rather than as a separate node type.
     """
 
     def __init__(
@@ -243,19 +265,27 @@ class BlueGNNEncoder(nn.Module):
 
 class GNNStage4Policy(nn.Module):
     """
-    Stage 4 CTDE + recurrent actor-critic with belief-map encoders.
+    Stage 4 CTDE + recurrent actor-critic (v5.3).
 
-    Actor input (per UAV, concatenated into a 136-dim node feature):
-      - blue_features   (8)   — position, velocity, wall dists
-      - hidden_prev     (64)  — Stage 3 opt-1 cross-blue hidden channel
-      - belief embed    (64)  — CNN(belief_maps[i])
+    Actor input (per UAV, concatenated into a 200-dim node feature with
+    hidden-in-GNN on and the actor CNN off — the default):
+      - blue_features       (8)   — own kinematics + wall dists
+      - hidden_prev         (64)  — Stage 3 opt-1 cross-blue channel
+      - red context         (64)  — sum of encoded VISIBLE rb_edges
+        (precise enemy velocity only; position excluded)
+      - enemy peak context  (32)  — sum of encoded top-K belief-map
+        channel-0 detections (noisy P(enemy) positions)
+      - obstacle peak ctx   (32)  — sum of encoded top-K belief-map
+        channel-1 detections (noisy P(obstacle) positions)
+      (+ belief CNN embed (belief_encoder_out_dim) only if
+       ``use_actor_belief_cnn=True`` — off by default)
 
     Actor path:
       node features → BlueGNNEncoder → GRUCell → actor_mean
 
     Critic path (CTDE, sees full state incl. true_occupancy):
       blue_features → BlueGNNEncoder (separate weights) → sum over blues
-        + CNN(true_occupancy)  →  critic_trunk → V
+        + BeliefEncoder(true_occupancy)  →  critic_trunk → V
 
     ``get_action_and_value`` returns
         (action, log_prob, entropy, value, new_hidden)
@@ -272,10 +302,10 @@ class GNNStage4Policy(nn.Module):
         n_msg_rounds:          int   = 2,
         init_log_std:          float = 0.0,
         belief_channels:       int   = 3,
-        belief_grid_size:      int   = 26,
+        belief_grid_size:      int   = 52,
         belief_encoder_out_dim:int   = 128,
         actor_bayesian_channels:int  = 2,
-        belief_window_size:    int   = 17,
+        belief_window_size:    int   = 33,
         use_hidden_in_gnn:     bool  = True,
         # ----- Red-side branch (Stage 4 v5.1) -----------------------
         # rb_edge is velocity-only (4-D): [rel_vel (2), src_vel (2)].
@@ -302,18 +332,25 @@ class GNNStage4Policy(nn.Module):
     ) -> None:
         """
         Args:
-          actor_bayesian_channels: number of belief-map channels that
-            are noisy log-odds (defaults to 2 for Stage 4: enemy +
-            obstacle).  These get ``sigmoid`` at the CNN input.  Any
-            additional channels (e.g. deterministic ally overlay) are
-            treated as already in [0, 1] and pass through unchanged.
+          n_enemy_peaks / n_obstacle_peaks: number of top-K detections
+            extracted from belief-map channel 0 / channel 1 and fed to
+            the actor as (dx, dy, conf) triples.  These are the primary
+            enemy/obstacle POSITION signal (the actor CNN is off by
+            default).  Defaults track n_red / n_obstacles.
 
-          belief_window_size: side length K of the ego-centric window
-            fed to the actor's belief CNN.  The actor consumes a
-            (belief_channels, K, K) crop centred on the UAV's cell,
-            NOT the global (belief_channels, H, W) map.  Fixes the
-            "CNN can't produce ego-centric features" problem
-            observed in Stage 4 v1/v2.
+          peak_msg_dim: output width of each per-peak encoder MLP.
+
+          use_actor_belief_cnn: if True, additionally run a per-UAV CNN
+            over an ego-centric belief window and concatenate its
+            embedding to the node feature.  Off by default (v5.3): the
+            CNN was ablation-shown not to recover position from the
+            belief tensor, and peaks carry that signal directly.
+
+          actor_bayesian_channels / belief_window_size: only relevant
+            when ``use_actor_belief_cnn=True``.  The former marks how
+            many leading belief channels are log-odds (sigmoid'd at the
+            CNN input); the latter is the side length K of the
+            ego-centric crop fed to the CNN.
         """
         super().__init__()
         self.n_blue             = n_blue

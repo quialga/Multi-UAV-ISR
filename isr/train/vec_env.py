@@ -341,11 +341,14 @@ class RecurrentVectorPursuitEnv(VectorPursuitEnv):
 
 class Stage4VectorPursuitEnv(VectorPursuitEnv):
     """
-    Stage 4 vectorised env.  Same reset/step signatures as the Stage 3
-    variant, but the obs dict is the Stage 4 schema
-    (``structured_belief_observation()``): drops the red-side and
-    visibility keys, adds ``belief_maps``, ``obstacle_positions``,
-    ``true_occupancy``.
+    Stage 4 (v5.3) vectorised env.  Same reset/step signatures as the
+    Stage 3 variant, but the obs dict is the Stage 4 schema from
+    ``structured_belief_observation()``.  It carries both the precise
+    graph-side keys (blue_features, bb_edge_features, red_features,
+    velocity-only rb_edge_features, rb_edge_visible) and the noisy
+    belief-side keys (belief_maps, belief_peaks_enemy,
+    belief_peaks_obstacle), plus obstacle_positions / true_occupancy
+    for diagnostics and the CTDE critic.
 
     Requires ``env_kwargs`` to have both ``sensor_radius`` set (so the
     sensor step has a defined disk) and ``use_belief_maps=True`` (so

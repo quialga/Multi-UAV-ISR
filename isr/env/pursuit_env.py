@@ -1043,9 +1043,11 @@ class PursuitEnv(ParallelEnv):
         Ground-truth occupancy grid of shape ``(2, H, W)`` -- always
         exactly 2 channels: enemy + obstacle.  Used by the critic and
         by the diagnostic BCE.  It does NOT track the deterministic
-        ally / self channels that live in the actor's belief tensor
-        (channels 2-3), because those are already fully known and
-        the critic reads ally positions via ``blue_features`` anyway.
+        overlay channels that may live in the actor's belief tensor
+        (ally at channel 2, and the legacy self channel at channel 3
+        when belief_channels=4), because those positions are already
+        fully known -- the critic reads ally positions via
+        ``blue_features`` anyway.
         """
         H = W = self.belief_grid_size
         cs = self.belief_cell_size
@@ -1332,26 +1334,40 @@ class PursuitEnv(ParallelEnv):
 
     def structured_belief_observation(self) -> Dict[str, np.ndarray]:
         """
-        Stage 4 observation dict.  Extends the Stage 2/3 fully-observable
-        structured obs with per-UAV belief maps, obstacle positions, and
-        ground-truth occupancy (training-only key).
+        Stage 4 (v5.3) observation dict.  The sensor-physics split is:
+        precise self/ally state + enemy velocity flow through the graph;
+        noisy enemy/obstacle POSITIONS flow only through the Bayesian
+        belief map (as peak detections).
 
-        Notable removals versus Stage 3:
-        - ``red_features`` and ``rb_edge_features`` -- reds live only in
-          the belief map's enemy channel.
-        - ``bb_edge_visible`` and ``rb_edge_visible`` -- no per-edge
-          gating in Stage 4 (allies communicate via GPS-style
-          continuous comms; enemies enter via the belief map).
+        Keys
+        ----
+        Precise (graph side):
+        - ``blue_features``     : (N_blue, 8)        own kinematics
+        - ``bb_edge_features``  : (n_bb, 7)          ally rel state (GPS)
+        - ``red_features``      : (N_red, 1)         red active flags
+        - ``rb_edge_features``  : (n_rb, 4)          VELOCITY-only
+          (rel_vel, src_vel); NO position -- see
+          ``_velocity_edge_features_for``
+        - ``rb_edge_visible``   : (n_rb,)            per-edge visibility
 
-        Kept from Stage 3:
-        - ``blue_features`` and ``bb_edge_features`` -- unchanged
-          semantics.
+        Noisy (belief side):
+        - ``belief_maps``       : (N_blue, C, H, W)  log-odds tensor
+          (kept for the diagnostic BCE; the actor does NOT consume the
+          raw map in v5.3)
+        - ``belief_peaks_enemy``    : (N_blue, n_red, 3) top-K
+          (dx, dy, conf) from channel 0
+        - ``belief_peaks_obstacle`` : (N_blue, max(1, n_obs), 3) top-K
+          from channel 1
 
-        New keys:
-        - ``belief_maps``       : (N_blue, C, H, W) float32 log-odds
-        - ``obstacle_positions``: (N_obs, 3) float32 = (x, y, radius)
-        - ``true_occupancy``    : (C, H, W) float32 binary,
-          training-only.  The actor must NOT read this key.
+        Diagnostics / critic-only:
+        - ``obstacle_positions``: (N_obs, 3) = (x, y, radius) ground
+          truth -- kept for logging; the ACTOR must not read it (obstacle
+          position is meant to come from belief_peaks_obstacle)
+        - ``true_occupancy``    : (2, H, W) binary, CTDE critic only;
+          the actor must NOT read this key
+        - ``belief_windows``    : (N_blue, C, K, K) ego-centric crops,
+          only present when belief_window_size > 0 (the
+          ``use_actor_belief_cnn`` ablation path)
         """
         base = self._build_structured_obs()
         # v5.1: velocity-only rb_edges.

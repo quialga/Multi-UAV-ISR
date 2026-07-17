@@ -334,11 +334,14 @@ def ppo_update_stage4(
     target_kl:      float = None,
 ) -> Dict[str, float]:
     """
-    Stage 4 PPO update.  Same clipped-objective PPO as
-    ``ppo_update_ctde``, but the minibatch layout is the belief-map
-    schema (``blue_features``, ``bb_edge_features``, ``belief_maps``,
-    ``true_occupancy``) instead of the Stage 3 (visibility-mask +
-    red-side) schema.
+    Stage 4 (v5.3) PPO update.  Same clipped-objective PPO as
+    ``ppo_update_ctde``.  The minibatch carries the full Stage 4
+    schema — graph-side keys (blue_features, bb_edge_features,
+    red_features, velocity-only rb_edge_features, rb_edge_visible),
+    belief-side keys (belief_maps, belief_peaks_enemy,
+    belief_peaks_obstacle), and true_occupancy for the critic — which
+    are reassembled into partial_obs / full_state here and forwarded
+    to ``policy.get_action_and_value``.
 
     Also logs a diagnostic BCE(sigmoid(fused belief), true_occupancy)
     — a no-gradient metric that measures how well the classical

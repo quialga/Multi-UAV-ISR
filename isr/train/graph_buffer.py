@@ -297,15 +297,18 @@ class RecurrentGraphRolloutBuffer(GraphRolloutBuffer):
 
 class Stage4RolloutBuffer:
     """
-    Buffer for the Stage 4 CTDE + belief-map + recurrent policy.
+    Buffer for the Stage 4 (v5.3) CTDE + belief-map + recurrent policy.
 
-    Layout differences vs Stage 3's ``RecurrentGraphRolloutBuffer``:
-    - No red-side obs fields, no per-edge visibility masks.
-    - New per-UAV log-odds ``belief_maps`` field
-      shape (T, E, N_blue, C, H, W).
-    - New per-env ``true_occupancy`` field shape (T, E, C, H, W).
-    - Same actions / log_probs / values / rewards / dones / hidden
-      layout as the Stage 3 buffer.
+    Stores, per (T, E) transition:
+    - Graph side: blue_features, bb_edge_features, and (when n_red > 0)
+      red_features, velocity-only rb_edge_features, rb_edge_visible.
+    - Belief side: belief_maps (T, E, N_blue, C, H, W) plus the peak
+      detections belief_peaks_enemy (T, E, N_blue, n_red, 3) and
+      belief_peaks_obstacle (T, E, N_blue, n_obstacle_peaks, 3).
+      Optionally belief_windows when the actor-CNN ablation path is on.
+    - Critic side: true_occupancy (T, E, 2, H, W).
+    - RL bookkeeping: actions / log_probs / values / rewards / dones /
+      hidden -- same layout as the Stage 3 buffer.
 
     Minibatch item = one env-timestep transition (stateless-at-update).
     """
