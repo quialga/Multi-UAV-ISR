@@ -732,6 +732,32 @@ class PursuitEnv(ParallelEnv):
             bearing,
         ], axis=1).astype(np.float32)
 
+    def _velocity_edge_features_for(
+        self,
+        src_vel: np.ndarray,   # (E, 2)  sender velocities  (e.g. reds)
+        dst_vel: np.ndarray,   # (E, 2)  receiver velocities (e.g. blues)
+    ) -> np.ndarray:
+        """
+        Velocity-only edge features for the Stage 4 v5.1 rb_edges.
+
+        Produces 4-D features: ``[rel_vel (2), src_vel (2)]`` normalised
+        by ``BLUE_UAV.v_max``.  NO position information -- that lives
+        exclusively in the noisy Bayesian belief map, per the realistic
+        sensor split (Doppler radar precisely measures velocity;
+        position is uncertain).
+
+        - ``rel_vel = src_vel - dst_vel``: closing/opening motion, useful
+          for pursuit geometry once the policy knows WHERE the enemy is.
+        - ``src_vel`` (enemy absolute velocity): tells the policy where
+          the enemy is heading in world frame, for lead-pursuit.
+        """
+        v_max = BLUE_UAV.v_max
+        rel_vel = src_vel - dst_vel                          # (E, 2)
+        return np.concatenate([
+            (rel_vel / v_max).astype(np.float32),
+            (src_vel / v_max).astype(np.float32),
+        ], axis=1).astype(np.float32)
+
     def _build_structured_obs(self) -> Dict[str, np.ndarray]:
         """
         Build the graph-structured observation for the GNN policy.
@@ -1264,17 +1290,24 @@ class PursuitEnv(ParallelEnv):
           training-only.  The actor must NOT read this key.
         """
         base = self._build_structured_obs()
-        # v5: keep red_features + rb_edge_features gated by
-        # rb_edge_visible.  The belief map handles memory of past
-        # observations; rb_edges give precise position AND VELOCITY
-        # for CURRENTLY-visible enemies -- required for intercept
-        # against evading reds.  See docs/stage4_backlog.md discussion.
+        # v5.1: velocity-only rb_edges.
+        # Position of enemies lives ONLY in the noisy Bayesian belief
+        # map -- feeding precise position through rb_edges would let
+        # the policy bypass the belief map entirely (radar/EO position
+        # estimates are noisy in reality; only the fused belief
+        # tracker output is available to the operator).  Velocity is
+        # measured directly by Doppler radar and comes through
+        # precisely when the target is visible.
         _bb_vis, rb_vis = self._compute_edge_visibility()
+        rb_edge_vel = self._velocity_edge_features_for(
+            src_vel=self._red_vel[self.rb_edge_src],
+            dst_vel=self._blue_vel[self.rb_edge_dst],
+        )
         out: Dict[str, np.ndarray] = {
             "blue_features":     base["blue_features"],
             "bb_edge_features":  base["bb_edge_features"],
             "red_features":      base["red_features"],
-            "rb_edge_features":  base["rb_edge_features"],
+            "rb_edge_features":  rb_edge_vel,
             "rb_edge_visible":   rb_vis,
         }
 

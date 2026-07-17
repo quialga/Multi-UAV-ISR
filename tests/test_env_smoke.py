@@ -782,8 +782,53 @@ def test_stage4_obs_dict_schema():
     assert obs["obstacle_positions"].shape[1] == 3
     assert obs["true_occupancy"].shape   == (2, 52, 52)
     assert obs["red_features"].shape     == (env.n_red, 1)
-    assert obs["rb_edge_features"].shape == (env.n_rb_edges, 7)
+    # v5.1: rb_edges are velocity-only, 4-D (not 7-D full geometry).
+    assert obs["rb_edge_features"].shape == (env.n_rb_edges, 4)
     assert obs["rb_edge_visible"].shape  == (env.n_rb_edges,)
+
+
+def test_stage4_rb_edges_are_velocity_only_no_position_leak():
+    """
+    v5.1 rb_edge_features must NOT contain position information --
+    it lives only in the noisy belief map.  Verify by moving reds to
+    a completely different position with the SAME velocities: rb_edge
+    features should be unchanged.
+    """
+    env = _stage4_env()
+    env.reset(seed=0)
+    obs_a = env.structured_belief_observation()
+    rb_a = obs_a["rb_edge_features"].copy()
+
+    # Teleport all reds far away but keep velocities identical.
+    env._red_pos = env._red_pos + 40.0   # shift each red by 40m
+    obs_b = env.structured_belief_observation()
+    rb_b = obs_b["rb_edge_features"]
+
+    assert np.allclose(rb_a, rb_b), (
+        "rb_edge_features changed after moving reds without changing "
+        "their velocities -- position is leaking through the edges!"
+    )
+
+
+def test_stage4_rb_edges_reflect_velocity_changes():
+    """
+    Symmetric to the above -- if we CHANGE red velocities but not
+    positions, rb_edge_features MUST change (velocity is the whole
+    point of rb_edges in v5.1).
+    """
+    env = _stage4_env()
+    env.reset(seed=0)
+    obs_a = env.structured_belief_observation()
+    rb_a = obs_a["rb_edge_features"].copy()
+
+    env._red_vel = env._red_vel + np.array([1.0, 0.5], dtype=np.float32)
+    obs_b = env.structured_belief_observation()
+    rb_b = obs_b["rb_edge_features"]
+
+    assert not np.allclose(rb_a, rb_b), (
+        "rb_edge_features did not change after modifying red "
+        "velocities -- velocity signal is missing!"
+    )
 
 
 def test_stage4_belief_window_shape_and_ego_centric():

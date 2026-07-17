@@ -384,9 +384,12 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
         self.belief_window_size = getattr(e0, "belief_window_size", 0)
         self.n_obstacles        = e0.n_obstacles
         self.n_red              = e0.n_red
-        # Stage 4 v5: red-side sizing.
-        self.red_feat_dim       = 1                    # matches env
-        self.rb_edge_feat_dim   = self.edge_feat_dim   # same 7-dim as bb
+        # Stage 4 v5.1: velocity-only rb_edges (4-D: rel_vel + src_vel).
+        # Position info is deliberately withheld from rb_edges and lives
+        # only in the noisy Bayesian belief map -- see
+        # PursuitEnv._velocity_edge_features_for.
+        self.red_feat_dim       = 1
+        self.rb_edge_feat_dim   = 4
         self.n_rb_edges         = e0.n_rb_edges
         # Reserve batch space for the requested obstacle count.  A
         # rejection-sampled reset may drop below this if placement

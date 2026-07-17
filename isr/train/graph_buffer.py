@@ -324,11 +324,12 @@ class Stage4RolloutBuffer:
         d_hidden:       int,
         device:         torch.device,
         belief_window:  int = 0,   # 0 -> ego-centric windows disabled
-        # Stage 4 v5 red-side sizing (0 -> red-side branch disabled)
+        # Stage 4 v5.1 red-side sizing (0 -> red-side branch disabled).
+        # rb_edge is now 4-D velocity-only, not 7-D full geometry.
         n_red:          int = 0,
         red_feat_dim:   int = 1,
         n_rb_edges:     int = 0,
-        rb_edge_feat_dim:int = 7,
+        rb_edge_feat_dim:int = 4,
     ) -> None:
         self.T = int(rollout_steps)
         self.E = int(n_envs)

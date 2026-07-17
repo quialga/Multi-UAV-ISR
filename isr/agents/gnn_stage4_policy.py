@@ -278,10 +278,12 @@ class GNNStage4Policy(nn.Module):
         actor_bayesian_channels:int  = 2,
         belief_window_size:    int   = 17,
         use_hidden_in_gnn:     bool  = True,
-        # ----- Red-side branch (Stage 4 v5) -------------------------
+        # ----- Red-side branch (Stage 4 v5.1) -----------------------
+        # rb_edge is velocity-only (4-D): [rel_vel (2), src_vel (2)].
+        # Position info stays in the noisy belief map.
         n_red:                 int   = 3,
         red_feat_dim:          int   = 1,
-        rb_edge_feat_dim:      int   = 7,
+        rb_edge_feat_dim:      int   = 4,
         red_msg_dim:           int   = 64,
     ) -> None:
         """
