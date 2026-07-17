@@ -124,18 +124,17 @@ class BeliefEncoder(nn.Module):
         # Build a conv stack that progressively halves the spatial dims.
         # For grid_size <= 17: 2 convs  (C->16 s1, 16->32 s2)  -> ~9x9
         # For grid_size >  17: 3 convs  (C->16 s1, 16->32 s2, 32->32 s2) -> ~9x9
-        # This keeps the flatten dim reasonable (~2500-3200) for any
-        # grid size in the [17, 52] range.
+        # Keeps flat dim reasonable (~2500-5500) for grid_size in [17, 52].
         layers = []
         layers.append(nn.Conv2d(in_channels, 16, kernel_size=3,
                                 stride=1, padding=1))
         layers.append(nn.ReLU(inplace=True))
         layers.append(nn.Conv2d(16, 32, kernel_size=3,
-                                stride=1, padding=1))
+                                stride=2, padding=1))
         layers.append(nn.ReLU(inplace=True))
         if grid_size > 17:
             layers.append(nn.Conv2d(32, 32, kernel_size=3,
-                                    stride=1, padding=1))
+                                    stride=2, padding=1))
             layers.append(nn.ReLU(inplace=True))
         self.convs = nn.Sequential(*layers)
         self.act = nn.ReLU(inplace=True)
