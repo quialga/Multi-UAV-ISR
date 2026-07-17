@@ -516,10 +516,9 @@ def _stage4_env(**overrides):
         n_blue=5, n_red=3, arena_size=130.0, capture_radius=3.0,
         sensor_radius=40.0,
         n_obstacles=4, obstacle_radius_min=5.0, obstacle_radius_max=15.0,
-        # v3: 3 channels (enemy, obstacle, ally) -- self dropped since
-        # ego-centric window is inherently centred on self.
-        # v4: cell_size 2.5m -> grid 52x52 for sub-cell precision.
-        use_belief_maps=True, belief_grid_size=52, belief_channels=3,
+        # v6.1: ONE global fused belief map (C, H, W); 2 Bayesian
+        # channels (enemy, obstacle); grid back at 26x26 (5 m cells).
+        use_belief_maps=True, belief_grid_size=26, belief_channels=2,
         red_policy=stationary_red, seed=0,
     )
     kwargs.update(overrides)
@@ -590,7 +589,8 @@ def test_stage4_blue_cannot_move_into_obstacle():
 def test_stage4_belief_maps_shape_and_no_nans_after_200_steps():
     env = _stage4_env(max_steps=250)
     env.reset(seed=0)
-    assert env._belief_maps.shape == (5, 3, 52, 52)
+    # v6.1: ONE global fused map (C, H, W).
+    assert env._belief_maps.shape == (2, 26, 26)
     for _ in range(200):
         if not env.agents:
             env.reset(seed=1)
@@ -625,15 +625,21 @@ def test_stage4_occluded_cells_never_updated():
     cxi_free = int(free_x / cs)
     cyi_free = int(free_y / cs)
 
+    # Move the OTHER blues far away so only blue_0's sensor is in play
+    # (the map is global — any blue with line-of-sight would add
+    # evidence to the "occluded" cell and defeat the test).
+    for b in range(1, env.n_blue):
+        env._blue_pos[b] = np.array([2.0, 2.0], dtype=np.float32)
+
     env._belief_maps[:] = 0.0
     for _ in range(20):
         env._update_belief_maps()
 
-    assert env._belief_maps[0, 0, cxi_occ, cyi_occ] == 0.0, (
+    assert env._belief_maps[0, cxi_occ, cyi_occ] == 0.0, (
         f"Occluded cell got updated: log-odds = "
-        f"{env._belief_maps[0, 0, cxi_occ, cyi_occ]}"
+        f"{env._belief_maps[0, cxi_occ, cyi_occ]}"
     )
-    assert env._belief_maps[0, 0, cxi_free, cyi_free] != 0.0, (
+    assert env._belief_maps[0, cxi_free, cyi_free] != 0.0, (
         "Un-occluded cell should have accumulated evidence"
     )
 
@@ -657,7 +663,7 @@ def test_stage4_caught_red_decays_from_belief_map():
     cs = env.belief_cell_size
     cxi = int(52.0 / cs)   # 10 for cs=5
     cyi = int(50.0 / cs)   # 10
-    initial_L = float(env._belief_maps[0, 0, cxi, cyi])
+    initial_L = float(env._belief_maps[0, cxi, cyi])
     # Run ~15 more steps; because the red is gone, the sensor now sees
     # "no enemy" at that cell most of the time -> log-odds should
     # decrease from ``initial_L``.  Enough noise means we assert
@@ -665,7 +671,7 @@ def test_stage4_caught_red_decays_from_belief_map():
     final_L = initial_L
     for _ in range(15):
         env.step(actions)
-        final_L = float(env._belief_maps[0, 0, cxi, cyi])
+        final_L = float(env._belief_maps[0, cxi, cyi])
     assert final_L < initial_L, (
         f"Caught red's cell log-odds should decay: initial={initial_L:.3f} "
         f"final={final_L:.3f}"
@@ -676,7 +682,7 @@ def test_stage4_true_occupancy_matches_ground_truth():
     env = _stage4_env()
     env.reset(seed=0)
     truth = env._true_occupancy()
-    assert truth.shape == (2, 52, 52)
+    assert truth.shape == (2, 26, 26)
     # Enemy channel: every active red maps to exactly one cell = 1.
     n_ones_enemy = int(truth[0].sum())
     assert n_ones_enemy == int(env._red_active.sum())
@@ -685,77 +691,41 @@ def test_stage4_true_occupancy_matches_ground_truth():
     assert int(truth[1].sum()) > 0
 
 
-def test_stage4_ally_channel_is_deterministic_and_shared():
+def test_stage4_v61_global_map_fuses_multi_uav_evidence():
     """
-    Channel 2 (ally positions) must equal 1.0 at every active blue's
-    cell and be IDENTICAL across all UAVs' belief maps (all-blues
-    view via TDL uplink).
+    v6.1: the belief map is GLOBAL — evidence from different UAVs
+    accumulates in the same tensor.  A cell visible to two UAVs should
+    accumulate roughly twice the evidence magnitude per step of a cell
+    visible to one (log-odds fusion is additive).
     """
-    env = _stage4_env()
+    # Low sensor noise (0.99/0.01 -> |L| ~ 4.6, still under the ±10
+    # clip for a double observation... actually 2x4.6=9.2 < 10) so a
+    # single false positive is very unlikely and magnitudes stay
+    # distinguishable.
+    env = _stage4_env(n_obstacles=0, p_TP=0.99, p_FP=0.01)
     env.reset(seed=0)
+    # Two blues staring at the same empty cell; the rest far away.
+    env._blue_pos[0] = np.array([40.0, 65.0], dtype=np.float32)
+    env._blue_pos[1] = np.array([90.0, 65.0], dtype=np.float32)
+    for b in range(2, env.n_blue):
+        env._blue_pos[b] = np.array([2.0, 2.0], dtype=np.float32)
+    # Move reds away so the watched cell is empty (evidence: no enemy).
+    env._red_pos[:] = np.array([5.0, 5.0], dtype=np.float32)
+
     cs = env.belief_cell_size
-    ally_ch = env._belief_maps[:, 2]                    # (N_blue, H, W)
-    # All UAVs see the same ally channel.
-    for i in range(1, env.n_blue):
-        assert np.allclose(ally_ch[i], ally_ch[0]), (
-            f"Ally channel differs for UAV {i} vs UAV 0"
-        )
-    # Every blue's cell is marked = 1.
-    for i in range(env.n_blue):
-        cx = int(env._blue_pos[i, 0] / cs)
-        cy = int(env._blue_pos[i, 1] / cs)
-        assert ally_ch[0, cx, cy] == 1.0, (
-            f"Blue {i}'s cell ({cx},{cy}) not marked in ally channel"
-        )
-
-
-def test_stage4_self_channel_is_per_uav():
-    """
-    Channel 3 (self position) is DIFFERENT per UAV: only THIS UAV's
-    cell is marked in its own belief map.  Requires belief_channels=4;
-    the default Stage 4 v3 config drops this channel since the actor
-    now consumes ego-centric windows.
-    """
-    env = _stage4_env(belief_channels=4)
-    env.reset(seed=0)
-    cs = env.belief_cell_size
-    self_ch = env._belief_maps[:, 3]                    # (N_blue, H, W)
-    for i in range(env.n_blue):
-        cx = int(env._blue_pos[i, 0] / cs)
-        cy = int(env._blue_pos[i, 1] / cs)
-        # UAV i sees a 1 at its own cell...
-        assert self_ch[i, cx, cy] == 1.0, (
-            f"UAV {i}'s own cell not marked in self channel"
-        )
-        # ...and no more than a single 1 in its self channel.
-        assert self_ch[i].sum() == pytest.approx(1.0), (
-            f"UAV {i}'s self channel has multiple non-zero cells"
-        )
-
-
-def test_stage4_deterministic_channels_unaffected_by_clip():
-    """
-    ``belief_clip`` should only apply to log-odds channels (0-1);
-    the deterministic channels stay in {0, 1}.  Run 300 steps with
-    all blues moving toward the same corner and confirm channels
-    2-3 are still {0, 1}, not clipped weirdly.
-    """
-    env = _stage4_env(max_steps=350, belief_channels=4)
-    env.reset(seed=0)
-    actions = {a: np.array([1.0, 1.0], dtype=np.float32) for a in env.agents}
-    for _ in range(300):
-        if not env.agents:
-            env.reset(seed=1)
-        env.step(actions)
-    ally_ch = env._belief_maps[:, 2]
-    self_ch = env._belief_maps[:, 3]
-    unique_ally = np.unique(ally_ch)
-    unique_self = np.unique(self_ch)
-    assert set(unique_ally.tolist()).issubset({0.0, 1.0}), (
-        f"Ally channel has non-binary values: {unique_ally}"
-    )
-    assert set(unique_self.tolist()).issubset({0.0, 1.0}), (
-        f"Self channel has non-binary values: {unique_self}"
+    cxi = int(65.0 / cs)
+    cyi = int(65.0 / cs)     # cell (13, 13) at (65+2.5, 65+2.5) centre
+    env._belief_maps[:] = 0.0
+    env._update_belief_maps()
+    # Cell (65, 65) is ~25m from both watchers -> both contribute.
+    both = float(env._belief_maps[0, cxi, cyi])
+    # A cell only ONE watcher can see: near (40, 65), ~50m from blue 1.
+    cxi_one = int(38.0 / cs)
+    one = float(env._belief_maps[0, cxi_one, cyi])
+    assert both < 0.0 and one < 0.0, "empty cells should get negative evidence"
+    assert abs(both) > 1.5 * abs(one), (
+        f"doubly-observed cell should have ~2x evidence: both={both:.2f} "
+        f"one={one:.2f}"
     )
 
 
@@ -805,7 +775,7 @@ def test_stage4_v6_rb_position_comes_from_belief():
     """
     The actor's rb_edge geometry (rel_pos) is reconstructed from the
     belief-map PEAK, not from ground truth.  Plant a dominant enemy
-    peak in UAV 0's belief and verify edge (r=0, b=0)'s rel_pos points
+    peak in the GLOBAL map and verify edge (r=0, b=0)'s rel_pos points
     at that cell.  Edge layout: [rel_pos(2), rel_vel(2), range(1),
     bearing(2)]; rel_pos = blue_pos - peak_pos (normalised by L).
     """
@@ -814,7 +784,7 @@ def test_stage4_v6_rb_position_comes_from_belief():
     cs = env.belief_cell_size
     L = env.arena_size
     env._belief_maps[:] = -5.0
-    env._belief_maps[0, 0, 20, 20] = 8.0     # dominant enemy peak, UAV 0
+    env._belief_maps[0, 20, 20] = 8.0   # dominant enemy peak (global map)
     obs = env.structured_belief_observation()
     rb = obs["rb_edge_features"]             # (n_rb, 7)
     peak = np.array([(20 + 0.5) * cs, (20 + 0.5) * cs], dtype=np.float32)
@@ -856,6 +826,26 @@ def test_stage4_v6_obstacle_edges_static_velocity():
         "obstacle rel_vel should be 0 when blues are stationary "
         "(object velocity is 0)"
     )
+
+
+def test_stage4_v61_occlusion_exact_catches_grazing_chord():
+    """
+    The analytic segment-disk test must flag a GRAZING ray whose chord
+    through the obstacle (~2.0 m here) is SHORTER than the old 2.5 m
+    sample spacing — the case the sampled ray-march could miss.
+    """
+    env = _stage4_env()
+    env.reset(seed=0)
+    env._obstacle_pos = np.array([[65.0, 65.0]], dtype=np.float32)
+    env._obstacle_r   = np.array([10.0],        dtype=np.float32)
+    uav = np.array([45.0, 55.05], dtype=np.float32)
+    cells = np.array([
+        [85.0, 55.05],   # grazing: perp 9.95 m < r=10 -> chord ~2.0 m
+        [85.0, 50.0],    # passes ~12.4 m from centre -> clear
+    ], dtype=np.float32)
+    occ = env._rays_occluded_by_obstacles(uav, cells)
+    assert bool(occ[0]), "grazing chord shorter than 2.5 m must occlude"
+    assert not bool(occ[1]), "ray well clear of the disk must not occlude"
 
 
 def test_stage4_backward_compat_when_flags_off():

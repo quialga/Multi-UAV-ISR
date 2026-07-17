@@ -156,9 +156,10 @@ class PursuitEnv(ParallelEnv):
                                    radii, in metres.
         obstacle_spawn_clearance   Minimum distance blues and reds must
                                    spawn from any obstacle boundary.
-        use_belief_maps            When True, allocate and update per-UAV
-                                   log-odds belief maps every step.
-                                   Costs some compute; default False.
+        use_belief_maps            When True, allocate and update the
+                                   GLOBAL fused (team-shared) log-odds
+                                   belief map every step.  Costs some
+                                   compute; default False.
         belief_grid_size           H = W for the belief tensor.  With
                                    arena_size = 130 and default 26,
                                    each cell is 5 m across.
@@ -169,7 +170,12 @@ class PursuitEnv(ParallelEnv):
                                    ±10 -> P in ~[5e-5, 1 - 5e-5].
         p_TP, p_FP                 Sensor detection reliability.
                                    Same values for both channels in v1.
-        ray_step_size              Ray-cast step for occlusion, in metres.
+        ray_step_size              Occlusion margin, in metres: obstacle
+                                   boundary cells within this depth of
+                                   the ray's disk entry point remain
+                                   observable (the analytic segment-disk
+                                   test cuts the ray this far before the
+                                   cell centre).
         """
         super().__init__()
         self.n_blue         = int(n_blue)
@@ -223,6 +229,13 @@ class PursuitEnv(ParallelEnv):
         # (per-red: rel_pos 2 + rel_vel 2 + range 1 + bearing_cs 2 + active 1)
         # (per-teammate: rel_pos 2 + rel_vel 2 + range 1 + bearing_cs 2)
         # (self+global: vel 2 + speed 1 + walls 4 + time 1)
+        #
+        # NOTE (Stage 4): obstacles are deliberately NOT part of this
+        # flat per-agent obs.  It is the legacy Stage 1-3 MLP / Gym-API
+        # path (also used by heuristic baselines, which are
+        # obstacle-unaware).  Stage 4 policies consume the structured
+        # graph obs (``structured_belief_observation``), where obstacles
+        # appear as typed nodes with ob_edges.
         self._obs_dim = (
             8 * self.n_red
             + 7 * (self.n_blue - 1)
@@ -267,7 +280,9 @@ class PursuitEnv(ParallelEnv):
         # ---- Stage 4 mutable state (obstacles + belief) ------------------
         # ``_obstacle_pos``  (n_obs, 2)   float32 -- centres
         # ``_obstacle_r``    (n_obs,)     float32 -- radii
-        # ``_belief_maps``   (n_blue, C, H, W) float32 -- per-UAV log-odds
+        # ``_belief_maps``   (C, H, W)    float32 -- GLOBAL fused log-odds
+        #   (v6.1: one shared map for the whole blue team — common
+        #   operational picture over TDL; Bayesian fusion = log-odds add)
         # All None when Stage 4 features are disabled.
         self._obstacle_pos: Optional[np.ndarray] = None
         self._obstacle_r:   Optional[np.ndarray] = None
@@ -311,10 +326,10 @@ class PursuitEnv(ParallelEnv):
         self._last_n_caught = 0
         self.agents = list(self.possible_agents)
 
-        # Stage 4: zero belief maps.
+        # Stage 4: zero the GLOBAL fused belief map (C, H, W).
         if self.use_belief_maps:
             self._belief_maps = np.zeros(
-                (self.n_blue, self.belief_channels,
+                (self.belief_channels,
                  self.belief_grid_size, self.belief_grid_size),
                 dtype=np.float32,
             )
@@ -1040,66 +1055,102 @@ class PursuitEnv(ParallelEnv):
         grid[1] = self._obstacle_grid
         return grid
 
-    def _cell_occluded_by_obstacle(
+    def _rays_occluded_by_obstacles(
         self,
-        uav_pos:     np.ndarray,   # (2,)
-        cell_centre: np.ndarray,   # (2,)
-    ) -> bool:
+        uav_pos:      np.ndarray,   # (2,)
+        cell_centres: np.ndarray,   # (K, 2)
+    ) -> np.ndarray:
         """
-        Return True iff the straight line from ``uav_pos`` to
-        ``cell_centre`` passes through any obstacle (strictly between
-        the endpoints).  The cell centre itself is allowed to be an
-        obstacle -- the sensor CAN observe obstacle cells to add
-        evidence to the obstacle channel; only cells BEHIND another
-        obstacle along the ray are hidden.
+        EXACT analytic segment-disk occlusion test (no sampling).
+
+        For each ray uav_pos -> cell_centre, returns True iff the ray
+        enters any obstacle disk strictly BEFORE reaching the cell —
+        specifically, more than ``ray_step_size`` metres before the
+        cell centre.  That margin preserves the original semantics:
+        the sensor CAN observe the first obstacle boundary cell it
+        sees (to accumulate evidence on the obstacle channel); only
+        cells buried BEHIND an obstacle surface are hidden.
+
+        Replaces the earlier sampled ray-march, which could miss a
+        grazing chord shorter than the sample spacing.
+
+        Geometry per (ray k, obstacle o):
+          d      = cell - uav                       (ray vector)
+          t_hat  = (c_o - uav)·d / |d|²             (closest approach param)
+          perp²  = |c_o - uav|² - (t_hat |d|)²      (line-to-centre dist²)
+          the ray intersects the disk iff perp² < r²; the entry point
+          parameter is t1 = t_hat - sqrt(r² - perp²)/|d|.
+          Occluded iff the intersection interval [t1, t2] overlaps
+          (0, t_cut) with t_cut = 1 - margin/|d|.
+
+        Returns
+        -------
+        occluded : (K,) bool
         """
+        K = cell_centres.shape[0]
         if self._obstacle_pos is None or len(self._obstacle_pos) == 0:
-            return False
-        diff = cell_centre - uav_pos
-        dist = float(np.linalg.norm(diff))
-        if dist < 1e-6:
-            return False
-        n_steps = max(2, int(np.ceil(dist / self.ray_step_size)) + 1)
-        # Sample points strictly between the endpoints.  We EXCLUDE k=n_steps-1
-        # (the endpoint) so the sensor can observe the first obstacle cell it
-        # sees; we EXCLUDE k=0 (the UAV) trivially.
-        ts = np.linspace(0.0, 1.0, n_steps + 1)[1:-1]   # (n_steps - 1,)
-        pts = uav_pos[None, :] + ts[:, None] * diff[None, :]   # (n_steps-1, 2)
-        # For each interior point, distance to all obstacles.
-        # (n_pts, n_obs)
-        dists = np.linalg.norm(
-            pts[:, None, :] - self._obstacle_pos[None, :, :], axis=-1,
-        )
-        # Occluded if ANY interior point is inside ANY obstacle.
-        return bool(np.any(dists < self._obstacle_r[None, :]))
+            return np.zeros(K, dtype=bool)
+
+        d = cell_centres - uav_pos[None, :]                # (K, 2)
+        seg_len = np.linalg.norm(d, axis=-1)               # (K,)
+        seg_len = np.maximum(seg_len, 1e-6)
+
+        oc = self._obstacle_pos - uav_pos[None, :]         # (n_obs, 2)
+        oc_len2 = np.sum(oc * oc, axis=-1)                 # (n_obs,)
+        r = self._obstacle_r                               # (n_obs,)
+
+        # Closest-approach parameter of each obstacle centre along each
+        # ray: t_hat (K, n_obs) = (d · oc) / |d|².
+        dot = d @ oc.T                                     # (K, n_obs)
+        t_hat = dot / (seg_len ** 2)[:, None]
+
+        # Perpendicular (line-to-centre) distance squared.
+        proj_len2 = (t_hat * seg_len[:, None]) ** 2        # (K, n_obs)
+        perp2 = oc_len2[None, :] - proj_len2               # (K, n_obs)
+
+        disc = r[None, :] ** 2 - perp2                     # (K, n_obs)
+        intersects = disc > 0.0
+        sqrt_disc = np.sqrt(np.maximum(disc, 0.0))
+        half_chord_t = sqrt_disc / seg_len[:, None]        # in ray params
+        t1 = t_hat - half_chord_t                          # entry
+        t2 = t_hat + half_chord_t                          # exit
+
+        # Cut the ray ``ray_step_size`` metres before the cell centre so
+        # the first obstacle boundary cell stays observable.
+        t_cut = 1.0 - (self.ray_step_size / seg_len)       # (K,)
+
+        blocked = intersects & (t2 > 0.0) & (t1 < t_cut[:, None])
+        return np.any(blocked, axis=1)                     # (K,)
 
     def _update_belief_maps(self) -> None:
         """
-        Vectorised Bayesian log-odds update on ``self._belief_maps``.
-        See ``docs/stage4_design.md §3.4`` for the algorithm.
+        Vectorised Bayesian log-odds update on the GLOBAL fused belief
+        map ``self._belief_maps`` of shape (C, H, W).
 
-        Channel layout (v2, 4 channels by default):
-        - 0: P(enemy)    -- Bayesian log-odds from noisy sensor
-        - 1: P(obstacle) -- Bayesian log-odds from noisy sensor
-        - 2: ally_positions -- DETERMINISTIC overlay (perfect GPS via TDL)
-        - 3: self_position  -- DETERMINISTIC overlay (own GPS)
+        v6.1: ONE shared map for the whole blue team (common
+        operational picture).  Every UAV's sensor evidence is added
+        into the same log-odds tensor — Bayesian fusion of independent
+        sensors is exactly log-odds addition, and the always-on TDL
+        comms assumption (allies already share GPS continuously) means
+        sharing detections over the same link is realistic (a Link-16
+        style fused surveillance picture).
 
-        Only channels 0-1 are updated by Bayesian log-odds and clipped
-        to ``[-belief_clip, +belief_clip]``.  Channels 2-3 are reset
-        each step and written directly from ground-truth positions --
-        they represent perfect self and ally position knowledge, which
-        is what modern ISR drones have from GPS + Tactical Data Link.
+        Channel layout (2 channels):
+        - 0: P(enemy)    -- Bayesian log-odds from noisy sensors
+        - 1: P(obstacle) -- Bayesian log-odds from noisy sensors
+        Ally/self positions are NOT belief channels — they are precise
+        and flow through the graph (blue_features / bb_edges).
+
+        Occlusion is the exact analytic segment-disk test
+        (``_rays_occluded_by_obstacles``), not a sampled ray-march.
         """
         if self._belief_maps is None or self.sensor_radius is None:
             return
 
         R  = self.sensor_radius
         centres = self._cell_centres                # (W, H, 2)  cached at reset
-        C_total    = self.belief_channels
-        C_bayesian = min(2, C_total)                # channels 0..1 if present
+        C = min(2, self.belief_channels)            # Bayesian channels
         truth = self._true_occupancy()              # (2, W, H) -- always 2
-
-        n_obs = 0 if self._obstacle_pos is None else int(self._obstacle_pos.shape[0])
 
         for i in range(self.n_blue):
             uav_pos = self._blue_pos[i]
@@ -1111,166 +1162,98 @@ class PursuitEnv(ParallelEnv):
                 continue
 
             cx_idx, cy_idx = np.where(in_disk)      # (K,) each
-            K = int(cx_idx.shape[0])
             candidate_centres = centres[cx_idx, cy_idx]     # (K, 2)
 
-            # 2. Batched ray-cast occlusion check across ALL candidates.
-            if n_obs > 0:
-                diffs = candidate_centres - uav_pos          # (K, 2)
-                dists = np.linalg.norm(diffs, axis=-1)       # (K,)
-                # Enough interior samples to resolve any obstacle along
-                # the LONGEST ray at ``ray_step_size`` granularity.
-                max_dist = float(dists.max())
-                n_samples = max(1, int(np.ceil(max_dist / self.ray_step_size)))
-                # Interior sample fractions in (0, 1); endpoints excluded so
-                # the sensor CAN observe an obstacle boundary cell directly.
-                if n_samples <= 1:
-                    ts = np.array([0.5], dtype=np.float32)
-                else:
-                    ts = np.linspace(0.0, 1.0, n_samples + 1,
-                                     dtype=np.float32)[1:-1]
-                # (K, S, 2) sample points along each ray.
-                sample_pts = (
-                    uav_pos[None, None, :]
-                    + ts[None, :, None] * diffs[:, None, :]
-                )                                             # (K, S, 2)
-                # Distance from each sample to each obstacle: (K, S, n_obs).
-                obs_diffs = (
-                    sample_pts[:, :, None, :]
-                    - self._obstacle_pos[None, None, :, :]
-                )
-                obs_dists = np.linalg.norm(obs_diffs, axis=-1)
-                # A candidate is occluded if any of its samples lies
-                # strictly inside any obstacle.
-                occluded = np.any(
-                    obs_dists < self._obstacle_r[None, None, :],
-                    axis=(1, 2),
-                )                                             # (K,)
-                visible = ~occluded
-                cx_idx = cx_idx[visible]
-                cy_idx = cy_idx[visible]
-                K = int(cx_idx.shape[0])
-                if K == 0:
-                    continue
-
-            # 3. Vectorised Bernoulli sensor sampling across BAYESIAN channels only.
-            if C_bayesian > 0:
-                truth_vis = truth[:C_bayesian, cx_idx, cy_idx]     # (C_b, K)
-                uniforms  = self._rng.random((C_bayesian, K)).astype(np.float32)
-                p_detect  = np.where(
-                    truth_vis > 0.5,
-                    np.float32(self.p_TP),
-                    np.float32(self.p_FP),
-                )                                                   # (C_b, K)
-                detected = uniforms < p_detect                      # (C_b, K) bool
-                evidence = np.where(
-                    detected,
-                    np.float32(self._L_detect),
-                    np.float32(self._L_no_detect),
-                )                                                   # (C_b, K)
-
-                # 4. Apply evidence to this UAV's belief map (Bayesian channels).
-                for c in range(C_bayesian):
-                    self._belief_maps[i, c, cx_idx, cy_idx] += evidence[c]
-
-        # Clip log-odds -- ONLY on Bayesian channels; deterministic
-        # channels 2-3 stay in {0, 1} untouched.
-        if C_bayesian > 0:
-            np.clip(
-                self._belief_maps[:, :C_bayesian],
-                -self.belief_clip, self.belief_clip,
-                out=self._belief_maps[:, :C_bayesian],
+            # 2. Exact analytic occlusion test across all candidates.
+            occluded = self._rays_occluded_by_obstacles(
+                uav_pos, candidate_centres,
             )
+            visible = ~occluded
+            cx_idx = cx_idx[visible]
+            cy_idx = cy_idx[visible]
+            K = int(cx_idx.shape[0])
+            if K == 0:
+                continue
 
-        # 5. Deterministic overlays for channels 2 (allies) and 3 (self).
-        #    Each is reset to zero every step, then set to 1.0 at the
-        #    ground-truth cell(s) -- perfect GPS + TDL model.
-        if C_total >= 3:
-            self._belief_maps[:, 2] = 0.0
-            cs = self.belief_cell_size
-            H = W = self.belief_grid_size
-            # Ally channel: same for every UAV -- all allies visible on TDL.
-            for j in range(self.n_blue):
-                cx = int(self._blue_pos[j, 0] / cs)
-                cy = int(self._blue_pos[j, 1] / cs)
-                if 0 <= cx < W and 0 <= cy < H:
-                    self._belief_maps[:, 2, cx, cy] = 1.0
+            # 3. Vectorised Bernoulli sensor sampling per channel.
+            truth_vis = truth[:C, cx_idx, cy_idx]              # (C, K)
+            uniforms  = self._rng.random((C, K)).astype(np.float32)
+            p_detect  = np.where(
+                truth_vis > 0.5,
+                np.float32(self.p_TP),
+                np.float32(self.p_FP),
+            )                                                  # (C, K)
+            detected = uniforms < p_detect                     # (C, K) bool
+            evidence = np.where(
+                detected,
+                np.float32(self._L_detect),
+                np.float32(self._L_no_detect),
+            )                                                  # (C, K)
 
-        if C_total >= 4:
-            self._belief_maps[:, 3] = 0.0
-            cs = self.belief_cell_size
-            H = W = self.belief_grid_size
-            # Self channel: DIFFERENT per UAV -- each sees only itself.
-            for i in range(self.n_blue):
-                cx = int(self._blue_pos[i, 0] / cs)
-                cy = int(self._blue_pos[i, 1] / cs)
-                if 0 <= cx < W and 0 <= cy < H:
-                    self._belief_maps[i, 3, cx, cy] = 1.0
+            # 4. Fuse this UAV's evidence into the SHARED map.
+            for c in range(C):
+                self._belief_maps[c, cx_idx, cy_idx] += evidence[c]
 
-    def _extract_belief_peaks(self, K: int, channel_idx: int = 0) -> np.ndarray:
+        # Clip log-odds.
+        np.clip(
+            self._belief_maps[:C],
+            -self.belief_clip, self.belief_clip,
+            out=self._belief_maps[:C],
+        )
+
+    def _extract_belief_peaks(
+        self, K: int, channel_idx: int = 0,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Vectorised top-K peak extraction from a specified channel of
-        each UAV's belief map.  Returns per-detection (rel_dx, rel_dy,
-        P_conf) triples in normalised units.
+        Top-K peak extraction from one channel of the GLOBAL fused
+        belief map.
 
-        Rationale: v5.1 showed the CNN can't extract usable position
-        info from the belief-map tensor.  Explicit peak detection is
-        what real ISR trackers do -- output a list of tracks with
-        (position, confidence).  The peaks are still noisy (they
-        inherit the belief map's noise), so the sensor-physics story
-        holds; we just give the policy a more digestible form.
+        Explicit peak detection is what real ISR trackers output — a
+        list of tracks with (position, confidence).  The peaks are
+        noisy (they inherit the belief map's sensor noise), so the
+        sensor-physics story holds; the policy just gets a digestible
+        form.  With the shared map, K matches the true entity count
+        (n_red enemy slots, n_obstacles obstacle slots) and the SAME
+        peaks are seen by every blue — one common track picture.
 
         Parameters
         ----------
         K : int
-          Number of peaks to extract per UAV.
+          Number of peaks to extract.
         channel_idx : int
-          Which belief map channel to extract from.  0 = P(enemy),
-          1 = P(obstacle) in the v5.2+ layout.
+          0 = P(enemy), 1 = P(obstacle).
 
         Returns
         -------
-        peaks : (N_blue, K, 3) float32
-          Channels: (dx / arena_size, dy / arena_size, sigmoid(log_odds))
-          dx, dy are relative from the UAV to the peak cell centre.
+        peak_pos : (K, 2) float32 — peak cell centres in WORLD coords
+        conf     : (K,)   float32 — sigmoid(log_odds) at each peak,
+          sorted descending.
         """
         assert self._belief_maps is not None
-        assert 0 <= channel_idx < self._belief_maps.shape[1]
-        L = self.arena_size
+        assert 0 <= channel_idx < self._belief_maps.shape[0]
         cs = self.belief_cell_size
         H = W = self.belief_grid_size
 
-        # Extract log-odds for the requested channel and sigmoid to prob.
-        chan_lo = self._belief_maps[:, channel_idx, :, :]
+        chan_lo = self._belief_maps[channel_idx]            # (H, W)
         chan_p  = 1.0 / (1.0 + np.exp(-chan_lo))
-        flat = chan_p.reshape(self.n_blue, -1)              # (N, H*W)
+        flat = chan_p.reshape(-1)                           # (H*W,)
 
-        # Top-K per UAV (vectorised across UAVs).
-        if flat.shape[1] <= K:
-            topk_idx = np.tile(np.arange(flat.shape[1]),
-                                (self.n_blue, 1))[:, :K]
+        if flat.shape[0] <= K:
+            topk_idx = np.arange(flat.shape[0])[:K]
         else:
-            topk_idx = np.argpartition(flat, -K, axis=1)[:, -K:]
+            topk_idx = np.argpartition(flat, -K)[-K:]
+        topk_vals = flat[topk_idx]
+        order = np.argsort(-topk_vals)
+        topk_idx  = topk_idx[order]
+        topk_vals = topk_vals[order]
 
-        topk_vals = np.take_along_axis(flat, topk_idx, axis=1)  # (N, K)
-        # Sort each row in descending value order.
-        order = np.argsort(-topk_vals, axis=1)
-        topk_idx  = np.take_along_axis(topk_idx,  order, axis=1)
-        topk_vals = np.take_along_axis(topk_vals, order, axis=1)
-
-        # Flat index -> (cx, cy).
-        cx = topk_idx // W                                    # (N, K)
+        cx = topk_idx // W
         cy = topk_idx %  W
-        # Cell centres in world coords.
-        px = (cx.astype(np.float32) + 0.5) * cs
-        py = (cy.astype(np.float32) + 0.5) * cs
-        # Relative to each UAV.
-        dx = (px - self._blue_pos[:, 0:1]) / L                # (N, K)
-        dy = (py - self._blue_pos[:, 1:2]) / L
-
-        out = np.stack([dx, dy, topk_vals.astype(np.float32)], axis=-1)
-        return out.astype(np.float32)
-
+        peak_pos = np.stack([
+            (cx.astype(np.float32) + 0.5) * cs,
+            (cy.astype(np.float32) + 0.5) * cs,
+        ], axis=-1)                                          # (K, 2)
+        return peak_pos.astype(np.float32), topk_vals.astype(np.float32)
 
     def _attach_enemy_velocity(self, blue_idx: int, peak_pos: np.ndarray) -> np.ndarray:
         """
@@ -1294,37 +1277,35 @@ class PursuitEnv(ParallelEnv):
         return np.zeros(2, dtype=np.float32)
 
     def _belief_graph_from_peaks(
-        self, peaks: np.ndarray, static: bool,
+        self,
+        peak_pos: np.ndarray,   # (K, 2) world coords (shared track picture)
+        conf:     np.ndarray,   # (K,)   peak confidences
+        static:   bool,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Build the actor-side node + edge features for one entity type
-        (enemy or obstacle) from per-UAV belief peaks.
+        (enemy or obstacle) from the GLOBAL belief peaks.
 
-        Parameters
-        ----------
-        peaks : (N_blue, K, 3) float32
-          (dx_norm, dy_norm, conf) per UAV per detection slot, from
-          ``_extract_belief_peaks``.
-        static : bool
-          True for obstacles (object velocity 0 -> ``rel_vel`` driven
-          only by the blue's own motion, same helper as rb edges with
-          the object velocity zeroed).  False for enemies (radar
-          velocity attached when visible).
+        Every blue sees the SAME K tracks (common operational picture);
+        only the edge geometry (rel_pos / range / bearing to each
+        blue) differs per blue.
+
+        static=True  -> obstacles: object velocity 0, so ``rel_vel``
+          is driven purely by the blue's own motion (an rb edge with
+          the sender velocity zeroed — the user-chosen convention).
+        static=False -> enemies: precise radar velocity attached when
+          the nearest active red is within sensor range of that blue.
 
         Returns
         -------
-        node_feat : (K, 1)  soft detection flag = max confidence over UAVs
+        node_feat : (K, 1)  track confidence
         edge_feat : (K * N_blue, 7)  same 7-D layout as bb/rb edges
-        edge_vis  : (K * N_blue,)    per-edge visibility = peak confidence
+        edge_vis  : (K * N_blue,)    per-edge visibility = confidence
           Edge ordering matches _build_xb_edges: for s in K, for b in N.
         """
-        L = self.arena_size
         N = self.n_blue
-        K = peaks.shape[1]
+        K = peak_pos.shape[0]
         n_edges = K * N
-
-        peak_abs = self._blue_pos[:, None, :] + peaks[:, :, :2] * L   # (N, K, 2)
-        conf = peaks[:, :, 2]                                          # (N, K)
 
         src_pos = np.zeros((n_edges, 2), dtype=np.float32)
         src_vel = np.zeros((n_edges, 2), dtype=np.float32)
@@ -1335,17 +1316,16 @@ class PursuitEnv(ParallelEnv):
         for s in range(K):
             for b in range(N):
                 e = s * N + b
-                p = peak_abs[b, s]
-                src_pos[e] = p
+                src_pos[e] = peak_pos[s]
                 dst_pos[e] = self._blue_pos[b]
                 dst_vel[e] = self._blue_vel[b]
-                edge_vis[e] = conf[b, s]
+                edge_vis[e] = conf[s]
                 if not static:
-                    src_vel[e] = self._attach_enemy_velocity(b, p)
+                    src_vel[e] = self._attach_enemy_velocity(b, peak_pos[s])
                 # static: src_vel stays 0.
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
-        node_feat = conf.max(axis=0).reshape(K, 1).astype(np.float32)
+        node_feat = conf.reshape(K, 1).astype(np.float32)
         return node_feat, edge_feat, edge_vis
 
     def _true_obstacle_graph(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -1394,11 +1374,12 @@ class PursuitEnv(ParallelEnv):
         graph, extended with obstacle nodes.  No CNN, no raw belief
         tensor fed to the policy.
 
-        The ACTOR consumes a belief-derived graph: enemy/obstacle node
-        and edge features (rel_pos, range, bearing) come from each
-        UAV's belief-map PEAK detections (noisy); enemy edge velocity
-        from radar (precise when visible); obstacle velocity 0 (static).
-        Per-edge visibility = peak confidence.
+        The ACTOR consumes a belief-derived graph: enemy/obstacle
+        positions come from top-K PEAK detections on the GLOBAL fused
+        belief map (one shared track picture for the whole team, noisy);
+        enemy edge velocity from radar (precise when the nearest red is
+        in that blue's sensor range); obstacle velocity 0 (static).
+        Per-edge visibility = track confidence.
 
         The CRITIC (CTDE) consumes the ground-truth graph: true red and
         obstacle node/edge features, no masks.
@@ -1421,7 +1402,7 @@ class PursuitEnv(ParallelEnv):
           ``true_ob_edge_features`` (n_ob, 7)  [only if n_obstacles > 0]
 
         Diagnostics (not consumed by the policy):
-        - ``belief_maps`` (N_blue, C, H, W), ``true_occupancy`` (2, H, W)
+        - ``belief_maps`` (C, H, W) global fused, ``true_occupancy`` (2, H, W)
         """
         base = self._build_structured_obs()   # true blue/red/bb/rb + masks
         bb_vis, rb_vis_true = self._compute_edge_visibility()
@@ -1436,13 +1417,16 @@ class PursuitEnv(ParallelEnv):
             "true_rb_edge_features": base["rb_edge_features"],
         }
 
-        # ---- Actor belief-derived enemy graph ----------------------------
+        # ---- Actor belief-derived enemy graph (shared track picture) -----
         if self._belief_maps is not None:
-            enemy_peaks = self._extract_belief_peaks(self.n_red, channel_idx=0)
+            enemy_pos, enemy_conf = self._extract_belief_peaks(
+                self.n_red, channel_idx=0,
+            )
         else:
-            enemy_peaks = np.zeros((self.n_blue, self.n_red, 3), dtype=np.float32)
+            enemy_pos  = np.zeros((self.n_red, 2), dtype=np.float32)
+            enemy_conf = np.zeros((self.n_red,),   dtype=np.float32)
         red_node, rb_edge, rb_vis = self._belief_graph_from_peaks(
-            enemy_peaks, static=False,
+            enemy_pos, enemy_conf, static=False,
         )
         out["red_features"]    = red_node
         out["rb_edge_features"] = rb_edge
@@ -1451,15 +1435,14 @@ class PursuitEnv(ParallelEnv):
         # ---- Obstacle graph (only when obstacles are configured) ---------
         if self.n_obstacles > 0:
             if self._belief_maps is not None and self.belief_channels >= 2:
-                obs_peaks = self._extract_belief_peaks(
+                obs_pos, obs_conf = self._extract_belief_peaks(
                     self.n_obstacles, channel_idx=1,
                 )
             else:
-                obs_peaks = np.zeros(
-                    (self.n_blue, self.n_obstacles, 3), dtype=np.float32,
-                )
+                obs_pos  = np.zeros((self.n_obstacles, 2), dtype=np.float32)
+                obs_conf = np.zeros((self.n_obstacles,),   dtype=np.float32)
             ob_node, ob_edge, ob_vis = self._belief_graph_from_peaks(
-                obs_peaks, static=True,
+                obs_pos, obs_conf, static=True,
             )
             out["obstacle_features"] = ob_node
             out["ob_edge_features"]  = ob_edge
@@ -1469,12 +1452,12 @@ class PursuitEnv(ParallelEnv):
             out["true_obstacle_features"] = true_ob_node
             out["true_ob_edge_features"]  = true_ob_edge
 
-        # ---- Diagnostics (BCE telemetry; NOT fed to the policy) ----------
+        # ---- Diagnostics (telemetry; NOT fed to the policy) --------------
         if self._belief_maps is not None:
             out["belief_maps"] = self._belief_maps.copy()
         else:
             out["belief_maps"] = np.zeros(
-                (self.n_blue, self.belief_channels,
+                (self.belief_channels,
                  self.belief_grid_size, self.belief_grid_size),
                 dtype=np.float32,
             )
