@@ -372,6 +372,10 @@ def ppo_update_stage4(
             # belief_maps (see GNNStage4Policy.actor_encode).
             if "belief_windows" in batch:
                 partial_obs["belief_windows"] = batch["belief_windows"]
+            # v5: red-side branch (visibility-gated intercept signal).
+            for k in ("red_features", "rb_edge_features", "rb_edge_visible"):
+                if k in batch:
+                    partial_obs[k] = batch[k]
             full_state = {
                 "blue_features":    batch["blue_features"],
                 "bb_edge_features": batch["bb_edge_features"],

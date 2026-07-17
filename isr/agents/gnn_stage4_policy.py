@@ -278,6 +278,11 @@ class GNNStage4Policy(nn.Module):
         actor_bayesian_channels:int  = 2,
         belief_window_size:    int   = 17,
         use_hidden_in_gnn:     bool  = True,
+        # ----- Red-side branch (Stage 4 v5) -------------------------
+        n_red:                 int   = 3,
+        red_feat_dim:          int   = 1,
+        rb_edge_feat_dim:      int   = 7,
+        red_msg_dim:           int   = 64,
     ) -> None:
         """
         Args:
@@ -315,8 +320,28 @@ class GNNStage4Policy(nn.Module):
             num_logit_channels=min(actor_bayesian_channels, belief_channels),
         )
 
-        # Actor node feature dim: base blue + optional hidden + belief.
-        actor_node_feat_dim = blue_feat_dim + belief_encoder_out_dim
+        # ---- Red-to-blue message branch (Stage 4 v5) ---------------------
+        # Restores the intercept signal that v1-v4 lacked.  For each
+        # currently-visible red-blue edge (rb_edge_visible == 1), compute
+        # a message from the red features + edge features (which carry
+        # relative position AND VELOCITY -- critical for intercepting
+        # evading reds), then sum-aggregate per destination blue.
+        self.n_red             = n_red
+        self.red_msg_dim       = red_msg_dim
+        self.red_encoder       = _mlp(red_feat_dim, [red_msg_dim], red_msg_dim)
+        self.rb_edge_encoder   = _mlp(rb_edge_feat_dim, [red_msg_dim], red_msg_dim)
+        self.rb_msg_mlp        = _mlp(2 * red_msg_dim, [red_msg_dim], red_msg_dim)
+
+        # rb edge index buffers -- convention:
+        # edges are enumerated (red_i, blue_j) with i in [0..n_red),
+        # j in [0..n_blue).  src = red index, dst = blue index.
+        rb_src = torch.arange(n_red).repeat_interleave(n_blue)
+        rb_dst = torch.arange(n_blue).repeat(n_red)
+        self.register_buffer("rb_src", rb_src.long(), persistent=False)
+        self.register_buffer("rb_dst", rb_dst.long(), persistent=False)
+
+        # Actor node feature dim: base blue + optional hidden + belief + red context.
+        actor_node_feat_dim = blue_feat_dim + belief_encoder_out_dim + red_msg_dim
         if use_hidden_in_gnn:
             actor_node_feat_dim += d_hidden
 
@@ -359,6 +384,45 @@ class GNNStage4Policy(nn.Module):
     #  Sub-forwards                                                        #
     # ------------------------------------------------------------------ #
 
+    def _aggregate_red_context(
+        self,
+        red_features:      torch.Tensor,  # (B, n_red, red_feat_dim)
+        rb_edge_features:  torch.Tensor,  # (B, n_rb, rb_edge_feat_dim)
+        rb_edge_visible:   torch.Tensor,  # (B, n_rb) or (B, n_rb, 1)
+    ) -> torch.Tensor:
+        """
+        For each blue UAV, gather messages from currently-visible reds
+        via rb_edge_features (which carry relative position + velocity)
+        and sum-aggregate.  Non-visible edges contribute zero.
+
+        Returns (B, n_blue, red_msg_dim).
+        """
+        B, n_rb, _ = rb_edge_features.shape
+        # Encode reds and edges.
+        red_emb  = self.red_encoder(red_features)            # (B, n_red, d)
+        edge_emb = self.rb_edge_encoder(rb_edge_features)    # (B, n_rb, d)
+
+        # Broadcast red embeddings to per-edge (using rb_src).
+        red_per_edge = red_emb.index_select(1, self.rb_src)  # (B, n_rb, d)
+
+        # Per-edge message: MLP(concat(red_emb, edge_emb)).
+        msg = self.rb_msg_mlp(torch.cat([red_per_edge, edge_emb], dim=-1))
+
+        # Mask by visibility.
+        if rb_edge_visible.dim() == 2:
+            vis = rb_edge_visible.unsqueeze(-1)              # (B, n_rb, 1)
+        else:
+            vis = rb_edge_visible
+        msg = msg * vis
+
+        # Scatter-sum to destination blue.
+        agg = torch.zeros(
+            B, self.n_blue, self.red_msg_dim,
+            device=msg.device, dtype=msg.dtype,
+        )
+        agg.index_add_(1, self.rb_dst, msg)
+        return agg
+
     def actor_encode(
         self,
         partial_obs: Dict[str, torch.Tensor],
@@ -366,21 +430,45 @@ class GNNStage4Policy(nn.Module):
     ) -> torch.Tensor:
         """
         Build the actor's per-blue node embedding by concatenating
-        blue_features, hidden (if enabled), and belief-encoded features,
-        then running the actor GNN.  Returns h_blue (B, N, d_hidden).
+        blue_features, hidden (if enabled), belief-encoded features,
+        and aggregated red context (from visible rb_edges), then
+        running the actor GNN.  Returns h_blue (B, N, d_hidden).
 
         Belief input: reads ``belief_windows`` (ego-centric, per-UAV KxK
         crops) if present in ``partial_obs``, else falls back to the
         global ``belief_maps`` for backward compatibility.
+
+        Red context: from ``red_features`` + ``rb_edge_features`` gated
+        by ``rb_edge_visible``.  If any of those keys are missing (e.g.
+        legacy Stage 4 v1-v4 obs dict without red-side), we substitute
+        zeros -- the actor gracefully degrades to belief-only behaviour.
         """
         belief_input = partial_obs.get(
             "belief_windows", partial_obs.get("belief_maps"),
         )
         belief_emb = self.actor_belief_encoder(belief_input)
+
+        # Red context aggregation (v5).  Zero fallback for missing keys.
+        if all(k in partial_obs for k in (
+            "red_features", "rb_edge_features", "rb_edge_visible",
+        )):
+            red_ctx = self._aggregate_red_context(
+                partial_obs["red_features"],
+                partial_obs["rb_edge_features"],
+                partial_obs["rb_edge_visible"],
+            )
+        else:
+            B = partial_obs["blue_features"].shape[0]
+            red_ctx = torch.zeros(
+                B, self.n_blue, self.red_msg_dim,
+                device=belief_emb.device, dtype=belief_emb.dtype,
+            )
+
         parts = [partial_obs["blue_features"]]
         if self.use_hidden_in_gnn:
             parts.append(hidden)
         parts.append(belief_emb)
+        parts.append(red_ctx)
         blue_input = torch.cat(parts, dim=-1)
         return self.actor_encoder(blue_input, partial_obs["bb_edge_features"])
 

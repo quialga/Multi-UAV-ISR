@@ -324,6 +324,11 @@ class Stage4RolloutBuffer:
         d_hidden:       int,
         device:         torch.device,
         belief_window:  int = 0,   # 0 -> ego-centric windows disabled
+        # Stage 4 v5 red-side sizing (0 -> red-side branch disabled)
+        n_red:          int = 0,
+        red_feat_dim:   int = 1,
+        n_rb_edges:     int = 0,
+        rb_edge_feat_dim:int = 7,
     ) -> None:
         self.T = int(rollout_steps)
         self.E = int(n_envs)
@@ -373,6 +378,29 @@ class Stage4RolloutBuffer:
         else:
             self.belief_windows = None
 
+        # Red-side (Stage 4 v5).  Only allocated when n_red > 0.
+        self.n_red = int(n_red)
+        self.red_feat_dim   = int(red_feat_dim)
+        self.n_rb_edges     = int(n_rb_edges)
+        self.rb_edge_feat_dim = int(rb_edge_feat_dim)
+        if self.n_red > 0 and self.n_rb_edges > 0:
+            self.red_features = torch.zeros(
+                (self.T, self.E, self.n_red, self.red_feat_dim),
+                dtype=torch.float32, device=device,
+            )
+            self.rb_edge_features = torch.zeros(
+                (self.T, self.E, self.n_rb_edges, self.rb_edge_feat_dim),
+                dtype=torch.float32, device=device,
+            )
+            self.rb_edge_visible = torch.zeros(
+                (self.T, self.E, self.n_rb_edges),
+                dtype=torch.float32, device=device,
+            )
+        else:
+            self.red_features    = None
+            self.rb_edge_features = None
+            self.rb_edge_visible  = None
+
         # Agent-level tensors.
         self.actions   = torch.zeros((self.T, self.E, self.A, self.action_dim),
                                      dtype=torch.float32, device=device)
@@ -406,11 +434,22 @@ class Stage4RolloutBuffer:
         dones:            torch.Tensor,   # (E,)
         hidden:           torch.Tensor,   # (E, A, d_hidden)
         belief_windows:   torch.Tensor = None,   # (E, A, C, K, K) or None
+        # v5 red-side (None-safe: falls back to no-op when disabled)
+        red_features:     torch.Tensor = None,
+        rb_edge_features_v5: torch.Tensor = None,
+        rb_edge_visible:  torch.Tensor = None,
     ) -> None:
         assert self.ptr < self.T, "Buffer full — call reset() between rollouts."
         if self.belief_windows is not None:
             assert belief_windows is not None
             self.belief_windows[self.ptr] = belief_windows
+        if self.red_features is not None:
+            assert red_features is not None
+            assert rb_edge_features_v5 is not None
+            assert rb_edge_visible is not None
+            self.red_features[self.ptr]     = red_features
+            self.rb_edge_features[self.ptr] = rb_edge_features_v5
+            self.rb_edge_visible[self.ptr]  = rb_edge_visible
         self.blue_features[self.ptr]    = blue_features
         self.bb_edge_features[self.ptr] = bb_edge_features
         self.belief_maps[self.ptr]      = belief_maps
@@ -477,6 +516,15 @@ class Stage4RolloutBuffer:
             K = self.belief_window
             flat_bw = self.belief_windows.reshape(N, self.A, C, K, K)
 
+        # v5 red-side flat views.
+        flat_rf = flat_rb = flat_rv = None
+        if self.red_features is not None:
+            flat_rf = self.red_features.reshape(N, self.n_red, self.red_feat_dim)
+            flat_rb = self.rb_edge_features.reshape(
+                N, self.n_rb_edges, self.rb_edge_feat_dim,
+            )
+            flat_rv = self.rb_edge_visible.reshape(N, self.n_rb_edges)
+
         perm = torch.randperm(N, device=self.device)
         for start in range(0, N, mb_size):
             idx = perm[start:start + mb_size]
@@ -494,4 +542,8 @@ class Stage4RolloutBuffer:
             }
             if flat_bw is not None:
                 out["belief_windows"] = flat_bw[idx]
+            if flat_rf is not None:
+                out["red_features"]     = flat_rf[idx]
+                out["rb_edge_features"] = flat_rb[idx]
+                out["rb_edge_visible"]  = flat_rv[idx]
             yield out

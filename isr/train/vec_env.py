@@ -383,6 +383,11 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
         self.belief_grid_size   = e0.belief_grid_size
         self.belief_window_size = getattr(e0, "belief_window_size", 0)
         self.n_obstacles        = e0.n_obstacles
+        self.n_red              = e0.n_red
+        # Stage 4 v5: red-side sizing.
+        self.red_feat_dim       = 1                    # matches env
+        self.rb_edge_feat_dim   = self.edge_feat_dim   # same 7-dim as bb
+        self.n_rb_edges         = e0.n_rb_edges
         # Reserve batch space for the requested obstacle count.  A
         # rejection-sampled reset may drop below this if placement
         # fails; ``_fill_row`` pads with zeros in that case.
@@ -419,6 +424,17 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
             batch["belief_windows"] = np.zeros(
                 (self.n_envs, self.n_blue, C, K, K), dtype=np.float32,
             )
+        # Stage 4 v5: red-side keys for the intercept signal.
+        batch["red_features"] = np.zeros(
+            (self.n_envs, self.n_red, self.red_feat_dim), dtype=np.float32,
+        )
+        batch["rb_edge_features"] = np.zeros(
+            (self.n_envs, self.n_rb_edges, self.rb_edge_feat_dim),
+            dtype=np.float32,
+        )
+        batch["rb_edge_visible"] = np.zeros(
+            (self.n_envs, self.n_rb_edges), dtype=np.float32,
+        )
         return batch
 
     def _fill_row(  # type: ignore[override]
@@ -426,8 +442,10 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
     ) -> None:
         obs = env.structured_belief_observation()
         for k in ("blue_features", "bb_edge_features",
-                  "belief_maps", "true_occupancy"):
-            batch[k][idx] = obs[k]
+                  "belief_maps", "true_occupancy",
+                  "red_features", "rb_edge_features", "rb_edge_visible"):
+            if k in batch and k in obs:
+                batch[k][idx] = obs[k]
         if "belief_windows" in batch and "belief_windows" in obs:
             batch["belief_windows"][idx] = obs["belief_windows"]
         # obstacle_positions might have differed per-env at reset (if

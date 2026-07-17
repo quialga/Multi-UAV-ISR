@@ -1264,10 +1264,18 @@ class PursuitEnv(ParallelEnv):
           training-only.  The actor must NOT read this key.
         """
         base = self._build_structured_obs()
-        # Drop the red-side fields.
+        # v5: keep red_features + rb_edge_features gated by
+        # rb_edge_visible.  The belief map handles memory of past
+        # observations; rb_edges give precise position AND VELOCITY
+        # for CURRENTLY-visible enemies -- required for intercept
+        # against evading reds.  See docs/stage4_backlog.md discussion.
+        _bb_vis, rb_vis = self._compute_edge_visibility()
         out: Dict[str, np.ndarray] = {
-            "blue_features":    base["blue_features"],
-            "bb_edge_features": base["bb_edge_features"],
+            "blue_features":     base["blue_features"],
+            "bb_edge_features":  base["bb_edge_features"],
+            "red_features":      base["red_features"],
+            "rb_edge_features":  base["rb_edge_features"],
+            "rb_edge_visible":   rb_vis,
         }
 
         # Belief maps.  If disabled, still return a zero-filled tensor

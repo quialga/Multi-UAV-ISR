@@ -760,12 +760,20 @@ def test_stage4_deterministic_channels_unaffected_by_clip():
 
 
 def test_stage4_obs_dict_schema():
-    env = _stage4_env()
+    """
+    v5 schema: belief-map keys + Stage 3 red-side keys (visibility-
+    gated) coexist -- the actor uses rb_edges for intercept signal
+    and the belief map for spatial memory.
+    """
+    env = _stage4_env(belief_window_size=33)
     env.reset(seed=0)
     obs = env.structured_belief_observation()
     expected_keys = {
         "blue_features", "bb_edge_features",
-        "belief_maps", "obstacle_positions", "true_occupancy",
+        "belief_maps", "belief_windows",
+        "obstacle_positions", "true_occupancy",
+        # v5 red-side.
+        "red_features", "rb_edge_features", "rb_edge_visible",
     }
     assert set(obs.keys()) == expected_keys
     assert obs["blue_features"].shape    == (5, 8)
@@ -773,10 +781,9 @@ def test_stage4_obs_dict_schema():
     assert obs["belief_maps"].shape      == (5, 3, 52, 52)
     assert obs["obstacle_positions"].shape[1] == 3
     assert obs["true_occupancy"].shape   == (2, 52, 52)
-    # Ensure we did NOT accidentally leak Stage 3 keys.
-    for stage3_key in ("red_features", "rb_edge_features",
-                       "bb_edge_visible", "rb_edge_visible"):
-        assert stage3_key not in obs
+    assert obs["red_features"].shape     == (env.n_red, 1)
+    assert obs["rb_edge_features"].shape == (env.n_rb_edges, 7)
+    assert obs["rb_edge_visible"].shape  == (env.n_rb_edges,)
 
 
 def test_stage4_belief_window_shape_and_ego_centric():

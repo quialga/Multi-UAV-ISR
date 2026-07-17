@@ -270,6 +270,10 @@ def main() -> None:
         belief_encoder_out_dim= args.belief_encoder_out_dim,
         belief_window_size    = args.belief_window_size,
         use_hidden_in_gnn     = args.share_hidden_via_gnn,
+        # v5 red-side branch.
+        n_red                 = vec_env.n_red,
+        red_feat_dim          = vec_env.red_feat_dim,
+        rb_edge_feat_dim      = vec_env.rb_edge_feat_dim,
     ).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     n_params = sum(p.numel() for p in policy.parameters())
@@ -282,18 +286,23 @@ def main() -> None:
 
     # Buffer.
     buffer = Stage4RolloutBuffer(
-        rollout_steps  = args.rollout_steps,
-        n_envs         = args.n_envs,
-        n_agents       = n_agents,
-        action_dim     = action_dim,
-        blue_feat_dim  = vec_env.blue_feat_dim,
-        edge_feat_dim  = vec_env.edge_feat_dim,
-        n_bb_edges     = vec_env.n_bb_edges,
-        belief_channels= args.belief_channels,
-        belief_grid    = args.belief_grid_size,
-        belief_window  = args.belief_window_size,
-        d_hidden       = args.d_hidden,
-        device         = device,
+        rollout_steps    = args.rollout_steps,
+        n_envs           = args.n_envs,
+        n_agents         = n_agents,
+        action_dim       = action_dim,
+        blue_feat_dim    = vec_env.blue_feat_dim,
+        edge_feat_dim    = vec_env.edge_feat_dim,
+        n_bb_edges       = vec_env.n_bb_edges,
+        belief_channels  = args.belief_channels,
+        belief_grid      = args.belief_grid_size,
+        belief_window    = args.belief_window_size,
+        d_hidden         = args.d_hidden,
+        device           = device,
+        # v5 red-side (intercept signal).
+        n_red            = vec_env.n_red,
+        red_feat_dim     = vec_env.red_feat_dim,
+        n_rb_edges       = vec_env.n_rb_edges,
+        rb_edge_feat_dim = vec_env.rb_edge_feat_dim,
     )
 
     log(f"\nStarting Stage 4 training: {args.n_rollouts} rollouts x "
@@ -334,6 +343,10 @@ def main() -> None:
                 partial_obs["belief_windows"] = _to_device(
                     obs_np["belief_windows"], device,
                 )
+            # v5 red-side branch.
+            for k in ("red_features", "rb_edge_features", "rb_edge_visible"):
+                if k in obs_np:
+                    partial_obs[k] = _to_device(obs_np[k], device)
             full_state = {
                 "blue_features":    partial_obs["blue_features"],
                 "bb_edge_features": partial_obs["bb_edge_features"],
@@ -348,17 +361,20 @@ def main() -> None:
             next_obs_np, reward_np, done_np, _ = vec_env.step(action_np)
 
             buffer.add(
-                blue_features    = partial_obs["blue_features"],
-                bb_edge_features = partial_obs["bb_edge_features"],
-                belief_maps      = partial_obs["belief_maps"],
-                true_occupancy   = full_state["true_occupancy"],
-                actions          = action_t,
-                log_probs        = log_p_t,
-                values           = value_t,
-                rewards          = torch.from_numpy(reward_np).to(device),
-                dones            = torch.from_numpy(done_np).to(device),
-                hidden           = hidden,
-                belief_windows   = partial_obs.get("belief_windows", None),
+                blue_features       = partial_obs["blue_features"],
+                bb_edge_features    = partial_obs["bb_edge_features"],
+                belief_maps         = partial_obs["belief_maps"],
+                true_occupancy      = full_state["true_occupancy"],
+                actions             = action_t,
+                log_probs           = log_p_t,
+                values              = value_t,
+                rewards             = torch.from_numpy(reward_np).to(device),
+                dones               = torch.from_numpy(done_np).to(device),
+                hidden              = hidden,
+                belief_windows      = partial_obs.get("belief_windows", None),
+                red_features        = partial_obs.get("red_features", None),
+                rb_edge_features_v5 = partial_obs.get("rb_edge_features", None),
+                rb_edge_visible     = partial_obs.get("rb_edge_visible", None),
             )
 
             done_t = torch.from_numpy(done_np).to(device).view(-1, 1, 1)
