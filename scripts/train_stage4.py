@@ -45,7 +45,7 @@ from isr.agents.heuristics  import (
     GreedyPursuer, RandomAgent,
     run_from_nearest_uav, stationary_red,
 )
-from isr.agents.gnn_stage4_policy import GNNStage4Policy
+from isr.agents.gnn_stage4_policy import GNNStage4Policy, split_stage4_obs
 from isr.train.graph_buffer       import Stage4RolloutBuffer
 from isr.train.ppo                import ppo_update_stage4
 from isr.train.vec_env            import Stage4VectorPursuitEnv
@@ -80,13 +80,6 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--p-tp",             type=float, default=d["p_TP"])
     p.add_argument("--p-fp",             type=float, default=d["p_FP"])
     p.add_argument("--ray-step-size",    type=float, default=d["ray_step_size"])
-    p.add_argument("--belief-encoder-out-dim",
-                   type=int, default=d["belief_encoder_out_dim"])
-    p.add_argument("--belief-window-size", type=int,
-                   default=d.get("belief_window_size", 0),
-                   help="Side K of the ego-centric window fed to the "
-                        "actor's belief CNN.  0 -> disabled (fall back "
-                        "to global belief_maps).")
     # PPO
     p.add_argument("--n-envs",         type=int,   default=d["n_envs"])
     p.add_argument("--rollout-steps",  type=int,   default=d["rollout_steps"])
@@ -206,7 +199,6 @@ def main() -> None:
         p_TP                    = args.p_tp,
         p_FP                    = args.p_fp,
         ray_step_size           = args.ray_step_size,
-        belief_window_size      = args.belief_window_size,
     )
 
     # Red policy mix parsing.
@@ -256,55 +248,38 @@ def main() -> None:
     n_agents   = vec_env.n_agents
     action_dim = vec_env.action_dim
 
-    # Policy.
+    # Policy (v6: typed GNN + obstacle nodes, no CNN).
     policy = GNNStage4Policy(
-        n_blue                = vec_env.n_blue,
-        blue_feat_dim         = vec_env.blue_feat_dim,
-        edge_feat_dim         = vec_env.edge_feat_dim,
-        action_dim            = action_dim,
-        d_hidden              = args.d_hidden,
-        n_msg_rounds          = args.n_msg_rounds,
-        init_log_std          = STAGE4_DEFAULTS.get("init_log_std", 0.0),
-        belief_channels       = args.belief_channels,
-        belief_grid_size      = args.belief_grid_size,
-        belief_encoder_out_dim= args.belief_encoder_out_dim,
-        belief_window_size    = args.belief_window_size,
-        use_hidden_in_gnn     = args.share_hidden_via_gnn,
-        # v5 red-side branch.
-        n_red                 = vec_env.n_red,
-        red_feat_dim          = vec_env.red_feat_dim,
-        rb_edge_feat_dim      = vec_env.rb_edge_feat_dim,
+        n_blue            = vec_env.n_blue,
+        n_red             = vec_env.n_red,
+        n_obs             = vec_env.n_obstacles,
+        blue_feat_dim     = vec_env.blue_feat_dim,
+        red_feat_dim      = 1,
+        obs_feat_dim      = 1,
+        edge_feat_dim     = vec_env.edge_feat_dim,
+        action_dim        = action_dim,
+        d_hidden          = args.d_hidden,
+        n_msg_rounds      = args.n_msg_rounds,
+        init_log_std      = STAGE4_DEFAULTS.get("init_log_std", 0.0),
+        use_hidden_in_gnn = args.share_hidden_via_gnn,
     ).to(device)
     optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     n_params = sum(p.numel() for p in policy.parameters())
-    log(f"Policy: GNNStage4Policy d_hidden={args.d_hidden} "
-        f"rounds={args.n_msg_rounds} params={n_params}")
-    log("Critic COLD-STARTED (Stage 3 checkpoints not compatible with "
-        "Stage 4 obs dict / critic input shape).")
+    log(f"Policy: GNNStage4Policy (v6) d_hidden={args.d_hidden} "
+        f"rounds={args.n_msg_rounds} n_obs={vec_env.n_obstacles} "
+        f"params={n_params}")
+    log("Critic COLD-STARTED (typed GNN, no CNN).")
 
-    args_dict_saved = {**vars(args), "policy_type": "gnn_stage4"}
+    args_dict_saved = {**vars(args), "policy_type": "gnn_stage4_v6"}
 
-    # Buffer.
+    # Buffer (generic dict-of-tensors).
     buffer = Stage4RolloutBuffer(
-        rollout_steps    = args.rollout_steps,
-        n_envs           = args.n_envs,
-        n_agents         = n_agents,
-        action_dim       = action_dim,
-        blue_feat_dim    = vec_env.blue_feat_dim,
-        edge_feat_dim    = vec_env.edge_feat_dim,
-        n_bb_edges       = vec_env.n_bb_edges,
-        belief_channels  = args.belief_channels,
-        belief_grid      = args.belief_grid_size,
-        belief_window    = args.belief_window_size,
-        d_hidden         = args.d_hidden,
-        device           = device,
-        # v5 red-side (intercept signal).
-        n_red            = vec_env.n_red,
-        red_feat_dim     = vec_env.red_feat_dim,
-        n_rb_edges       = vec_env.n_rb_edges,
-        rb_edge_feat_dim = vec_env.rb_edge_feat_dim,
-        # v5.3 obstacle peaks slot count (matches env's max(1, n_obstacles)).
-        n_obstacle_peaks = max(1, vec_env.n_obstacles),
+        rollout_steps = args.rollout_steps,
+        n_envs        = args.n_envs,
+        n_agents      = n_agents,
+        action_dim    = action_dim,
+        d_hidden      = args.d_hidden,
+        device        = device,
     )
 
     log(f"\nStarting Stage 4 training: {args.n_rollouts} rollouts x "
@@ -335,26 +310,10 @@ def main() -> None:
         buffer.reset()
 
         for step in range(args.rollout_steps):
-            # Tensorise the current obs.
-            partial_obs = {
-                "blue_features":    _to_device(obs_np["blue_features"], device),
-                "bb_edge_features": _to_device(obs_np["bb_edge_features"], device),
-                "belief_maps":      _to_device(obs_np["belief_maps"], device),
-            }
-            if "belief_windows" in obs_np:
-                partial_obs["belief_windows"] = _to_device(
-                    obs_np["belief_windows"], device,
-                )
-            # v5 red-side branch + v5.3 two-channel belief peaks.
-            for k in ("red_features", "rb_edge_features", "rb_edge_visible",
-                      "belief_peaks_enemy", "belief_peaks_obstacle"):
-                if k in obs_np:
-                    partial_obs[k] = _to_device(obs_np[k], device)
-            full_state = {
-                "blue_features":    partial_obs["blue_features"],
-                "bb_edge_features": partial_obs["bb_edge_features"],
-                "true_occupancy":   _to_device(obs_np["true_occupancy"], device),
-            }
+            # Tensorise the whole v6 graph obs, then split into
+            # actor / critic dicts.
+            obs_t = {k: _to_device(v, device) for k, v in obs_np.items()}
+            partial_obs, full_state = split_stage4_obs(obs_t)
 
             with torch.no_grad():
                 action_t, log_p_t, _, value_t, new_hidden = \
@@ -364,22 +323,13 @@ def main() -> None:
             next_obs_np, reward_np, done_np, _ = vec_env.step(action_np)
 
             buffer.add(
-                blue_features       = partial_obs["blue_features"],
-                bb_edge_features    = partial_obs["bb_edge_features"],
-                belief_maps         = partial_obs["belief_maps"],
-                true_occupancy      = full_state["true_occupancy"],
-                actions             = action_t,
-                log_probs           = log_p_t,
-                values              = value_t,
-                rewards             = torch.from_numpy(reward_np).to(device),
-                dones               = torch.from_numpy(done_np).to(device),
-                hidden              = hidden,
-                belief_windows      = partial_obs.get("belief_windows", None),
-                red_features        = partial_obs.get("red_features", None),
-                rb_edge_features_v5 = partial_obs.get("rb_edge_features", None),
-                rb_edge_visible     = partial_obs.get("rb_edge_visible", None),
-                belief_peaks_enemy    = partial_obs.get("belief_peaks_enemy",    None),
-                belief_peaks_obstacle = partial_obs.get("belief_peaks_obstacle", None),
+                obs       = obs_t,
+                actions   = action_t,
+                log_probs = log_p_t,
+                values    = value_t,
+                rewards   = torch.from_numpy(reward_np).to(device),
+                dones     = torch.from_numpy(done_np).to(device),
+                hidden    = hidden,
             )
 
             done_t = torch.from_numpy(done_np).to(device).view(-1, 1, 1)
@@ -390,11 +340,8 @@ def main() -> None:
 
         # Bootstrap V from post-rollout state.
         with torch.no_grad():
-            last_full_state = {
-                "blue_features":    _to_device(obs_np["blue_features"], device),
-                "bb_edge_features": _to_device(obs_np["bb_edge_features"], device),
-                "true_occupancy":   _to_device(obs_np["true_occupancy"], device),
-            }
+            last_obs_t = {k: _to_device(v, device) for k, v in obs_np.items()}
+            _, last_full_state = split_stage4_obs(last_obs_t)
             last_value = policy.critic_forward(last_full_state)
         buffer.compute_gae(last_value, args.gamma, args.gae_lambda)
 
@@ -430,8 +377,6 @@ def main() -> None:
                 f"kl={update_metrics['approx_kl']:.4f}  "
                 f"clip={update_metrics['clip_frac']:.3f}  "
                 f"eps={update_metrics['n_epochs_run']}"
-                f"  bce_uav={update_metrics['per_uav_bce']:.3f}"
-                f"  bce_fused={update_metrics['fused_bce']:.3f}"
                 f"{lr_str}"
             )
 
@@ -444,8 +389,6 @@ def main() -> None:
         writer.add_scalar("ppo/approx_kl",    update_metrics["approx_kl"],    global_step)
         writer.add_scalar("ppo/clip_frac",    update_metrics["clip_frac"],    global_step)
         writer.add_scalar("ppo/n_epochs_run", update_metrics["n_epochs_run"], global_step)
-        writer.add_scalar("ppo/per_uav_bce",  update_metrics["per_uav_bce"],  global_step)
-        writer.add_scalar("ppo/fused_bce",    update_metrics["fused_bce"],    global_step)
         writer.add_scalar("ppo/lr",           cur_lr,                         global_step)
 
         # Best-ckpt tracking.

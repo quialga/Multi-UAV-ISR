@@ -759,168 +759,103 @@ def test_stage4_deterministic_channels_unaffected_by_clip():
     )
 
 
-def test_stage4_obs_dict_schema():
+def test_stage4_v6_obs_schema_with_obstacles():
     """
-    v5 schema: belief-map keys + Stage 3 red-side keys (visibility-
-    gated) coexist -- the actor uses rb_edges for intercept signal
-    and the belief map for spatial memory.
+    v6 typed-graph schema: belief-derived actor node/edge features +
+    ground-truth ``true_*`` critic features + obstacle variants.
     """
-    env = _stage4_env(belief_window_size=33)
+    env = _stage4_env(n_obstacles=4)
     env.reset(seed=0)
+    for _ in range(10):
+        env._update_belief_maps()
     obs = env.structured_belief_observation()
-    expected_keys = {
-        "blue_features", "bb_edge_features",
-        "belief_maps", "belief_windows",
-        "obstacle_positions", "true_occupancy",
-        # v5 red-side.
+    n_rb = env.n_rb_edges
+    n_ob = env.n_obstacles * env.n_blue
+    expected = {
+        "blue_features", "bb_edge_features", "bb_edge_visible",
         "red_features", "rb_edge_features", "rb_edge_visible",
-        # v5.3 two-channel belief peak detections.
-        "belief_peaks_enemy", "belief_peaks_obstacle",
+        "true_red_features", "true_rb_edge_features",
+        "obstacle_features", "ob_edge_features", "ob_edge_visible",
+        "true_obstacle_features", "true_ob_edge_features",
+        "belief_maps", "true_occupancy",
     }
-    assert set(obs.keys()) == expected_keys
-    assert obs["blue_features"].shape    == (5, 8)
-    assert obs["bb_edge_features"].shape == (env.n_bb_edges, 7)
-    assert obs["belief_maps"].shape      == (5, 3, 52, 52)
-    assert obs["obstacle_positions"].shape[1] == 3
-    assert obs["true_occupancy"].shape   == (2, 52, 52)
-    assert obs["red_features"].shape     == (env.n_red, 1)
-    # v5.1: rb_edges are velocity-only, 4-D (not 7-D full geometry).
-    assert obs["rb_edge_features"].shape == (env.n_rb_edges, 4)
-    assert obs["rb_edge_visible"].shape  == (env.n_rb_edges,)
+    assert set(obs.keys()) == expected
+    assert obs["blue_features"].shape         == (5, 8)
+    assert obs["red_features"].shape          == (env.n_red, 1)
+    assert obs["rb_edge_features"].shape      == (n_rb, 7)
+    assert obs["rb_edge_visible"].shape       == (n_rb,)
+    assert obs["true_rb_edge_features"].shape == (n_rb, 7)
+    assert obs["obstacle_features"].shape     == (env.n_obstacles, 1)
+    assert obs["ob_edge_features"].shape      == (n_ob, 7)
+    assert obs["ob_edge_visible"].shape       == (n_ob,)
+    assert obs["true_ob_edge_features"].shape == (n_ob, 7)
 
 
-def test_stage4_belief_peaks_enemy_shape_and_ordering():
-    """
-    v5.3 enemy belief peaks: (N_blue, K, 3) with K = n_red, confidence
-    monotonically non-increasing across the K slots (peaks sorted).
-    """
-    env = _stage4_env()
+def test_stage4_v6_no_obstacle_keys_when_disabled():
+    """No obstacle node/edge keys when n_obstacles == 0."""
+    env = _stage4_env(n_obstacles=0)
     env.reset(seed=0)
-    # Plant three peaks of decreasing strength in UAV 0's belief map.
-    env._belief_maps[0, 0, 10, 10] = 5.0    # highest
-    env._belief_maps[0, 0, 20, 20] = 3.0
-    env._belief_maps[0, 0, 30, 30] = 1.5
     obs = env.structured_belief_observation()
-    peaks = obs["belief_peaks_enemy"]
-    assert peaks.shape == (env.n_blue, env.n_red, 3)
-    confs = peaks[0, :, 2]
-    assert confs[0] >= confs[1] >= confs[2]
-    assert confs[0] > 0.99
+    for k in ("obstacle_features", "ob_edge_features", "ob_edge_visible",
+              "true_obstacle_features", "true_ob_edge_features"):
+        assert k not in obs
 
 
-def test_stage4_belief_peaks_obstacle_from_channel_1():
+def test_stage4_v6_rb_position_comes_from_belief():
     """
-    v5.3 obstacle peaks come from belief map channel 1 (P(obstacle)),
-    NOT from ground-truth obstacle_positions.  Verify by planting
-    obstacle-channel evidence and confirming it surfaces as peaks
-    with correct confidence.
+    The actor's rb_edge geometry (rel_pos) is reconstructed from the
+    belief-map PEAK, not from ground truth.  Plant a dominant enemy
+    peak in UAV 0's belief and verify edge (r=0, b=0)'s rel_pos points
+    at that cell.  Edge layout: [rel_pos(2), rel_vel(2), range(1),
+    bearing(2)]; rel_pos = blue_pos - peak_pos (normalised by L).
     """
-    env = _stage4_env()
+    env = _stage4_env(n_obstacles=0)
     env.reset(seed=0)
-    # Plant strong evidence in obstacle channel of UAV 0.
-    env._belief_maps[0, 1, 5, 5]   = 4.5
-    env._belief_maps[0, 1, 15, 15] = 3.5
+    cs = env.belief_cell_size
+    L = env.arena_size
+    env._belief_maps[:] = -5.0
+    env._belief_maps[0, 0, 20, 20] = 8.0     # dominant enemy peak, UAV 0
     obs = env.structured_belief_observation()
-    assert "belief_peaks_obstacle" in obs
-    peaks = obs["belief_peaks_obstacle"]
-    # UAV 0's top obstacle-peak should have high confidence.
-    assert peaks[0, 0, 2] > 0.98, (
-        f"UAV 0 top obstacle peak conf {peaks[0, 0, 2]} not > 0.98"
+    rb = obs["rb_edge_features"]             # (n_rb, 7)
+    peak = np.array([(20 + 0.5) * cs, (20 + 0.5) * cs], dtype=np.float32)
+    expected_relpos = (env._blue_pos[0] - peak) / L
+    # Edge (s=0, b=0) is index 0 in the (s outer, b inner) ordering.
+    assert np.allclose(rb[0, :2], expected_relpos, atol=1e-3), (
+        f"rb rel_pos {rb[0, :2]} != belief-peak-derived {expected_relpos}"
     )
 
 
-def test_stage4_rb_edges_are_velocity_only_no_position_leak():
+def test_stage4_v6_belief_rb_differs_from_true_rb():
     """
-    v5.1 rb_edge_features must NOT contain position information --
-    it lives only in the noisy belief map.  Verify by moving reds to
-    a completely different position with the SAME velocities: rb_edge
-    features should be unchanged.
+    Belief-derived rb edges (noisy) should generally differ from the
+    ground-truth ``true_rb_edge_features`` the critic sees.
     """
-    env = _stage4_env()
+    env = _stage4_env(n_obstacles=0)
     env.reset(seed=0)
-    obs_a = env.structured_belief_observation()
-    rb_a = obs_a["rb_edge_features"].copy()
-
-    # Teleport all reds far away but keep velocities identical.
-    env._red_pos = env._red_pos + 40.0   # shift each red by 40m
-    obs_b = env.structured_belief_observation()
-    rb_b = obs_b["rb_edge_features"]
-
-    assert np.allclose(rb_a, rb_b), (
-        "rb_edge_features changed after moving reds without changing "
-        "their velocities -- position is leaking through the edges!"
-    )
-
-
-def test_stage4_rb_edges_reflect_velocity_changes():
-    """
-    Symmetric to the above -- if we CHANGE red velocities but not
-    positions, rb_edge_features MUST change (velocity is the whole
-    point of rb_edges in v5.1).
-    """
-    env = _stage4_env()
-    env.reset(seed=0)
-    obs_a = env.structured_belief_observation()
-    rb_a = obs_a["rb_edge_features"].copy()
-
-    env._red_vel = env._red_vel + np.array([1.0, 0.5], dtype=np.float32)
-    obs_b = env.structured_belief_observation()
-    rb_b = obs_b["rb_edge_features"]
-
-    assert not np.allclose(rb_a, rb_b), (
-        "rb_edge_features did not change after modifying red "
-        "velocities -- velocity signal is missing!"
-    )
-
-
-def test_stage4_belief_window_shape_and_ego_centric():
-    """
-    ``_extract_belief_windows(K)`` returns per-UAV (C, K, K) crops
-    centred on each UAV's own cell.  Verified by planting a marker
-    log-odds value at the UAV's own cell and confirming it lands at
-    the window centre.
-    """
-    K = 33
-    env = _stage4_env(belief_window_size=K, belief_channels=3)
-    env.reset(seed=0)
-    cs = env.belief_cell_size   # 2.5 m at grid_size=52
-    # Force UAV 0 to (50, 50) → cell (50/cs, 50/cs) = (20, 20).
-    env._blue_pos[0] = np.array([50.0, 50.0], dtype=np.float32)
-    cx = int(50.0 / cs)
-    cy = int(50.0 / cs)
-    env._belief_maps[0, 0, cx, cy] = 4.2
-    windows = env._extract_belief_windows(K)
-    assert windows.shape == (env.n_blue, env.belief_channels, K, K)
-    centre = K // 2
-    assert windows[0, 0, centre, centre] == pytest.approx(4.2)
-
-
-def test_stage4_belief_window_edge_padding():
-    """
-    A UAV placed at (0, 0) has half its window outside the arena;
-    those out-of-bounds cells must be zero-padded (never garbage).
-    """
-    K = 33
-    env = _stage4_env(belief_window_size=K, belief_channels=3)
-    env.reset(seed=0)
-    env._blue_pos[0] = np.array([0.0, 0.0], dtype=np.float32)
-    env._belief_maps[0, 0, :, :] = 1.0
-    windows = env._extract_belief_windows(K)
-    r = K // 2
-    assert np.all(windows[0, 0, :r, :] == 0.0), "top-left rows not zero-padded"
-    assert np.all(windows[0, 0, :, :r] == 0.0), "top-left cols not zero-padded"
-    assert np.all(windows[0, 0, r:, r:] == 1.0), \
-        "in-arena portion should show the log-odds we planted"
-
-
-def test_stage4_obs_dict_includes_belief_windows_when_enabled():
-    K = 33
-    env = _stage4_env(belief_window_size=K)
-    env.reset(seed=0)
+    for _ in range(5):
+        env._update_belief_maps()
     obs = env.structured_belief_observation()
-    assert "belief_windows" in obs
-    assert obs["belief_windows"].shape == (env.n_blue,
-                                            env.belief_channels, K, K)
+    assert not np.allclose(
+        obs["rb_edge_features"], obs["true_rb_edge_features"],
+    ), "belief rb should not exactly match ground-truth rb"
+
+
+def test_stage4_v6_obstacle_edges_static_velocity():
+    """
+    Obstacle edges are rb-equivalent with the object velocity zeroed:
+    rel_vel = blue_vel - 0.  With blues stationary, ob rel_vel == 0.
+    """
+    env = _stage4_env(n_obstacles=4)
+    env.reset(seed=0)
+    for _ in range(5):
+        env._update_belief_maps()
+    env._blue_vel[:] = 0.0
+    obs = env.structured_belief_observation()
+    ob = obs["ob_edge_features"]             # (n_ob, 7)
+    assert np.allclose(ob[:, 2:4], 0.0), (
+        "obstacle rel_vel should be 0 when blues are stationary "
+        "(object velocity is 0)"
+    )
 
 
 def test_stage4_backward_compat_when_flags_off():

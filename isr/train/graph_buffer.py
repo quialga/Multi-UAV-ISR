@@ -297,18 +297,19 @@ class RecurrentGraphRolloutBuffer(GraphRolloutBuffer):
 
 class Stage4RolloutBuffer:
     """
-    Buffer for the Stage 4 (v5.3) CTDE + belief-map + recurrent policy.
+    Buffer for the Stage 4 (v6) typed-GNN CTDE recurrent policy.
 
-    Stores, per (T, E) transition:
-    - Graph side: blue_features, bb_edge_features, and (when n_red > 0)
-      red_features, velocity-only rb_edge_features, rb_edge_visible.
-    - Belief side: belief_maps (T, E, N_blue, C, H, W) plus the peak
-      detections belief_peaks_enemy (T, E, N_blue, n_red, 3) and
-      belief_peaks_obstacle (T, E, N_blue, n_obstacle_peaks, 3).
-      Optionally belief_windows when the actor-CNN ablation path is on.
-    - Critic side: true_occupancy (T, E, 2, H, W).
-    - RL bookkeeping: actions / log_probs / values / rewards / dones /
-      hidden -- same layout as the Stage 3 buffer.
+    Generic dict-of-tensors design: the set of observation keys is
+    discovered from the first ``add`` call and each key gets its own
+    (T, E, ...) tensor.  This keeps the buffer agnostic to the exact
+    v6 obs schema (blue/red/obstacle node features + bb/rb/ob edge
+    features + visibility masks, both belief-derived actor keys and
+    ``true_*`` critic keys).
+
+    RL bookkeeping (actions / log_probs / values / rewards / dones /
+    hidden / GAE) matches the Stage 3 recurrent buffer: one centralised
+    value per env-timestep, per-agent actions/log_probs, per-agent
+    hidden state.
 
     Minibatch item = one env-timestep transition (stateless-at-update).
     """
@@ -319,118 +320,26 @@ class Stage4RolloutBuffer:
         n_envs:         int,
         n_agents:       int,
         action_dim:     int,
-        blue_feat_dim:  int,
-        edge_feat_dim:  int,
-        n_bb_edges:     int,
-        belief_channels:int,
-        belief_grid:    int,
         d_hidden:       int,
         device:         torch.device,
-        belief_window:  int = 0,   # 0 -> ego-centric windows disabled
-        # Stage 4 v5.1 red-side sizing (0 -> red-side branch disabled).
-        # rb_edge is now 4-D velocity-only, not 7-D full geometry.
-        n_red:          int = 0,
-        red_feat_dim:   int = 1,
-        n_rb_edges:     int = 0,
-        rb_edge_feat_dim:int = 4,
-        # Stage 4 v5.3 obstacle peaks sizing.
-        n_obstacle_peaks:int = 1,
     ) -> None:
         self.T = int(rollout_steps)
         self.E = int(n_envs)
         self.A = int(n_agents)
-        self.action_dim      = int(action_dim)
-        self.blue_feat_dim   = int(blue_feat_dim)
-        self.edge_feat_dim   = int(edge_feat_dim)
-        self.n_bb_edges      = int(n_bb_edges)
-        self.belief_channels = int(belief_channels)
-        self.belief_grid     = int(belief_grid)
-        self.belief_window   = int(belief_window)
-        self.d_hidden        = int(d_hidden)
-        self.device          = device
+        self.action_dim = int(action_dim)
+        self.d_hidden   = int(d_hidden)
+        self.device     = device
 
-        H = W = self.belief_grid
-        C   = self.belief_channels
+        # Obs tensors are lazily allocated on the first add() from the
+        # observed key -> shape schema.
+        self._obs: Dict[str, torch.Tensor] = {}
 
-        # Obs — the two graph-side tensors.
-        self.blue_features = torch.zeros(
-            (self.T, self.E, self.A, self.blue_feat_dim),
-            dtype=torch.float32, device=device,
-        )
-        self.bb_edge_features = torch.zeros(
-            (self.T, self.E, self.n_bb_edges, self.edge_feat_dim),
-            dtype=torch.float32, device=device,
-        )
-        # Belief-map inputs.
-        self.belief_maps = torch.zeros(
-            (self.T, self.E, self.A, C, H, W),
-            dtype=torch.float32, device=device,
-        )
-        # true_occupancy always 2 channels (enemy + obstacle); it does
-        # not track deterministic ally/self overlays that live in the
-        # actor's belief tensor.
-        self.true_occupancy = torch.zeros(
-            (self.T, self.E, 2, H, W),
-            dtype=torch.float32, device=device,
-        )
-        # Ego-centric belief windows (Stage 4 v3).  Only allocated when
-        # belief_window > 0.  None sentinel used to signal "not present".
-        if self.belief_window > 0:
-            K = self.belief_window
-            self.belief_windows = torch.zeros(
-                (self.T, self.E, self.A, C, K, K),
-                dtype=torch.float32, device=device,
-            )
-        else:
-            self.belief_windows = None
-
-        # Red-side (Stage 4 v5).  Only allocated when n_red > 0.
-        self.n_red = int(n_red)
-        self.red_feat_dim   = int(red_feat_dim)
-        self.n_rb_edges     = int(n_rb_edges)
-        self.rb_edge_feat_dim = int(rb_edge_feat_dim)
-        if self.n_red > 0 and self.n_rb_edges > 0:
-            self.red_features = torch.zeros(
-                (self.T, self.E, self.n_red, self.red_feat_dim),
-                dtype=torch.float32, device=device,
-            )
-            self.rb_edge_features = torch.zeros(
-                (self.T, self.E, self.n_rb_edges, self.rb_edge_feat_dim),
-                dtype=torch.float32, device=device,
-            )
-            self.rb_edge_visible = torch.zeros(
-                (self.T, self.E, self.n_rb_edges),
-                dtype=torch.float32, device=device,
-            )
-        else:
-            self.red_features    = None
-            self.rb_edge_features = None
-            self.rb_edge_visible  = None
-
-        # v5.3 belief peak detections per UAV (two channels).
-        self.n_obstacle_peaks = int(n_obstacle_peaks)
-        if self.n_red > 0:
-            self.belief_peaks_enemy = torch.zeros(
-                (self.T, self.E, self.A, self.n_red, 3),
-                dtype=torch.float32, device=device,
-            )
-            self.belief_peaks_obstacle = torch.zeros(
-                (self.T, self.E, self.A, self.n_obstacle_peaks, 3),
-                dtype=torch.float32, device=device,
-            )
-        else:
-            self.belief_peaks_enemy    = None
-            self.belief_peaks_obstacle = None
-
-        # Agent-level tensors.
         self.actions   = torch.zeros((self.T, self.E, self.A, self.action_dim),
                                      dtype=torch.float32, device=device)
         self.log_probs = torch.zeros((self.T, self.E, self.A),
                                      dtype=torch.float32, device=device)
         self.hidden    = torch.zeros((self.T, self.E, self.A, self.d_hidden),
                                      dtype=torch.float32, device=device)
-
-        # Env-level (centralised) tensors.
         self.values     = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
         self.rewards    = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
         self.dones      = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
@@ -444,51 +353,29 @@ class Stage4RolloutBuffer:
 
     def add(
         self,
-        blue_features:    torch.Tensor,   # (E, A, blue_feat_dim)
-        bb_edge_features: torch.Tensor,   # (E, n_bb, edge_feat_dim)
-        belief_maps:      torch.Tensor,   # (E, A, C, H, W)
-        true_occupancy:   torch.Tensor,   # (E, 2, H, W)
-        actions:          torch.Tensor,   # (E, A, action_dim)
-        log_probs:        torch.Tensor,   # (E, A)
-        values:           torch.Tensor,   # (E,)
-        rewards:          torch.Tensor,   # (E,)
-        dones:            torch.Tensor,   # (E,)
-        hidden:           torch.Tensor,   # (E, A, d_hidden)
-        belief_windows:   torch.Tensor = None,   # (E, A, C, K, K) or None
-        # v5 red-side (None-safe: falls back to no-op when disabled)
-        red_features:     torch.Tensor = None,
-        rb_edge_features_v5: torch.Tensor = None,
-        rb_edge_visible:  torch.Tensor = None,
-        # v5.3 belief peaks (two channels)
-        belief_peaks_enemy:    torch.Tensor = None,
-        belief_peaks_obstacle: torch.Tensor = None,
+        obs:       Dict[str, torch.Tensor],   # per-key (E, ...) tensors
+        actions:   torch.Tensor,              # (E, A, action_dim)
+        log_probs: torch.Tensor,              # (E, A)
+        values:    torch.Tensor,              # (E,)
+        rewards:   torch.Tensor,              # (E,)
+        dones:     torch.Tensor,              # (E,)
+        hidden:    torch.Tensor,              # (E, A, d_hidden)
     ) -> None:
         assert self.ptr < self.T, "Buffer full — call reset() between rollouts."
-        if self.belief_windows is not None:
-            assert belief_windows is not None
-            self.belief_windows[self.ptr] = belief_windows
-        if self.red_features is not None:
-            assert red_features is not None
-            assert rb_edge_features_v5 is not None
-            assert rb_edge_visible is not None
-            self.red_features[self.ptr]     = red_features
-            self.rb_edge_features[self.ptr] = rb_edge_features_v5
-            self.rb_edge_visible[self.ptr]  = rb_edge_visible
-        if self.belief_peaks_enemy is not None:
-            assert belief_peaks_enemy is not None
-            assert belief_peaks_obstacle is not None
-            self.belief_peaks_enemy[self.ptr]    = belief_peaks_enemy
-            self.belief_peaks_obstacle[self.ptr] = belief_peaks_obstacle
-        self.blue_features[self.ptr]    = blue_features
-        self.bb_edge_features[self.ptr] = bb_edge_features
-        self.belief_maps[self.ptr]      = belief_maps
-        self.true_occupancy[self.ptr]   = true_occupancy
-        self.actions[self.ptr]          = actions
-        self.log_probs[self.ptr]        = log_probs
-        self.values[self.ptr]           = values
-        self.rewards[self.ptr]          = rewards
-        self.dones[self.ptr]            = dones
-        self.hidden[self.ptr]           = hidden
+        if not self._obs:
+            for k, v in obs.items():
+                self._obs[k] = torch.zeros(
+                    (self.T,) + tuple(v.shape), dtype=torch.float32,
+                    device=self.device,
+                )
+        for k, v in obs.items():
+            self._obs[k][self.ptr] = v
+        self.actions[self.ptr]   = actions
+        self.log_probs[self.ptr] = log_probs
+        self.values[self.ptr]    = values
+        self.rewards[self.ptr]   = rewards
+        self.dones[self.ptr]     = dones
+        self.hidden[self.ptr]    = hidden
         self.ptr += 1
 
     def compute_gae(
@@ -511,81 +398,30 @@ class Stage4RolloutBuffer:
         self, mb_size: int,
     ) -> Iterator[Dict[str, object]]:
         """
-        Same shuffling as the base buffer; each minibatch item is one
-        (env-timestep) transition.  Caller assembles the two obs dicts:
-            partial_obs = {
-                "blue_features":    mb["blue_features"],
-                "bb_edge_features": mb["bb_edge_features"],
-                "belief_maps":      mb["belief_maps"],
-            }
-            full_state = {
-                "blue_features":    mb["blue_features"],
-                "bb_edge_features": mb["bb_edge_features"],
-                "true_occupancy":   mb["true_occupancy"],
-            }
+        Shuffle over (env-timestep) transitions.  Each minibatch dict
+        carries every stored obs key plus the RL tensors; the PPO
+        update splits obs keys into the actor / critic dicts by name.
         """
         N = self.T * self.E
-        H = W = self.belief_grid
-        C   = self.belief_channels
-
-        flat_blue = self.blue_features.reshape(N, self.A, self.blue_feat_dim)
-        flat_bb   = self.bb_edge_features.reshape(N, self.n_bb_edges, self.edge_feat_dim)
-        flat_bm   = self.belief_maps.reshape(N, self.A, C, H, W)
-        flat_to   = self.true_occupancy.reshape(N, 2, H, W)
-        flat_act  = self.actions.reshape(N, self.A, self.action_dim)
-        flat_lp   = self.log_probs.reshape(N, self.A)
-        flat_val  = self.values.reshape(N)
-        flat_adv  = self.advantages.reshape(N)
-        flat_ret  = self.returns.reshape(N)
-        flat_hid  = self.hidden.reshape(N, self.A, self.d_hidden)
-
-        # Ego-centric windows if present.
-        flat_bw = None
-        if self.belief_windows is not None:
-            K = self.belief_window
-            flat_bw = self.belief_windows.reshape(N, self.A, C, K, K)
-
-        # v5 red-side flat views.
-        flat_rf = flat_rb = flat_rv = None
-        if self.red_features is not None:
-            flat_rf = self.red_features.reshape(N, self.n_red, self.red_feat_dim)
-            flat_rb = self.rb_edge_features.reshape(
-                N, self.n_rb_edges, self.rb_edge_feat_dim,
-            )
-            flat_rv = self.rb_edge_visible.reshape(N, self.n_rb_edges)
-
-        # v5.3 belief peaks flat views.
-        flat_bpe = flat_bpo = None
-        if self.belief_peaks_enemy is not None:
-            flat_bpe = self.belief_peaks_enemy.reshape(
-                N, self.A, self.n_red, 3,
-            )
-            flat_bpo = self.belief_peaks_obstacle.reshape(
-                N, self.A, self.n_obstacle_peaks, 3,
-            )
+        flat_obs = {
+            k: v.reshape((N,) + tuple(v.shape[2:]))
+            for k, v in self._obs.items()
+        }
+        flat_act = self.actions.reshape(N, self.A, self.action_dim)
+        flat_lp  = self.log_probs.reshape(N, self.A)
+        flat_val = self.values.reshape(N)
+        flat_adv = self.advantages.reshape(N)
+        flat_ret = self.returns.reshape(N)
+        flat_hid = self.hidden.reshape(N, self.A, self.d_hidden)
 
         perm = torch.randperm(N, device=self.device)
         for start in range(0, N, mb_size):
             idx = perm[start:start + mb_size]
-            out = {
-                "blue_features":    flat_blue[idx],
-                "bb_edge_features": flat_bb[idx],
-                "belief_maps":      flat_bm[idx],
-                "true_occupancy":   flat_to[idx],
-                "actions":          flat_act[idx],
-                "log_probs":        flat_lp[idx],
-                "values":           flat_val[idx],
-                "advantages":       flat_adv[idx],
-                "returns":          flat_ret[idx],
-                "hidden":           flat_hid[idx],
-            }
-            if flat_bw is not None:
-                out["belief_windows"] = flat_bw[idx]
-            if flat_rf is not None:
-                out["red_features"]     = flat_rf[idx]
-                out["rb_edge_features"] = flat_rb[idx]
-                out["rb_edge_visible"]  = flat_rv[idx]
-            if flat_bpe is not None:
-                out["belief_peaks_enemy"]    = flat_bpe[idx]
-                out["belief_peaks_obstacle"] = flat_bpo[idx]
+            out: Dict[str, object] = {k: v[idx] for k, v in flat_obs.items()}
+            out["actions"]    = flat_act[idx]
+            out["log_probs"]  = flat_lp[idx]
+            out["values"]     = flat_val[idx]
+            out["advantages"] = flat_adv[idx]
+            out["returns"]    = flat_ret[idx]
+            out["hidden"]     = flat_hid[idx]
             yield out

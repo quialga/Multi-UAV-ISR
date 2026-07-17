@@ -341,19 +341,22 @@ class RecurrentVectorPursuitEnv(VectorPursuitEnv):
 
 class Stage4VectorPursuitEnv(VectorPursuitEnv):
     """
-    Stage 4 (v5.3) vectorised env.  Same reset/step signatures as the
-    Stage 3 variant, but the obs dict is the Stage 4 schema from
-    ``structured_belief_observation()``.  It carries both the precise
-    graph-side keys (blue_features, bb_edge_features, red_features,
-    velocity-only rb_edge_features, rb_edge_visible) and the noisy
-    belief-side keys (belief_maps, belief_peaks_enemy,
-    belief_peaks_obstacle), plus obstacle_positions / true_occupancy
-    for diagnostics and the CTDE critic.
+    Stage 4 (v6) vectorised env.  The obs dict is the v6 typed-graph
+    schema from ``structured_belief_observation()``: belief-derived
+    actor node/edge features + ground-truth ``true_*`` critic features
+    (+ obstacle variants when configured).
+
+    The big ``belief_maps`` / ``true_occupancy`` diagnostic tensors are
+    NOT batched — the v6 policy consumes only the reconstructed graph,
+    and storing full belief grids per step would blow up memory.
 
     Requires ``env_kwargs`` to have both ``sensor_radius`` set (so the
-    sensor step has a defined disk) and ``use_belief_maps=True`` (so
-    the log-odds tensor is actually maintained).
+    sensor step has a defined disk) and ``use_belief_maps=True`` (so the
+    log-odds tensor that feeds the peak extractor is maintained).
     """
+
+    #: obs keys that stay inside the env (not fed to the policy/buffer).
+    _EXCLUDE = ("belief_maps", "true_occupancy")
 
     def __init__(
         self,
@@ -380,95 +383,30 @@ class Stage4VectorPursuitEnv(VectorPursuitEnv):
             episode_buffer_size  = episode_buffer_size,
             red_policy_mix       = red_policy_mix,
         )
-        # Pull Stage 4 sizing from the first env for convenience.
         e0 = self.envs[0]
-        self.belief_channels    = e0.belief_channels
-        self.belief_grid_size   = e0.belief_grid_size
-        self.belief_window_size = getattr(e0, "belief_window_size", 0)
-        self.n_obstacles        = e0.n_obstacles
-        self.n_red              = e0.n_red
-        # Stage 4 v5.1: velocity-only rb_edges (4-D: rel_vel + src_vel).
-        # Position info is deliberately withheld from rb_edges and lives
-        # only in the noisy Bayesian belief map -- see
-        # PursuitEnv._velocity_edge_features_for.
-        self.red_feat_dim       = 1
-        self.rb_edge_feat_dim   = 4
-        self.n_rb_edges         = e0.n_rb_edges
-        # Reserve batch space for the requested obstacle count.  A
-        # rejection-sampled reset may drop below this if placement
-        # fails; ``_fill_row`` pads with zeros in that case.
-        self._obs_n_obstacles = int(e0.n_obstacles)
+        self.n_red       = e0.n_red
+        self.n_obstacles = e0.n_obstacles
+
+        # Discover the graph-obs schema from one sample observation so
+        # obstacle keys appear only when configured.
+        e0.reset(seed=base_seed)
+        sample = e0.structured_belief_observation()
+        self._graph_keys = [k for k in sample if k not in self._EXCLUDE]
+        self._graph_shapes = {k: tuple(sample[k].shape) for k in self._graph_keys}
 
     # ------------------------------------------------------------------ #
-    #  Structured-obs override                                             #
+    #  Structured-obs override (generic over the v6 graph schema)          #
     # ------------------------------------------------------------------ #
 
     def _empty_batch(self) -> Dict[str, np.ndarray]:  # type: ignore[override]
-        H = W = self.belief_grid_size
-        C   = self.belief_channels
-        nob = self._obs_n_obstacles
-        K   = self.belief_window_size
-        batch = {
-            "blue_features":    np.zeros(
-                (self.n_envs, self.n_blue, self.blue_feat_dim),
-                dtype=np.float32),
-            "bb_edge_features": np.zeros(
-                (self.n_envs, self.n_bb_edges, self.edge_feat_dim),
-                dtype=np.float32),
-            "belief_maps":      np.zeros(
-                (self.n_envs, self.n_blue, C, H, W),
-                dtype=np.float32),
-            "obstacle_positions": np.zeros(
-                (self.n_envs, nob, 3), dtype=np.float32),
-            # true_occupancy always 2 channels: enemy + obstacle.
-            "true_occupancy":   np.zeros(
-                (self.n_envs, 2, H, W), dtype=np.float32),
+        return {
+            k: np.zeros((self.n_envs,) + shp, dtype=np.float32)
+            for k, shp in self._graph_shapes.items()
         }
-        # Ego-centric windows (Stage 4 v3).  Allocated only when the
-        # underlying env exposes them.
-        if K > 0:
-            batch["belief_windows"] = np.zeros(
-                (self.n_envs, self.n_blue, C, K, K), dtype=np.float32,
-            )
-        # Stage 4 v5: red-side keys for the intercept signal.
-        batch["red_features"] = np.zeros(
-            (self.n_envs, self.n_red, self.red_feat_dim), dtype=np.float32,
-        )
-        batch["rb_edge_features"] = np.zeros(
-            (self.n_envs, self.n_rb_edges, self.rb_edge_feat_dim),
-            dtype=np.float32,
-        )
-        batch["rb_edge_visible"] = np.zeros(
-            (self.n_envs, self.n_rb_edges), dtype=np.float32,
-        )
-        # Stage 4 v5.3: two-channel belief peaks per UAV.
-        batch["belief_peaks_enemy"] = np.zeros(
-            (self.n_envs, self.n_blue, self.n_red, 3), dtype=np.float32,
-        )
-        n_obs_peaks = max(1, self.n_obstacles)
-        batch["belief_peaks_obstacle"] = np.zeros(
-            (self.n_envs, self.n_blue, n_obs_peaks, 3), dtype=np.float32,
-        )
-        return batch
 
     def _fill_row(  # type: ignore[override]
         self, batch: Dict[str, np.ndarray], idx: int, env: PursuitEnv,
     ) -> None:
         obs = env.structured_belief_observation()
-        for k in ("blue_features", "bb_edge_features",
-                  "belief_maps", "true_occupancy",
-                  "red_features", "rb_edge_features", "rb_edge_visible",
-                  "belief_peaks_enemy", "belief_peaks_obstacle"):
-            if k in batch and k in obs:
-                batch[k][idx] = obs[k]
-        if "belief_windows" in batch and "belief_windows" in obs:
-            batch["belief_windows"][idx] = obs["belief_windows"]
-        # obstacle_positions might have differed per-env at reset (if
-        # rejection sampling gave fewer than requested).  Pad or clip to
-        # the batch's declared size.
-        op = obs["obstacle_positions"]
-        nob_batch = batch["obstacle_positions"].shape[1]
-        if op.shape[0] >= nob_batch:
-            batch["obstacle_positions"][idx] = op[:nob_batch]
-        else:
-            batch["obstacle_positions"][idx, :op.shape[0]] = op
+        for k in self._graph_keys:
+            batch[k][idx] = obs[k]

@@ -732,32 +732,6 @@ class PursuitEnv(ParallelEnv):
             bearing,
         ], axis=1).astype(np.float32)
 
-    def _velocity_edge_features_for(
-        self,
-        src_vel: np.ndarray,   # (E, 2)  sender velocities  (e.g. reds)
-        dst_vel: np.ndarray,   # (E, 2)  receiver velocities (e.g. blues)
-    ) -> np.ndarray:
-        """
-        Velocity-only edge features for the Stage 4 v5.1 rb_edges.
-
-        Produces 4-D features: ``[rel_vel (2), src_vel (2)]`` normalised
-        by ``BLUE_UAV.v_max``.  NO position information -- that lives
-        exclusively in the noisy Bayesian belief map, per the realistic
-        sensor split (Doppler radar precisely measures velocity;
-        position is uncertain).
-
-        - ``rel_vel = src_vel - dst_vel``: closing/opening motion, useful
-          for pursuit geometry once the policy knows WHERE the enemy is.
-        - ``src_vel`` (enemy absolute velocity): tells the policy where
-          the enemy is heading in world frame, for lead-pursuit.
-        """
-        v_max = BLUE_UAV.v_max
-        rel_vel = src_vel - dst_vel                          # (E, 2)
-        return np.concatenate([
-            (rel_vel / v_max).astype(np.float32),
-            (src_vel / v_max).astype(np.float32),
-        ], axis=1).astype(np.float32)
-
     def _build_structured_obs(self) -> Dict[str, np.ndarray]:
         """
         Build the graph-structured observation for the GNN policy.
@@ -1297,102 +1271,205 @@ class PursuitEnv(ParallelEnv):
         out = np.stack([dx, dy, topk_vals.astype(np.float32)], axis=-1)
         return out.astype(np.float32)
 
-    def _extract_belief_windows(self, K: int) -> np.ndarray:
+
+    def _attach_enemy_velocity(self, blue_idx: int, peak_pos: np.ndarray) -> np.ndarray:
         """
-        Ego-centric KxK crop of each UAV's belief map centred on that
-        UAV's own cell.  Cells outside the arena are zero-padded (so a
-        UAV near a wall gets zeros filling the out-of-bounds portion of
-        its window).
+        Radar-velocity attachment for a belief-derived enemy detection.
+
+        The belief peak gives a (noisy) POSITION; Doppler radar gives
+        precise VELOCITY, but only for targets the UAV can actually
+        sense.  Model: attach the true velocity of the active red
+        nearest the peak, IF that red is within ``sensor_radius`` of
+        this UAV; otherwise the velocity is unknown -> 0.
+        """
+        active = np.where(self._red_active)[0]
+        if len(active) == 0:
+            return np.zeros(2, dtype=np.float32)
+        d = np.linalg.norm(self._red_pos[active] - peak_pos[None, :], axis=1)
+        r = int(active[int(np.argmin(d))])
+        if (self.sensor_radius is None
+                or np.linalg.norm(self._red_pos[r] - self._blue_pos[blue_idx])
+                <= self.sensor_radius):
+            return self._red_vel[r].astype(np.float32)
+        return np.zeros(2, dtype=np.float32)
+
+    def _belief_graph_from_peaks(
+        self, peaks: np.ndarray, static: bool,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build the actor-side node + edge features for one entity type
+        (enemy or obstacle) from per-UAV belief peaks.
+
+        Parameters
+        ----------
+        peaks : (N_blue, K, 3) float32
+          (dx_norm, dy_norm, conf) per UAV per detection slot, from
+          ``_extract_belief_peaks``.
+        static : bool
+          True for obstacles (object velocity 0 -> ``rel_vel`` driven
+          only by the blue's own motion, same helper as rb edges with
+          the object velocity zeroed).  False for enemies (radar
+          velocity attached when visible).
 
         Returns
         -------
-        windows : (N_blue, C, K, K) float32
+        node_feat : (K, 1)  soft detection flag = max confidence over UAVs
+        edge_feat : (K * N_blue, 7)  same 7-D layout as bb/rb edges
+        edge_vis  : (K * N_blue,)    per-edge visibility = peak confidence
+          Edge ordering matches _build_xb_edges: for s in K, for b in N.
         """
-        assert self._belief_maps is not None
-        assert K >= 1
-        r = K // 2
-        C = self.belief_channels
-        H = W = self.belief_grid_size
-        cs = self.belief_cell_size
+        L = self.arena_size
+        N = self.n_blue
+        K = peaks.shape[1]
+        n_edges = K * N
 
-        # Zero-pad the belief tensor spatially by r on each side.
-        padded = np.pad(
-            self._belief_maps,
-            ((0, 0), (0, 0), (r, r), (r, r)),
-            mode="constant", constant_values=0.0,
-        )                                     # (N_blue, C, H+2r, W+2r)
+        peak_abs = self._blue_pos[:, None, :] + peaks[:, :, :2] * L   # (N, K, 2)
+        conf = peaks[:, :, 2]                                          # (N, K)
 
-        out = np.zeros((self.n_blue, C, K, K), dtype=np.float32)
-        for i in range(self.n_blue):
-            cx = int(np.clip(self._blue_pos[i, 0] / cs, 0, W - 1))
-            cy = int(np.clip(self._blue_pos[i, 1] / cs, 0, H - 1))
-            # In padded coords the UAV cell is at (cx + r, cy + r);
-            # window starts r cells before that -> at (cx, cy) in
-            # padded coords -- so the window slice is [cx:cx+K, cy:cy+K].
-            out[i] = padded[i, :, cx:cx + K, cy:cy + K]
-        return out
+        src_pos = np.zeros((n_edges, 2), dtype=np.float32)
+        src_vel = np.zeros((n_edges, 2), dtype=np.float32)
+        dst_pos = np.zeros((n_edges, 2), dtype=np.float32)
+        dst_vel = np.zeros((n_edges, 2), dtype=np.float32)
+        edge_vis = np.zeros((n_edges,), dtype=np.float32)
+
+        for s in range(K):
+            for b in range(N):
+                e = s * N + b
+                p = peak_abs[b, s]
+                src_pos[e] = p
+                dst_pos[e] = self._blue_pos[b]
+                dst_vel[e] = self._blue_vel[b]
+                edge_vis[e] = conf[b, s]
+                if not static:
+                    src_vel[e] = self._attach_enemy_velocity(b, p)
+                # static: src_vel stays 0.
+
+        edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
+        node_feat = conf.max(axis=0).reshape(K, 1).astype(np.float32)
+        return node_feat, edge_feat, edge_vis
+
+    def _true_obstacle_graph(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Ground-truth obstacle node + edge features for the CTDE critic.
+
+        Node count is fixed at ``self.n_obstacles`` (the configured
+        value) so tensor shapes are stable across a run even when
+        rejection sampling places fewer.  Missing slots are inactive
+        (node feature 0, zero edges).  Obstacles are static -> object
+        velocity 0.
+        """
+        n_obs = self.n_obstacles
+        N = self.n_blue
+        placed = 0 if self._obstacle_pos is None else len(self._obstacle_pos)
+
+        node_feat = np.zeros((n_obs, 1), dtype=np.float32)
+        n_edges = n_obs * N
+        src_pos = np.zeros((n_edges, 2), dtype=np.float32)
+        src_vel = np.zeros((n_edges, 2), dtype=np.float32)   # static
+        dst_pos = np.zeros((n_edges, 2), dtype=np.float32)
+        dst_vel = np.zeros((n_edges, 2), dtype=np.float32)
+
+        for o in range(n_obs):
+            has = o < placed
+            if has:
+                node_feat[o, 0] = 1.0
+            for b in range(N):
+                e = o * N + b
+                dst_pos[e] = self._blue_pos[b]
+                dst_vel[e] = self._blue_vel[b]
+                # src_pos = obstacle centre if placed; else = blue pos
+                # (rel_pos 0) so the padded edge is neutral before zeroing.
+                src_pos[e] = self._obstacle_pos[o] if has else self._blue_pos[b]
+
+        edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
+        # Zero the edges of padded (unplaced) obstacle slots.
+        for o in range(n_obs):
+            if o >= placed:
+                edge_feat[o * N:(o + 1) * N] = 0.0
+        return node_feat, edge_feat
 
     def structured_belief_observation(self) -> Dict[str, np.ndarray]:
         """
-        Stage 4 (v5.3) observation dict.  The sensor-physics split is:
-        precise self/ally state + enemy velocity flow through the graph;
-        noisy enemy/obstacle POSITIONS flow only through the Bayesian
-        belief map (as peak detections).
+        Stage 4 (v6) observation dict — the proven Stage 3 typed-GNN
+        graph, extended with obstacle nodes.  No CNN, no raw belief
+        tensor fed to the policy.
+
+        The ACTOR consumes a belief-derived graph: enemy/obstacle node
+        and edge features (rel_pos, range, bearing) come from each
+        UAV's belief-map PEAK detections (noisy); enemy edge velocity
+        from radar (precise when visible); obstacle velocity 0 (static).
+        Per-edge visibility = peak confidence.
+
+        The CRITIC (CTDE) consumes the ground-truth graph: true red and
+        obstacle node/edge features, no masks.
 
         Keys
         ----
-        Precise (graph side):
-        - ``blue_features``     : (N_blue, 8)        own kinematics
-        - ``bb_edge_features``  : (n_bb, 7)          ally rel state (GPS)
-        - ``red_features``      : (N_red, 1)         red active flags
-        - ``rb_edge_features``  : (n_rb, 4)          VELOCITY-only
-          (rel_vel, src_vel); NO position -- see
-          ``_velocity_edge_features_for``
-        - ``rb_edge_visible``   : (n_rb,)            per-edge visibility
+        Shared precise:
+        - ``blue_features``     (N_blue, 8)
+        - ``bb_edge_features``  (n_bb, 7),  ``bb_edge_visible`` (n_bb,)
 
-        Noisy (belief side):
-        - ``belief_maps``       : (N_blue, C, H, W)  log-odds tensor
-          (kept for the diagnostic BCE; the actor does NOT consume the
-          raw map in v5.3)
-        - ``belief_peaks_enemy``    : (N_blue, n_red, 3) top-K
-          (dx, dy, conf) from channel 0
-        - ``belief_peaks_obstacle`` : (N_blue, max(1, n_obs), 3) top-K
-          from channel 1
+        Actor (belief-derived):
+        - ``red_features``      (N_red, 1),  ``rb_edge_features`` (n_rb, 7),
+          ``rb_edge_visible`` (n_rb,)
+        - ``obstacle_features`` (N_obs, 1),  ``ob_edge_features`` (n_ob, 7),
+          ``ob_edge_visible`` (n_ob,)         [only if n_obstacles > 0]
 
-        Diagnostics / critic-only:
-        - ``obstacle_positions``: (N_obs, 3) = (x, y, radius) ground
-          truth -- kept for logging; the ACTOR must not read it (obstacle
-          position is meant to come from belief_peaks_obstacle)
-        - ``true_occupancy``    : (2, H, W) binary, CTDE critic only;
-          the actor must NOT read this key
-        - ``belief_windows``    : (N_blue, C, K, K) ego-centric crops,
-          only present when belief_window_size > 0 (the
-          ``use_actor_belief_cnn`` ablation path)
+        Critic (ground truth):
+        - ``true_red_features`` (N_red, 1),  ``true_rb_edge_features`` (n_rb, 7)
+        - ``true_obstacle_features`` (N_obs, 1),
+          ``true_ob_edge_features`` (n_ob, 7)  [only if n_obstacles > 0]
+
+        Diagnostics (not consumed by the policy):
+        - ``belief_maps`` (N_blue, C, H, W), ``true_occupancy`` (2, H, W)
         """
-        base = self._build_structured_obs()
-        # v5.1: velocity-only rb_edges.
-        # Position of enemies lives ONLY in the noisy Bayesian belief
-        # map -- feeding precise position through rb_edges would let
-        # the policy bypass the belief map entirely (radar/EO position
-        # estimates are noisy in reality; only the fused belief
-        # tracker output is available to the operator).  Velocity is
-        # measured directly by Doppler radar and comes through
-        # precisely when the target is visible.
-        _bb_vis, rb_vis = self._compute_edge_visibility()
-        rb_edge_vel = self._velocity_edge_features_for(
-            src_vel=self._red_vel[self.rb_edge_src],
-            dst_vel=self._blue_vel[self.rb_edge_dst],
-        )
+        base = self._build_structured_obs()   # true blue/red/bb/rb + masks
+        bb_vis, rb_vis_true = self._compute_edge_visibility()
+
         out: Dict[str, np.ndarray] = {
-            "blue_features":     base["blue_features"],
-            "bb_edge_features":  base["bb_edge_features"],
-            "red_features":      base["red_features"],
-            "rb_edge_features":  rb_edge_vel,
-            "rb_edge_visible":   rb_vis,
+            # Shared precise.
+            "blue_features":    base["blue_features"],
+            "bb_edge_features": base["bb_edge_features"],
+            "bb_edge_visible":  bb_vis,
+            # Critic ground truth (reds).
+            "true_red_features":     base["red_features"],
+            "true_rb_edge_features": base["rb_edge_features"],
         }
 
-        # Belief maps.  If disabled, still return a zero-filled tensor
-        # so downstream callers can rely on the schema.
+        # ---- Actor belief-derived enemy graph ----------------------------
+        if self._belief_maps is not None:
+            enemy_peaks = self._extract_belief_peaks(self.n_red, channel_idx=0)
+        else:
+            enemy_peaks = np.zeros((self.n_blue, self.n_red, 3), dtype=np.float32)
+        red_node, rb_edge, rb_vis = self._belief_graph_from_peaks(
+            enemy_peaks, static=False,
+        )
+        out["red_features"]    = red_node
+        out["rb_edge_features"] = rb_edge
+        out["rb_edge_visible"]  = rb_vis
+
+        # ---- Obstacle graph (only when obstacles are configured) ---------
+        if self.n_obstacles > 0:
+            if self._belief_maps is not None and self.belief_channels >= 2:
+                obs_peaks = self._extract_belief_peaks(
+                    self.n_obstacles, channel_idx=1,
+                )
+            else:
+                obs_peaks = np.zeros(
+                    (self.n_blue, self.n_obstacles, 3), dtype=np.float32,
+                )
+            ob_node, ob_edge, ob_vis = self._belief_graph_from_peaks(
+                obs_peaks, static=True,
+            )
+            out["obstacle_features"] = ob_node
+            out["ob_edge_features"]  = ob_edge
+            out["ob_edge_visible"]   = ob_vis
+            # Critic ground truth (obstacles).
+            true_ob_node, true_ob_edge = self._true_obstacle_graph()
+            out["true_obstacle_features"] = true_ob_node
+            out["true_ob_edge_features"]  = true_ob_edge
+
+        # ---- Diagnostics (BCE telemetry; NOT fed to the policy) ----------
         if self._belief_maps is not None:
             out["belief_maps"] = self._belief_maps.copy()
         else:
@@ -1401,54 +1478,7 @@ class PursuitEnv(ParallelEnv):
                  self.belief_grid_size, self.belief_grid_size),
                 dtype=np.float32,
             )
-
-        # Obstacle positions in (x, y, r) form.
-        if self._obstacle_pos is not None and len(self._obstacle_pos) > 0:
-            out["obstacle_positions"] = np.concatenate([
-                self._obstacle_pos,
-                self._obstacle_r.reshape(-1, 1),
-            ], axis=1).astype(np.float32)
-        else:
-            out["obstacle_positions"] = np.zeros((0, 3), dtype=np.float32)
-
-        # Ground-truth occupancy for the CTDE critic + diagnostic BCE.
         out["true_occupancy"] = self._true_occupancy()
-
-        # Ego-centric belief windows (Phase 4 v3).  Only included when
-        # belief_window_size > 0.  Downstream: actor consumes
-        # ``belief_windows`` in place of ``belief_maps``; belief_maps
-        # is still returned for the diagnostic BCE + the CTDE critic
-        # can still see it if needed.
-        if self.belief_window_size > 0 and self._belief_maps is not None:
-            out["belief_windows"] = self._extract_belief_windows(
-                self.belief_window_size,
-            )
-
-        # Belief-map peak detections (Phase 4 v5.3).  Top-K cells with
-        # highest P per UAV, as (dx, dy, conf) triples.  Two channels:
-        #   - belief_peaks_enemy    : from log-odds channel 0
-        #     (K = n_red -- one detection slot per real target)
-        #   - belief_peaks_obstacle : from log-odds channel 1
-        #     (K = n_obstacles -- one slot per real obstacle)
-        # Both come from the noisy Bayesian belief map -- consistent
-        # sensor-physics story.  The former ``obstacle_positions``
-        # ground-truth field is deliberately NOT consumed by the
-        # actor, only kept in the obs for logging / diagnostics.
-        if self._belief_maps is not None:
-            out["belief_peaks_enemy"] = self._extract_belief_peaks(
-                self.n_red, channel_idx=0,
-            )
-            # Obstacles: ensure we always emit at least 1 slot even
-            # in the n_obstacles=0 case so downstream tensor shapes
-            # stay consistent within a training run.  The confidence
-            # channel signals "nothing here" when there are no real
-            # obstacles (P → 0 as sensor keeps observing "no obstacle").
-            n_obs_peaks = max(1, self.n_obstacles)
-            if self._belief_maps.shape[1] >= 2:
-                out["belief_peaks_obstacle"] = self._extract_belief_peaks(
-                    n_obs_peaks, channel_idx=1,
-                )
-
         return out
 
     def structured_partial_observation(self) -> Dict[str, np.ndarray]:

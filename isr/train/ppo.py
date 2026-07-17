@@ -334,29 +334,22 @@ def ppo_update_stage4(
     target_kl:      float = None,
 ) -> Dict[str, float]:
     """
-    Stage 4 (v5.3) PPO update.  Same clipped-objective PPO as
-    ``ppo_update_ctde``.  The minibatch carries the full Stage 4
-    schema — graph-side keys (blue_features, bb_edge_features,
-    red_features, velocity-only rb_edge_features, rb_edge_visible),
-    belief-side keys (belief_maps, belief_peaks_enemy,
-    belief_peaks_obstacle), and true_occupancy for the critic — which
-    are reassembled into partial_obs / full_state here and forwarded
-    to ``policy.get_action_and_value``.
-
-    Also logs a diagnostic BCE(sigmoid(fused belief), true_occupancy)
-    — a no-gradient metric that measures how well the classical
-    Bayesian log-odds fusion is approximating the ground truth.  Two
-    variants: per-UAV mean, and log-odds-summed team belief.  Both are
-    detached; no signal flows into the policy from these.
+    Stage 4 (v6) PPO update.  Same clipped-objective PPO as
+    ``ppo_update_ctde``.  Each minibatch carries the full v6 obs schema
+    (belief-derived actor keys + ``true_*`` critic keys); it is split
+    into ``partial_obs`` / ``full_state`` via ``split_stage4_obs`` and
+    forwarded to ``policy.get_action_and_value``.  No CNN, no BCE
+    diagnostic — the belief map is consumed only inside the env to
+    build the graph.
     """
+    from isr.agents.gnn_stage4_policy import split_stage4_obs
+
     metrics = {
         "policy_loss":     0.0,
         "value_loss":      0.0,
         "entropy":         0.0,
         "approx_kl":       0.0,
         "clip_frac":       0.0,
-        "per_uav_bce":     0.0,
-        "fused_bce":       0.0,
         "n_minibatches":   0,
         "n_epochs_run":    0,
     }
@@ -365,27 +358,7 @@ def ppo_update_stage4(
         epoch_kl_sum = 0.0
         epoch_mb_count = 0
         for batch in buffer.iter_minibatches(mb_size):
-            partial_obs = {
-                "blue_features":    batch["blue_features"],
-                "bb_edge_features": batch["bb_edge_features"],
-                "belief_maps":      batch["belief_maps"],
-            }
-            # If ego-centric windows are stored, expose them so the
-            # actor's belief encoder uses them in place of the global
-            # belief_maps (see GNNStage4Policy.actor_encode).
-            if "belief_windows" in batch:
-                partial_obs["belief_windows"] = batch["belief_windows"]
-            # v5: red-side branch (visibility-gated intercept signal).
-            # v5.3: two-channel belief peaks (enemy + obstacle).
-            for k in ("red_features", "rb_edge_features", "rb_edge_visible",
-                      "belief_peaks_enemy", "belief_peaks_obstacle"):
-                if k in batch:
-                    partial_obs[k] = batch[k]
-            full_state = {
-                "blue_features":    batch["blue_features"],
-                "bb_edge_features": batch["bb_edge_features"],
-                "true_occupancy":   batch["true_occupancy"],
-            }
+            partial_obs, full_state = split_stage4_obs(batch)
             old_actions   = batch["actions"]
             old_log_probs = batch["log_probs"]
             old_values    = batch["values"]
@@ -426,21 +399,7 @@ def ppo_update_stage4(
             nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
             optimizer.step()
 
-            # Diagnostic BCE — no gradient, just observability.  Only
-            # computed on the Bayesian channels (first 2 of belief_maps)
-            # since true_occupancy is always 2-channel.
             with torch.no_grad():
-                bm = batch["belief_maps"][:, :, :2, :, :]   # (mb, A, 2, H, W)
-                truth = batch["true_occupancy"].unsqueeze(1) \
-                          .expand_as(bm)                    # (mb, A, 2, H, W)
-                per_uav_bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                    bm, truth,
-                )
-                fused = bm.sum(dim=1)                       # log-odds addition
-                fused_bce = torch.nn.functional.binary_cross_entropy_with_logits(
-                    fused, batch["true_occupancy"],
-                )
-
                 approx_kl = ((ratio - 1.0) - log_ratio).mean().item()
                 clip_frac = ((ratio - 1.0).abs() > clip_eps).float().mean().item()
                 metrics["policy_loss"]  += policy_loss.item()
@@ -448,8 +407,6 @@ def ppo_update_stage4(
                 metrics["entropy"]      += (-entropy_loss).item()
                 metrics["approx_kl"]    += approx_kl
                 metrics["clip_frac"]    += clip_frac
-                metrics["per_uav_bce"]  += per_uav_bce.item()
-                metrics["fused_bce"]    += fused_bce.item()
                 metrics["n_minibatches"] += 1
                 epoch_kl_sum   += approx_kl
                 epoch_mb_count += 1
@@ -460,7 +417,6 @@ def ppo_update_stage4(
                 break
 
     n = max(metrics["n_minibatches"], 1)
-    for k in ("policy_loss", "value_loss", "entropy", "approx_kl",
-              "clip_frac", "per_uav_bce", "fused_bce"):
+    for k in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_frac"):
         metrics[k] /= n
     return metrics
