@@ -1231,6 +1231,61 @@ class PursuitEnv(ParallelEnv):
                 if 0 <= cx < W and 0 <= cy < H:
                     self._belief_maps[i, 3, cx, cy] = 1.0
 
+    def _extract_belief_peaks(self, K: int) -> np.ndarray:
+        """
+        Vectorised top-K peak extraction from each UAV's belief map
+        channel 0.  Returns per-detection (rel_dx, rel_dy, P_conf)
+        triples in normalised units.
+
+        Rationale: v5.1 showed the CNN can't extract usable position
+        info from the belief-map tensor.  Explicit peak detection is
+        what real ISR trackers do -- output a list of tracks with
+        (position, confidence).  The peaks are still noisy (they
+        inherit the belief map's noise), so the sensor-physics story
+        holds; we just give the policy a more digestible form.
+
+        Returns
+        -------
+        peaks : (N_blue, K, 3) float32
+          Channels: (dx / arena_size, dy / arena_size, sigmoid(log_odds))
+          dx, dy are relative from the UAV to the peak cell centre.
+        """
+        assert self._belief_maps is not None
+        L = self.arena_size
+        cs = self.belief_cell_size
+        H = W = self.belief_grid_size
+
+        # Channel 0 = P(enemy) in log-odds; sigmoid to get [0, 1].
+        enemy_lo = self._belief_maps[:, 0, :, :]
+        enemy_p  = 1.0 / (1.0 + np.exp(-enemy_lo))
+        flat = enemy_p.reshape(self.n_blue, -1)              # (N, H*W)
+
+        # Top-K per UAV (vectorised across UAVs).
+        if flat.shape[1] <= K:
+            topk_idx = np.tile(np.arange(flat.shape[1]),
+                                (self.n_blue, 1))[:, :K]
+        else:
+            topk_idx = np.argpartition(flat, -K, axis=1)[:, -K:]
+
+        topk_vals = np.take_along_axis(flat, topk_idx, axis=1)  # (N, K)
+        # Sort each row in descending value order.
+        order = np.argsort(-topk_vals, axis=1)
+        topk_idx  = np.take_along_axis(topk_idx,  order, axis=1)
+        topk_vals = np.take_along_axis(topk_vals, order, axis=1)
+
+        # Flat index -> (cx, cy).
+        cx = topk_idx // W                                    # (N, K)
+        cy = topk_idx %  W
+        # Cell centres in world coords.
+        px = (cx.astype(np.float32) + 0.5) * cs
+        py = (cy.astype(np.float32) + 0.5) * cs
+        # Relative to each UAV.
+        dx = (px - self._blue_pos[:, 0:1]) / L                # (N, K)
+        dy = (py - self._blue_pos[:, 1:2]) / L
+
+        out = np.stack([dx, dy, topk_vals.astype(np.float32)], axis=-1)
+        return out.astype(np.float32)
+
     def _extract_belief_windows(self, K: int) -> np.ndarray:
         """
         Ego-centric KxK crop of each UAV's belief map centred on that
@@ -1343,6 +1398,14 @@ class PursuitEnv(ParallelEnv):
             out["belief_windows"] = self._extract_belief_windows(
                 self.belief_window_size,
             )
+
+        # Belief-map peak detections (Phase 4 v5.2).  Top-K cells with
+        # highest P(enemy) per UAV, as (dx, dy, conf) triples.  Gives
+        # the policy explicit position estimates the CNN couldn't
+        # produce reliably.  K = n_red by convention (one detection
+        # slot per real target).
+        if self._belief_maps is not None:
+            out["belief_peaks"] = self._extract_belief_peaks(self.n_red)
 
         return out
 

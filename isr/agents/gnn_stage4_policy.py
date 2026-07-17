@@ -131,11 +131,11 @@ class BeliefEncoder(nn.Module):
                                 stride=1, padding=1))
         layers.append(nn.ReLU(inplace=True))
         layers.append(nn.Conv2d(16, 32, kernel_size=3,
-                                stride=2, padding=1))
+                                stride=1, padding=1))
         layers.append(nn.ReLU(inplace=True))
         if grid_size > 17:
             layers.append(nn.Conv2d(32, 32, kernel_size=3,
-                                    stride=2, padding=1))
+                                    stride=1, padding=1))
             layers.append(nn.ReLU(inplace=True))
         self.convs = nn.Sequential(*layers)
         self.act = nn.ReLU(inplace=True)
@@ -285,6 +285,13 @@ class GNNStage4Policy(nn.Module):
         red_feat_dim:          int   = 1,
         rb_edge_feat_dim:      int   = 4,
         red_msg_dim:           int   = 64,
+        # ----- Belief peak branch (Stage 4 v5.2) --------------------
+        # Top-K (dx, dy, confidence) peaks per UAV, extracted from the
+        # belief map.  Gives the policy explicit position estimates
+        # that the CNN couldn't reliably produce.  n_belief_peaks
+        # defaults to n_red; peak_msg_dim controls the encoder output.
+        n_belief_peaks:        int   = 3,
+        peak_msg_dim:          int   = 32,
     ) -> None:
         """
         Args:
@@ -342,8 +349,22 @@ class GNNStage4Policy(nn.Module):
         self.register_buffer("rb_src", rb_src.long(), persistent=False)
         self.register_buffer("rb_dst", rb_dst.long(), persistent=False)
 
-        # Actor node feature dim: base blue + optional hidden + belief + red context.
-        actor_node_feat_dim = blue_feat_dim + belief_encoder_out_dim + red_msg_dim
+        # ---- Belief peak encoder (Stage 4 v5.2) --------------------------
+        # Explicit (dx, dy, confidence) triples per UAV, top-K per belief
+        # map.  Encoded per-peak by a small MLP, then sum-aggregated so
+        # each UAV gets a fixed-size peak-context vector.
+        self.n_belief_peaks = n_belief_peaks
+        self.peak_msg_dim   = peak_msg_dim
+        self.peak_encoder = _mlp(3, [peak_msg_dim], peak_msg_dim)
+
+        # Actor node feature dim: blue + optional hidden + belief_cnn
+        # + red_context + peak_context.
+        actor_node_feat_dim = (
+            blue_feat_dim
+            + belief_encoder_out_dim
+            + red_msg_dim
+            + peak_msg_dim
+        )
         if use_hidden_in_gnn:
             actor_node_feat_dim += d_hidden
 
@@ -466,11 +487,25 @@ class GNNStage4Policy(nn.Module):
                 device=belief_emb.device, dtype=belief_emb.dtype,
             )
 
+        # Belief peak context (v5.2).  Encode each of the top-K peaks
+        # and sum-aggregate per UAV.  Zero fallback if not present.
+        if "belief_peaks" in partial_obs:
+            peaks = partial_obs["belief_peaks"]           # (B, N_blue, K, 3)
+            peak_emb = self.peak_encoder(peaks)           # (B, N_blue, K, D)
+            peak_ctx = peak_emb.sum(dim=2)                # (B, N_blue, D)
+        else:
+            B = partial_obs["blue_features"].shape[0]
+            peak_ctx = torch.zeros(
+                B, self.n_blue, self.peak_msg_dim,
+                device=belief_emb.device, dtype=belief_emb.dtype,
+            )
+
         parts = [partial_obs["blue_features"]]
         if self.use_hidden_in_gnn:
             parts.append(hidden)
         parts.append(belief_emb)
         parts.append(red_ctx)
+        parts.append(peak_ctx)
         blue_input = torch.cat(parts, dim=-1)
         return self.actor_encoder(blue_input, partial_obs["bb_edge_features"])
 

@@ -22,7 +22,7 @@ STAGE1_DEFAULTS = {
     # which feeds the PPO buffer.  16 * 256 * 3 = 12 288 transitions per
     # rollout in the default config.
     "n_envs":         16,
-    "rollout_steps":  256,
+    "rollout_steps":  300,
 
     # ----- PPO -----------------------------------------------------------
     "n_rollouts":     1000,        # total PPO updates

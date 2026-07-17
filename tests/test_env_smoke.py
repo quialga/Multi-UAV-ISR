@@ -774,6 +774,8 @@ def test_stage4_obs_dict_schema():
         "obstacle_positions", "true_occupancy",
         # v5 red-side.
         "red_features", "rb_edge_features", "rb_edge_visible",
+        # v5.2 belief peak detections.
+        "belief_peaks",
     }
     assert set(obs.keys()) == expected_keys
     assert obs["blue_features"].shape    == (5, 8)
@@ -785,6 +787,29 @@ def test_stage4_obs_dict_schema():
     # v5.1: rb_edges are velocity-only, 4-D (not 7-D full geometry).
     assert obs["rb_edge_features"].shape == (env.n_rb_edges, 4)
     assert obs["rb_edge_visible"].shape  == (env.n_rb_edges,)
+
+
+def test_stage4_belief_peaks_shape_and_ordering():
+    """
+    v5.2 belief peaks: (N_blue, K, 3) with K = n_red, confidence
+    monotonically non-increasing across the K slots (peaks sorted).
+    """
+    env = _stage4_env()
+    env.reset(seed=0)
+    # Plant three peaks of decreasing strength in UAV 0's belief map.
+    env._belief_maps[0, 0, 10, 10] = 5.0    # highest
+    env._belief_maps[0, 0, 20, 20] = 3.0
+    env._belief_maps[0, 0, 30, 30] = 1.5
+    obs = env.structured_belief_observation()
+    peaks = obs["belief_peaks"]
+    assert peaks.shape == (env.n_blue, env.n_red, 3)
+    # UAV 0's top-3 confidences must be monotonically non-increasing.
+    confs = peaks[0, :, 2]
+    assert confs[0] >= confs[1] >= confs[2], (
+        f"peak confidences not sorted: {confs}"
+    )
+    # Highest confidence peak should be near sigmoid(5) ~ 0.993.
+    assert confs[0] > 0.99
 
 
 def test_stage4_rb_edges_are_velocity_only_no_position_leak():

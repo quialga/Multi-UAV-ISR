@@ -402,6 +402,15 @@ class Stage4RolloutBuffer:
             self.rb_edge_features = None
             self.rb_edge_visible  = None
 
+        # v5.2 belief peak detections per UAV (top-K = n_red).
+        if self.n_red > 0:
+            self.belief_peaks = torch.zeros(
+                (self.T, self.E, self.A, self.n_red, 3),
+                dtype=torch.float32, device=device,
+            )
+        else:
+            self.belief_peaks = None
+
         # Agent-level tensors.
         self.actions   = torch.zeros((self.T, self.E, self.A, self.action_dim),
                                      dtype=torch.float32, device=device)
@@ -439,6 +448,8 @@ class Stage4RolloutBuffer:
         red_features:     torch.Tensor = None,
         rb_edge_features_v5: torch.Tensor = None,
         rb_edge_visible:  torch.Tensor = None,
+        # v5.2 belief peaks
+        belief_peaks:     torch.Tensor = None,
     ) -> None:
         assert self.ptr < self.T, "Buffer full — call reset() between rollouts."
         if self.belief_windows is not None:
@@ -451,6 +462,9 @@ class Stage4RolloutBuffer:
             self.red_features[self.ptr]     = red_features
             self.rb_edge_features[self.ptr] = rb_edge_features_v5
             self.rb_edge_visible[self.ptr]  = rb_edge_visible
+        if self.belief_peaks is not None:
+            assert belief_peaks is not None
+            self.belief_peaks[self.ptr] = belief_peaks
         self.blue_features[self.ptr]    = blue_features
         self.bb_edge_features[self.ptr] = bb_edge_features
         self.belief_maps[self.ptr]      = belief_maps
@@ -526,6 +540,11 @@ class Stage4RolloutBuffer:
             )
             flat_rv = self.rb_edge_visible.reshape(N, self.n_rb_edges)
 
+        # v5.2 belief peaks flat view.
+        flat_bp = None
+        if self.belief_peaks is not None:
+            flat_bp = self.belief_peaks.reshape(N, self.A, self.n_red, 3)
+
         perm = torch.randperm(N, device=self.device)
         for start in range(0, N, mb_size):
             idx = perm[start:start + mb_size]
@@ -547,4 +566,6 @@ class Stage4RolloutBuffer:
                 out["red_features"]     = flat_rf[idx]
                 out["rb_edge_features"] = flat_rb[idx]
                 out["rb_edge_visible"]  = flat_rv[idx]
+            if flat_bp is not None:
+                out["belief_peaks"] = flat_bp[idx]
             yield out

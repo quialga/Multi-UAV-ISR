@@ -373,7 +373,10 @@ def ppo_update_stage4(
             if "belief_windows" in batch:
                 partial_obs["belief_windows"] = batch["belief_windows"]
             # v5: red-side branch (visibility-gated intercept signal).
-            for k in ("red_features", "rb_edge_features", "rb_edge_visible"):
+            # v5.2: also forward belief_peaks (top-K position detections
+            # from the belief map).
+            for k in ("red_features", "rb_edge_features", "rb_edge_visible",
+                      "belief_peaks"):
                 if k in batch:
                     partial_obs[k] = batch[k]
             full_state = {

@@ -343,8 +343,9 @@ def main() -> None:
                 partial_obs["belief_windows"] = _to_device(
                     obs_np["belief_windows"], device,
                 )
-            # v5 red-side branch.
-            for k in ("red_features", "rb_edge_features", "rb_edge_visible"):
+            # v5 red-side branch + v5.2 belief peaks.
+            for k in ("red_features", "rb_edge_features", "rb_edge_visible",
+                      "belief_peaks"):
                 if k in obs_np:
                     partial_obs[k] = _to_device(obs_np[k], device)
             full_state = {
@@ -375,6 +376,7 @@ def main() -> None:
                 red_features        = partial_obs.get("red_features", None),
                 rb_edge_features_v5 = partial_obs.get("rb_edge_features", None),
                 rb_edge_visible     = partial_obs.get("rb_edge_visible", None),
+                belief_peaks        = partial_obs.get("belief_peaks", None),
             )
 
             done_t = torch.from_numpy(done_np).to(device).view(-1, 1, 1)
