@@ -57,9 +57,13 @@ STAGE4_DEFAULTS = {
     "warm_start_critic": None,
 
     # ----- Aux loss ------------------------------------------------------
-    # Off for the Stage 4 baseline (design §6).  Diagnostic BCE logged
-    # to TensorBoard but no gradient flows through the actor path.
-    "aux_hidden_coef":   0.0,
-    "freeze_critic":     False,
-    "use_hidden_in_gnn": True,     # Stage 3 opt-1 hidden-in-GNN kept on
+    # v6.2: aux hidden loss ported from Stage 3 (opt-C, live critic
+    # target).  MSE(actor_h_blue, critic_h_blue.detach()) encourages the
+    # actor's GNN embedding (from noisy belief-derived positions) to
+    # match the critic's (from ground truth).  Stage 3 landed on 0.1
+    # for live-critic; 0.2 needed freeze-critic (which requires warm
+    # start, not available in v6).
+    "aux_hidden_coef":   0.1,
+    "freeze_critic":     False,     # not supported in v6 (cold start)
+    "use_hidden_in_gnn": True,      # Stage 3 opt-1 hidden-in-GNN kept on
 }

@@ -94,6 +94,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--gamma",          type=float, default=d["gamma"])
     p.add_argument("--gae-lambda",     type=float, default=d["gae_lambda"])
     p.add_argument("--target-kl",      type=float, default=d["target_kl"])
+    p.add_argument("--aux-hidden-coef", type=float,
+                   default=d.get("aux_hidden_coef", 0.0),
+                   help="MSE(actor_h_blue, critic_h_blue.detach()) "
+                        "coefficient.  0 disables.  Stage 3 opt-C used 0.1.")
     # LR schedule
     p.add_argument("--lr-schedule",    default=d.get("lr_schedule", "linear"),
                    choices=("constant", "linear"))
@@ -316,7 +320,8 @@ def main() -> None:
             partial_obs, full_state = split_stage4_obs(obs_t)
 
             with torch.no_grad():
-                action_t, log_p_t, _, value_t, new_hidden = \
+                (action_t, log_p_t, _, value_t, new_hidden,
+                 _actor_hb, _critic_hb) = \
                     policy.get_action_and_value(partial_obs, full_state, hidden)
             action_np = action_t.cpu().numpy().astype(np.float32)
 
@@ -342,22 +347,23 @@ def main() -> None:
         with torch.no_grad():
             last_obs_t = {k: _to_device(v, device) for k, v in obs_np.items()}
             _, last_full_state = split_stage4_obs(last_obs_t)
-            last_value = policy.critic_forward(last_full_state)
+            last_value, _ = policy.critic_forward(last_full_state)
         buffer.compute_gae(last_value, args.gamma, args.gae_lambda)
 
         update_metrics = ppo_update_stage4(
-            policy         = policy,
-            optimizer      = optimizer,
-            buffer         = buffer,
-            clip_eps       = args.clip_eps,
-            ent_coef       = args.ent_coef,
-            vf_coef        = args.vf_coef,
-            max_grad_norm  = args.max_grad_norm,
-            n_epochs       = args.n_epochs,
-            mb_size        = args.mb_size,
-            value_clip     = STAGE4_DEFAULTS["value_clip"],
-            normalize_adv  = STAGE4_DEFAULTS["normalize_adv"],
-            target_kl      = target_kl_arg,
+            policy          = policy,
+            optimizer       = optimizer,
+            buffer          = buffer,
+            clip_eps        = args.clip_eps,
+            ent_coef        = args.ent_coef,
+            vf_coef         = args.vf_coef,
+            max_grad_norm   = args.max_grad_norm,
+            n_epochs        = args.n_epochs,
+            mb_size         = args.mb_size,
+            value_clip      = STAGE4_DEFAULTS["value_clip"],
+            normalize_adv   = STAGE4_DEFAULTS["normalize_adv"],
+            target_kl       = target_kl_arg,
+            aux_hidden_coef = args.aux_hidden_coef,
         )
 
         ep_stats = vec_env.recent_episode_stats()
@@ -366,6 +372,8 @@ def main() -> None:
             sps = global_step / max(elapsed, 1e-6)
             lr_str = (f"  lr={cur_lr:.2e}"
                       if args.lr_schedule != "constant" else "")
+            aux_str = (f"  aux={update_metrics['aux_hidden_loss']:.3f}"
+                       if args.aux_hidden_coef > 0 else "")
             log(
                 f"[rollout {rollout+1:>4d}/{args.n_rollouts}]  "
                 f"steps={global_step:>9d}  sps={sps:>6.0f}  "
@@ -377,7 +385,7 @@ def main() -> None:
                 f"kl={update_metrics['approx_kl']:.4f}  "
                 f"clip={update_metrics['clip_frac']:.3f}  "
                 f"eps={update_metrics['n_epochs_run']}"
-                f"{lr_str}"
+                f"{aux_str}{lr_str}"
             )
 
         writer.add_scalar("rollout/mean_return", ep_stats["mean_return"], global_step)
@@ -390,6 +398,9 @@ def main() -> None:
         writer.add_scalar("ppo/clip_frac",    update_metrics["clip_frac"],    global_step)
         writer.add_scalar("ppo/n_epochs_run", update_metrics["n_epochs_run"], global_step)
         writer.add_scalar("ppo/lr",           cur_lr,                         global_step)
+        if args.aux_hidden_coef > 0:
+            writer.add_scalar("ppo/aux_hidden_loss",
+                              update_metrics["aux_hidden_loss"], global_step)
 
         # Best-ckpt tracking.
         n_completed = int(ep_stats.get("n_completed", 0))

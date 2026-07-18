@@ -380,7 +380,13 @@ class GNNStage4Policy(nn.Module):
         self,
         partial_obs: Dict[str, torch.Tensor],
         hidden:      torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns (mean, log_std_expanded, new_hidden, h_blue_pre_gru).
+
+        ``h_blue_pre_gru`` is the actor GNN's per-blue node embedding
+        BEFORE the GRUCell — the target for the aux hidden loss
+        (Stage 3 pattern, ported into v6).
+        """
         h_blue, _, _ = self.actor_encode(partial_obs, hidden)
         B = h_blue.shape[0]
         d = self.d_hidden
@@ -392,21 +398,30 @@ class GNNStage4Policy(nn.Module):
 
         mean    = self.actor_mean(new_hidden)
         log_std = self.actor_log_std.view(1, 1, -1).expand_as(mean)
-        return mean, log_std, new_hidden
+        return mean, log_std, new_hidden, h_blue
 
-    def critic_forward(
+    def critic_encode(
         self,
         full_state: Dict[str, torch.Tensor],
-    ) -> torch.Tensor:
-        h_blue, h_red, h_obs = self.critic_encoder(
+    ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        """Run the critic GNN on ground-truth features (no visibility
+        masks — CTDE full state).  Returns (h_blue, h_red, h_obs)."""
+        return self.critic_encoder(
             full_state["blue_features"],
             full_state["red_features"],
             full_state["bb_edge_features"],
             full_state["rb_edge_features"],
             obs_feats     = full_state.get("obstacle_features"),
             ob_edge_feats = full_state.get("ob_edge_features"),
-            # No masks — critic sees full state.
         )
+
+    def critic_forward(
+        self,
+        full_state: Dict[str, torch.Tensor],
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Returns (V, h_blue).  The h_blue is the target for the aux
+        hidden loss."""
+        h_blue, h_red, h_obs = self.critic_encode(full_state)
         B = h_blue.shape[0]
         blue_summary = h_blue.sum(dim=1)                  # (B, d)
         red_summary  = h_red.reshape(B, -1)               # (B, N_red * d)
@@ -415,7 +430,7 @@ class GNNStage4Policy(nn.Module):
             parts.append(h_obs.reshape(B, -1))            # (B, N_obs * d)
         state_repr = torch.cat(parts, dim=-1)
         value = self.critic_head(self.critic_trunk(state_repr)).squeeze(-1)
-        return value
+        return value, h_blue
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #
@@ -427,9 +442,17 @@ class GNNStage4Policy(nn.Module):
         full_state:  Dict[str, torch.Tensor],
         hidden:      torch.Tensor,
         action:      Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-        mean, log_std, new_hidden = self.actor_forward(partial_obs, hidden)
-        value = self.critic_forward(full_state)
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor,
+               torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Returns
+            (action, log_prob, entropy, value, new_hidden,
+             actor_h_blue, critic_h_blue)
+        The last two are pre-GRU / post-GNN per-blue embeddings, used
+        by the aux hidden loss (Stage 3 opt-C).  Consumers that don't
+        need aux can simply discard them.
+        """
+        mean, log_std, new_hidden, actor_h_blue = self.actor_forward(partial_obs, hidden)
+        value, critic_h_blue = self.critic_forward(full_state)
 
         std = log_std.exp()
         dist = Normal(mean, std)
@@ -437,7 +460,8 @@ class GNNStage4Policy(nn.Module):
             action = dist.sample()
         log_prob = dist.log_prob(action).sum(-1)   # (B, N_blue)
         entropy  = dist.entropy().sum(-1)          # (B, N_blue)
-        return action, log_prob, entropy, value, new_hidden
+        return (action, log_prob, entropy, value, new_hidden,
+                actor_h_blue, critic_h_blue)
 
     @torch.no_grad()
     def act_deterministic(
@@ -445,7 +469,7 @@ class GNNStage4Policy(nn.Module):
         partial_obs: Dict[str, torch.Tensor],
         hidden:      torch.Tensor,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        mean, _, new_hidden = self.actor_forward(partial_obs, hidden)
+        mean, _, new_hidden, _ = self.actor_forward(partial_obs, hidden)
         return mean, new_hidden
 
     def initial_hidden(self, n_envs: int, device: torch.device) -> torch.Tensor:

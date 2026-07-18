@@ -320,27 +320,32 @@ def ppo_update_ctde(
 
 def ppo_update_stage4(
     policy,
-    optimizer:      torch.optim.Optimizer,
-    buffer:         Stage4RolloutBuffer,
+    optimizer:       torch.optim.Optimizer,
+    buffer:          Stage4RolloutBuffer,
     *,
-    clip_eps:       float,
-    ent_coef:       float,
-    vf_coef:        float,
-    max_grad_norm:  float,
-    n_epochs:       int,
-    mb_size:        int,
-    value_clip:     bool  = True,
-    normalize_adv:  bool  = True,
-    target_kl:      float = None,
+    clip_eps:        float,
+    ent_coef:        float,
+    vf_coef:         float,
+    max_grad_norm:   float,
+    n_epochs:        int,
+    mb_size:         int,
+    value_clip:      bool  = True,
+    normalize_adv:   bool  = True,
+    target_kl:       float = None,
+    aux_hidden_coef: float = 0.0,
 ) -> Dict[str, float]:
     """
     Stage 4 (v6) PPO update.  Same clipped-objective PPO as
     ``ppo_update_ctde``.  Each minibatch carries the full v6 obs schema
     (belief-derived actor keys + ``true_*`` critic keys); it is split
     into ``partial_obs`` / ``full_state`` via ``split_stage4_obs`` and
-    forwarded to ``policy.get_action_and_value``.  No CNN, no BCE
-    diagnostic — the belief map is consumed only inside the env to
-    build the graph.
+    forwarded to ``policy.get_action_and_value``.
+
+    Optional aux hidden loss (Stage 3 opt-C, ported):
+        L_aux = MSE(actor_h_blue, critic_h_blue.detach())
+    encourages the actor's per-blue GNN embedding (from belief-derived
+    noisy positions) to match the critic's (from ground truth).  Only
+    active when ``aux_hidden_coef > 0``; live-critic target (no freeze).
     """
     from isr.agents.gnn_stage4_policy import split_stage4_obs
 
@@ -350,6 +355,7 @@ def ppo_update_stage4(
         "entropy":         0.0,
         "approx_kl":       0.0,
         "clip_frac":       0.0,
+        "aux_hidden_loss": 0.0,
         "n_minibatches":   0,
         "n_epochs_run":    0,
     }
@@ -369,7 +375,8 @@ def ppo_update_stage4(
             if normalize_adv:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-            _, new_log_probs, entropy, new_values, _ = \
+            (_, new_log_probs, entropy, new_values, _,
+             actor_h_blue, critic_h_blue) = \
                 policy.get_action_and_value(
                     partial_obs, full_state, hidden, action=old_actions,
                 )
@@ -394,6 +401,11 @@ def ppo_update_stage4(
             entropy_loss = -entropy.mean()
             loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
 
+            if aux_hidden_coef > 0.0:
+                aux_loss = ((actor_h_blue - critic_h_blue.detach()) ** 2).mean()
+                loss = loss + aux_hidden_coef * aux_loss
+                metrics["aux_hidden_loss"] += aux_loss.item()
+
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(policy.parameters(), max_grad_norm)
@@ -417,6 +429,7 @@ def ppo_update_stage4(
                 break
 
     n = max(metrics["n_minibatches"], 1)
-    for k in ("policy_loss", "value_loss", "entropy", "approx_kl", "clip_frac"):
+    for k in ("policy_loss", "value_loss", "entropy", "approx_kl",
+              "clip_frac", "aux_hidden_loss"):
         metrics[k] /= n
     return metrics
