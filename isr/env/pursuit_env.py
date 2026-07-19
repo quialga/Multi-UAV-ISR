@@ -134,6 +134,12 @@ class PursuitEnv(ParallelEnv):
         p_FP:                     float = 0.15,
         ray_step_size:            float = 2.5,
         belief_window_size:       int   = 0,   # 0 = ego-centric windows disabled
+        # ----- Phase A: Bayesian prediction step on the enemy channel -----
+        # Both default OFF (1.0 / 0.0) so pre-Phase-A behaviour is
+        # byte-preserved unless explicitly enabled (stage4 config
+        # enables them).
+        enemy_belief_decay:       float = 1.0,   # gamma; < 1 = forgetting
+        enemy_belief_diffusion:   float = 0.0,   # p_move; > 0 = motion spread
     ):
         """
         sensor_radius: Stage 3 partial-observability knob.  When None
@@ -176,6 +182,17 @@ class PursuitEnv(ParallelEnv):
                                    observable (the analytic segment-disk
                                    test cuts the ray this far before the
                                    cell centre).
+        enemy_belief_decay         Phase A forgetting factor gamma for the
+                                   enemy channel: L <- gamma * L each step
+                                   before the sensor update.  1.0 = off.
+                                   Pulls stale evidence (both signs)
+                                   toward log-odds 0 = "unknown".
+        enemy_belief_diffusion     Phase A motion-model spread p_move:
+                                   the fraction of each cell's probability
+                                   mass that moves to its 8 neighbours per
+                                   step (isotropic random-walk prediction,
+                                   applied in PROBABILITY space via a 3x3
+                                   convolution).  0.0 = off.
         """
         super().__init__()
         self.n_blue         = int(n_blue)
@@ -202,6 +219,11 @@ class PursuitEnv(ParallelEnv):
         self.p_FP                     = float(p_FP)
         self.ray_step_size            = float(ray_step_size)
         self.belief_window_size       = int(belief_window_size)
+        # Phase A prediction-step knobs (enemy channel only).
+        self.enemy_belief_decay       = float(enemy_belief_decay)
+        self.enemy_belief_diffusion   = float(enemy_belief_diffusion)
+        assert 0.0 < self.enemy_belief_decay <= 1.0
+        assert 0.0 <= self.enemy_belief_diffusion < 1.0
         # Derived quantities.
         self.belief_cell_size = self.arena_size / max(1, self.belief_grid_size)
         # Log-odds evidence constants — same for both channels in v1.
@@ -1122,6 +1144,90 @@ class PursuitEnv(ParallelEnv):
         blocked = intersects & (t2 > 0.0) & (t1 < t_cut[:, None])
         return np.any(blocked, axis=1)                     # (K,)
 
+    def _predict_enemy_belief(self) -> None:
+        """
+        Phase A Bayesian PREDICTION step on the enemy channel (channel
+        0) of the global belief map.  Runs before the sensor update so
+        each step is a proper predict -> update cycle.
+
+        Two components, both enemy-channel-only (obstacles are static:
+        their prediction is identity, so channel 1 is never touched):
+
+        1. DECAY (temporal forgetting):  L <- gamma * L.
+           Pulls all log-odds toward 0 (= P 0.5 = "unknown").  Stale
+           positive peaks fade (ghost tracks die), and saturated
+           negatives relax (previously-"cleared" regions become
+           re-acquirable — the enemy could have moved in since).
+
+        2. DIFFUSION (isotropic random-walk motion model).  The
+           prediction equation b'(i) = sum_j P(i|j) b(j) is LINEAR IN
+           PROBABILITY, not in log-odds, so we convert:
+               P = sigmoid(L)  ->  P' = K * P  ->  L = logit(P')
+           with a 3x3 kernel derived from p_move
+           (= enemy_belief_diffusion):
+               centre       1 - p_move
+               4-orthogonal p_move * 0.20 each
+               4-diagonal   p_move * 0.05 each
+           Border handling: edge-replicate padding (the target cannot
+           leave the arena; reflecting mass at the walls).
+
+        Effect over unobserved time: a peak fades in confidence while
+        spreading into a widening blob around the last sighting —
+        the same qualitative behaviour as a full Bayes filter's prior
+        under an unknown-heading motion model.
+        """
+        if self._belief_maps is None:
+            return
+        gamma  = self.enemy_belief_decay
+        p_move = self.enemy_belief_diffusion
+        if gamma >= 1.0 and p_move <= 0.0:
+            return
+
+        L = self._belief_maps[0]
+
+        if gamma < 1.0:
+            L *= gamma
+
+        if p_move > 0.0:
+            # Log-odds -> probability (clamped for logit stability).
+            P = 1.0 / (1.0 + np.exp(-L))
+            # 3x3 convolution via padded shifts (no scipy dependency).
+            Pp = np.pad(P, 1, mode="edge")
+            centre = 1.0 - p_move
+            w_orth = p_move * 0.20
+            w_diag = p_move * 0.05
+            P_new = (
+                centre * Pp[1:-1, 1:-1]
+                + w_orth * (Pp[:-2, 1:-1] + Pp[2:, 1:-1]
+                            + Pp[1:-1, :-2] + Pp[1:-1, 2:])
+                + w_diag * (Pp[:-2, :-2] + Pp[:-2, 2:]
+                            + Pp[2:, :-2] + Pp[2:, 2:])
+            )
+            eps = 1e-6
+            P_new = np.clip(P_new, eps, 1.0 - eps)
+            L[:] = np.log(P_new / (1.0 - P_new))
+
+        np.clip(L, -self.belief_clip, self.belief_clip, out=L)
+
+    def belief_track_error(self) -> float:
+        """
+        Diagnostic: mean distance (metres) from each extracted enemy
+        peak to the nearest ACTIVE red.  Measures how well the belief
+        map is tracking vs lagging the true targets.  Returns NaN when
+        no reds are active or the belief map is disabled.
+        """
+        if self._belief_maps is None:
+            return float("nan")
+        active = np.where(self._red_active)[0]
+        if len(active) == 0:
+            return float("nan")
+        n_peaks = min(self.n_red, int(len(active)))
+        peak_pos, _conf = self._extract_belief_peaks(n_peaks, channel_idx=0)
+        d = np.linalg.norm(
+            peak_pos[:, None, :] - self._red_pos[active][None, :, :], axis=-1,
+        )                                   # (n_peaks, n_active)
+        return float(d.min(axis=1).mean())
+
     def _update_belief_maps(self) -> None:
         """
         Vectorised Bayesian log-odds update on the GLOBAL fused belief
@@ -1146,6 +1252,12 @@ class PursuitEnv(ParallelEnv):
         """
         if self._belief_maps is None or self.sensor_radius is None:
             return
+
+        # Phase A: predict -> update.  Prediction (decay + diffusion on
+        # the enemy channel) runs BEFORE the sensor evidence so each
+        # step is a proper Bayes-filter cycle.  No-op when both knobs
+        # are at their off defaults.
+        self._predict_enemy_belief()
 
         R  = self.sensor_radius
         centres = self._cell_centres                # (W, H, 2)  cached at reset

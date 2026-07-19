@@ -828,6 +828,94 @@ def test_stage4_v6_obstacle_edges_static_velocity():
     )
 
 
+def test_stage4_phaseA_off_by_default():
+    """
+    With the env defaults (decay=1.0, diffusion=0.0) the prediction
+    step must be a byte-exact no-op — pre-Phase-A behaviour preserved.
+    """
+    env = _stage4_env(n_obstacles=0)
+    env.reset(seed=0)
+    env._belief_maps[0, 10, 10] = 6.0
+    env._belief_maps[0, 5, 20]  = -4.0
+    before = env._belief_maps.copy()
+    env._predict_enemy_belief()
+    assert np.array_equal(env._belief_maps, before)
+
+
+def test_stage4_phaseA_decay_fades_stale_evidence():
+    """
+    Pure decay (no diffusion): unobserved evidence of BOTH signs must
+    fade geometrically toward log-odds 0 ("unknown").
+    """
+    env = _stage4_env(n_obstacles=0, enemy_belief_decay=0.97,
+                      enemy_belief_diffusion=0.0)
+    env.reset(seed=0)
+    # Park every blue in the far corner so the planted cells are
+    # outside all sensor disks (no evidence updates on them).
+    for b in range(env.n_blue):
+        env._blue_pos[b] = np.array([3.0, 3.0], dtype=np.float32)
+    env._belief_maps[:] = 0.0
+    env._belief_maps[0, 25, 25] = 6.0     # stale ghost, ~(127.5, 127.5)
+    env._belief_maps[0, 20, 25] = -8.0    # stale "cleared" region
+
+    for _ in range(10):
+        env._update_belief_maps()
+
+    ghost   = float(env._belief_maps[0, 25, 25])
+    cleared = float(env._belief_maps[0, 20, 25])
+    assert ghost == pytest.approx(6.0 * 0.97 ** 10, rel=1e-4), (
+        f"ghost decayed to {ghost}, expected {6.0 * 0.97**10:.3f}"
+    )
+    assert cleared == pytest.approx(-8.0 * 0.97 ** 10, rel=1e-4)
+    # Direction sanity: both moved TOWARD 0, neither crossed it.
+    assert 0.0 < ghost < 6.0
+    assert -8.0 < cleared < 0.0
+
+
+def test_stage4_phaseA_diffusion_spreads_peak():
+    """
+    Pure diffusion: one prediction pass must lower an isolated peak
+    and raise its neighbours above the background (mass spreads),
+    conserving total probability for an interior peak on a uniform
+    background.
+    """
+    env = _stage4_env(n_obstacles=0, enemy_belief_decay=1.0,
+                      enemy_belief_diffusion=0.4)
+    env.reset(seed=0)
+    env._belief_maps[:] = 0.0             # uniform background P = 0.5
+    env._belief_maps[0, 13, 13] = 6.0     # isolated interior peak
+
+    P_before = 1.0 / (1.0 + np.exp(-env._belief_maps[0]))
+    env._predict_enemy_belief()
+    P_after = 1.0 / (1.0 + np.exp(-env._belief_maps[0]))
+
+    # Peak fell, orthogonal neighbour rose above background.
+    assert env._belief_maps[0, 13, 13] < 6.0
+    assert env._belief_maps[0, 12, 13] > 0.0
+    # Approximate mass conservation (interior peak, uniform borders).
+    assert abs(P_before.sum() - P_after.sum()) < 1e-3
+
+
+def test_stage4_belief_track_error_small_when_peak_on_red():
+    """
+    Plant a dominant peak at a red's true cell -> track error must be
+    sub-cell (< 5 m at 5 m cells).
+    """
+    env = _stage4_env(n_obstacles=0)
+    env.reset(seed=0)
+    cs = env.belief_cell_size
+    env._belief_maps[0][:] = -5.0
+    # One dominant peak per red — the extractor pulls n_red peaks, so
+    # every slot must correspond to a real track for the error to be
+    # sub-cell.
+    for r in range(env.n_red):
+        pos = env._red_pos[r]
+        env._belief_maps[0, int(pos[0] / cs), int(pos[1] / cs)] = 8.0
+    err = env.belief_track_error()
+    assert not np.isnan(err)
+    assert err < 5.0, f"track error {err:.2f} m should be sub-cell"
+
+
 def test_stage4_v61_occlusion_exact_catches_grazing_chord():
     """
     The analytic segment-disk test must flag a GRAZING ray whose chord

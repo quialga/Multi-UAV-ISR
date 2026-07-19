@@ -80,6 +80,13 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--p-tp",             type=float, default=d["p_TP"])
     p.add_argument("--p-fp",             type=float, default=d["p_FP"])
     p.add_argument("--ray-step-size",    type=float, default=d["ray_step_size"])
+    # Phase A prediction step (enemy channel).
+    p.add_argument("--enemy-belief-decay", type=float,
+                   default=d.get("enemy_belief_decay", 1.0),
+                   help="Forgetting factor gamma (1.0 = off).")
+    p.add_argument("--enemy-belief-diffusion", type=float,
+                   default=d.get("enemy_belief_diffusion", 0.0),
+                   help="Motion-model spread p_move (0.0 = off).")
     # PPO
     p.add_argument("--n-envs",         type=int,   default=d["n_envs"])
     p.add_argument("--rollout-steps",  type=int,   default=d["rollout_steps"])
@@ -203,6 +210,8 @@ def main() -> None:
         p_TP                    = args.p_tp,
         p_FP                    = args.p_fp,
         ray_step_size           = args.ray_step_size,
+        enemy_belief_decay      = args.enemy_belief_decay,
+        enemy_belief_diffusion  = args.enemy_belief_diffusion,
     )
 
     # Red policy mix parsing.
@@ -367,6 +376,14 @@ def main() -> None:
         )
 
         ep_stats = vec_env.recent_episode_stats()
+
+        # Belief tracking diagnostic: mean peak-to-true-red distance (m)
+        # across envs.  Directly measures whether the belief map is
+        # tracking or lagging the targets.
+        _errs = [e.belief_track_error() for e in vec_env.envs]
+        _errs = [t for t in _errs if not np.isnan(t)]
+        track_err = float(np.mean(_errs)) if _errs else float("nan")
+
         if (rollout + 1) % args.log_interval == 0:
             elapsed = time.time() - t_start
             sps = global_step / max(elapsed, 1e-6)
@@ -384,7 +401,8 @@ def main() -> None:
                 f"ent={update_metrics['entropy']:.3f}  "
                 f"kl={update_metrics['approx_kl']:.4f}  "
                 f"clip={update_metrics['clip_frac']:.3f}  "
-                f"eps={update_metrics['n_epochs_run']}"
+                f"eps={update_metrics['n_epochs_run']}  "
+                f"trk={track_err:5.1f}m"
                 f"{aux_str}{lr_str}"
             )
 
@@ -401,6 +419,8 @@ def main() -> None:
         if args.aux_hidden_coef > 0:
             writer.add_scalar("ppo/aux_hidden_loss",
                               update_metrics["aux_hidden_loss"], global_step)
+        if not np.isnan(track_err):
+            writer.add_scalar("belief/track_error_m", track_err, global_step)
 
         # Best-ckpt tracking.
         n_completed = int(ep_stats.get("n_completed", 0))

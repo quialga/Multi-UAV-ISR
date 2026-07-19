@@ -31,6 +31,18 @@ STAGE4_DEFAULTS = {
     "belief_channels":     2,
     "belief_clip":         10.0,   # log-odds clip
 
+    # ----- Phase A: Bayesian prediction step (enemy channel) -------------
+    # Each env step runs predict -> update on the enemy channel:
+    #   decay:     L <- gamma * L   (stale evidence -> "unknown";
+    #              ghost tracks fade, cleared regions re-acquirable)
+    #   diffusion: p_move of each cell's probability mass spreads to its
+    #              8 neighbours (isotropic random-walk motion model,
+    #              applied in probability space).
+    # Obstacle channel untouched (static -> prediction = identity).
+    # Set 1.0 / 0.0 to recover pre-Phase-A behaviour exactly.
+    "enemy_belief_decay":     0.97,
+    "enemy_belief_diffusion": 0.4,
+
     # ----- Sensor model --------------------------------------------------
     "p_TP":                0.85,
     "p_FP":                0.15,
@@ -63,7 +75,7 @@ STAGE4_DEFAULTS = {
     # match the critic's (from ground truth).  Stage 3 landed on 0.1
     # for live-critic; 0.2 needed freeze-critic (which requires warm
     # start, not available in v6).
-    "aux_hidden_coef":   0.1,
+    "aux_hidden_coef":   0.0,
     "freeze_critic":     False,     # not supported in v6 (cold start)
     "use_hidden_in_gnn": True,      # Stage 3 opt-1 hidden-in-GNN kept on
 }
