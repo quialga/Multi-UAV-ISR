@@ -430,6 +430,12 @@ class PursuitEnv(ParallelEnv):
             # Zero velocities of newly caught reds (cosmetic, but
             # keeps the obs clean).
             self._red_vel[newly_caught] = 0.0
+            # A confirmed capture is a perfect observation: wipe the
+            # dead target's belief blob so the peak extractor cannot
+            # re-latch onto its stale evidence.
+            if (self.use_belief_maps and self._belief_maps is not None
+                    and n_caught_this_step > 0):
+                self._clear_enemy_belief_at(self._red_pos[newly_caught])
         self._last_n_caught = n_caught_this_step
 
         # 6. Reward — see docs/design.md §3.7.
@@ -1209,6 +1215,30 @@ class PursuitEnv(ParallelEnv):
 
         np.clip(L, -self.belief_clip, self.belief_clip, out=L)
 
+    def _clear_enemy_belief_at(self, positions: np.ndarray) -> None:
+        """
+        Reset the enemy-channel belief to log-odds 0 ("unknown") in a
+        disk around each given position.
+
+        Called on capture: a confirmed kill is a perfect observation —
+        the dead target's stale blob must not survive to re-capture a
+        track slot in the peak extractor.  We reset to UNKNOWN rather
+        than negative because the capture says nothing about OTHER
+        reds moving through the same area later.
+
+        Clear radius = capture_radius + 2 cells (the blob may have
+        diffused wider than the capture point).
+        """
+        if self._belief_maps is None or positions.shape[0] == 0:
+            return
+        clear_r = self.capture_radius + 2.0 * self.belief_cell_size
+        d = np.linalg.norm(
+            self._cell_centres[:, :, None, :]
+            - positions[None, None, :, :], axis=-1,
+        )                                   # (W, H, n_pos)
+        mask = np.any(d <= clear_r, axis=-1)
+        self._belief_maps[0][mask] = 0.0
+
     def belief_track_error(self) -> float:
         """
         Diagnostic: mean distance (metres) from each extracted enemy
@@ -1221,11 +1251,17 @@ class PursuitEnv(ParallelEnv):
         active = np.where(self._red_active)[0]
         if len(active) == 0:
             return float("nan")
-        n_peaks = min(self.n_red, int(len(active)))
-        peak_pos, _conf = self._extract_belief_peaks(n_peaks, channel_idx=0)
+        n_act = int(len(active))
+        peak_pos, conf = self._extract_belief_peaks(
+            n_act, channel_idx=0, k_extract=n_act, nms_radius_cells=2,
+        )
+        real = conf > 0.0
+        if not np.any(real):
+            return float("nan")
         d = np.linalg.norm(
-            peak_pos[:, None, :] - self._red_pos[active][None, :, :], axis=-1,
-        )                                   # (n_peaks, n_active)
+            peak_pos[real][:, None, :] - self._red_pos[active][None, :, :],
+            axis=-1,
+        )                                   # (n_real, n_active)
         return float(d.min(axis=1).mean())
 
     def _update_belief_maps(self) -> None:
@@ -1314,35 +1350,58 @@ class PursuitEnv(ParallelEnv):
         )
 
     def _extract_belief_peaks(
-        self, K: int, channel_idx: int = 0,
+        self,
+        K: int,
+        channel_idx: int = 0,
+        k_extract: Optional[int] = None,
+        nms_radius_cells: int = 2,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Top-K peak extraction from one channel of the GLOBAL fused
-        belief map.
+        Peak extraction with greedy NON-MAXIMUM SUPPRESSION from one
+        channel of the GLOBAL fused belief map.
 
-        Explicit peak detection is what real ISR trackers output — a
-        list of tracks with (position, confidence).  The peaks are
-        noisy (they inherit the belief map's sensor noise), so the
-        sensor-physics story holds; the policy just gets a digestible
-        form.  With the shared map, K matches the true entity count
-        (n_red enemy slots, n_obstacles obstacle slots) and the SAME
-        peaks are seen by every blue — one common track picture.
+        Two fixes over the naive top-K-cells version:
+
+        1. NMS: after picking the highest cell, all cells within
+           ``nms_radius_cells`` (Chebyshev) of it are suppressed before
+           picking the next.  Without this, the 2nd/3rd highest cells
+           are almost always NEIGHBOURS of the same strong blob
+           (especially with Phase A diffusion widening blobs), so one
+           well-tracked target could eat every slot and mask the
+           others.  One blob -> one track.
+
+        2. Known entity count: only ``k_extract`` real peaks are
+           extracted; the remaining ``K - k_extract`` slots are PADDED
+           with confidence 0 (downstream, zero-confidence slots get
+           zeroed edges and vis 0 — the Stage 3 caught-red
+           convention).  The team legitimately knows how many enemies
+           remain: it performed the captures itself.
 
         Parameters
         ----------
         K : int
-          Number of peaks to extract.
+          Total slot count (fixed tensor shape: n_red / n_obstacles).
         channel_idx : int
           0 = P(enemy), 1 = P(obstacle).
+        k_extract : int, optional
+          Number of REAL peaks to extract (e.g. number of still-active
+          reds).  Defaults to K.
+        nms_radius_cells : int
+          Chebyshev suppression radius, in cells.
 
         Returns
         -------
         peak_pos : (K, 2) float32 — peak cell centres in WORLD coords
-        conf     : (K,)   float32 — sigmoid(log_odds) at each peak,
-          sorted descending.
+          (padded slots hold (0, 0), but their conf is 0 so consumers
+          gate them out).
+        conf     : (K,)   float32 — sigmoid(log_odds) per slot, real
+          peaks sorted descending, padded slots 0.
         """
         assert self._belief_maps is not None
         assert 0 <= channel_idx < self._belief_maps.shape[0]
+        if k_extract is None:
+            k_extract = K
+        k_extract = max(0, min(int(k_extract), K))
         cs = self.belief_cell_size
         H = W = self.belief_grid_size
 
@@ -1350,22 +1409,27 @@ class PursuitEnv(ParallelEnv):
         chan_p  = 1.0 / (1.0 + np.exp(-chan_lo))
         flat = chan_p.reshape(-1)                           # (H*W,)
 
-        if flat.shape[0] <= K:
-            topk_idx = np.arange(flat.shape[0])[:K]
-        else:
-            topk_idx = np.argpartition(flat, -K)[-K:]
-        topk_vals = flat[topk_idx]
-        order = np.argsort(-topk_vals)
-        topk_idx  = topk_idx[order]
-        topk_vals = topk_vals[order]
+        peak_pos = np.zeros((K, 2), dtype=np.float32)
+        conf     = np.zeros((K,),   dtype=np.float32)
 
-        cx = topk_idx // W
-        cy = topk_idx %  W
-        peak_pos = np.stack([
-            (cx.astype(np.float32) + 0.5) * cs,
-            (cy.astype(np.float32) + 0.5) * cs,
-        ], axis=-1)                                          # (K, 2)
-        return peak_pos.astype(np.float32), topk_vals.astype(np.float32)
+        if k_extract > 0:
+            order = np.argsort(-flat)                       # desc
+            picked_cells: list = []
+            for idx in order:
+                cx = int(idx) // W
+                cy = int(idx) %  W
+                if any(max(abs(cx - px), abs(cy - py)) <= nms_radius_cells
+                       for (px, py) in picked_cells):
+                    continue
+                s = len(picked_cells)
+                peak_pos[s, 0] = (cx + 0.5) * cs
+                peak_pos[s, 1] = (cy + 0.5) * cs
+                conf[s] = flat[idx]
+                picked_cells.append((cx, cy))
+                if len(picked_cells) == k_extract:
+                    break
+
+        return peak_pos, conf
 
     def _attach_enemy_velocity(self, blue_idx: int, peak_pos: np.ndarray) -> np.ndarray:
         """
@@ -1437,6 +1501,11 @@ class PursuitEnv(ParallelEnv):
                 # static: src_vel stays 0.
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
+        # Padded (dead / unextracted) slots have conf 0: zero their edge
+        # features too so no garbage geometry leaks even though the
+        # visibility gate already nulls their messages — the Stage 3
+        # caught-red convention.
+        edge_feat[edge_vis <= 0.0] = 0.0
         node_feat = conf.reshape(K, 1).astype(np.float32)
         return node_feat, edge_feat, edge_vis
 
@@ -1530,9 +1599,14 @@ class PursuitEnv(ParallelEnv):
         }
 
         # ---- Actor belief-derived enemy graph (shared track picture) -----
+        # Only extract as many tracks as there are STILL-ACTIVE reds —
+        # the team performed the captures, so the remaining count is
+        # known over TDL.  Dead slots are conf-0 padded (zeroed edges).
         if self._belief_maps is not None:
             enemy_pos, enemy_conf = self._extract_belief_peaks(
                 self.n_red, channel_idx=0,
+                k_extract=int(self._red_active.sum()),
+                nms_radius_cells=2,
             )
         else:
             enemy_pos  = np.zeros((self.n_red, 2), dtype=np.float32)
@@ -1547,8 +1621,14 @@ class PursuitEnv(ParallelEnv):
         # ---- Obstacle graph (only when obstacles are configured) ---------
         if self.n_obstacles > 0:
             if self._belief_maps is not None and self.belief_channels >= 2:
+                # Obstacles: slots for the configured count, real peaks
+                # for the PLACED count; wider NMS (blobs are larger).
+                placed = (0 if self._obstacle_pos is None
+                          else len(self._obstacle_pos))
                 obs_pos, obs_conf = self._extract_belief_peaks(
                     self.n_obstacles, channel_idx=1,
+                    k_extract=placed,
+                    nms_radius_cells=3,
                 )
             else:
                 obs_pos  = np.zeros((self.n_obstacles, 2), dtype=np.float32)

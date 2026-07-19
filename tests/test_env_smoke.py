@@ -904,16 +904,95 @@ def test_stage4_belief_track_error_small_when_peak_on_red():
     env = _stage4_env(n_obstacles=0)
     env.reset(seed=0)
     cs = env.belief_cell_size
+    # Space the reds well apart so the extractor's NMS (2-cell radius)
+    # keeps one track per target.
+    env._red_pos = np.array(
+        [[20.0, 20.0], [65.0, 110.0], [110.0, 30.0]], dtype=np.float32,
+    )
     env._belief_maps[0][:] = -5.0
-    # One dominant peak per red — the extractor pulls n_red peaks, so
-    # every slot must correspond to a real track for the error to be
-    # sub-cell.
+    # One dominant peak per red — every slot must correspond to a real
+    # track for the error to be sub-cell.
     for r in range(env.n_red):
         pos = env._red_pos[r]
         env._belief_maps[0, int(pos[0] / cs), int(pos[1] / cs)] = 8.0
     err = env.belief_track_error()
     assert not np.isnan(err)
     assert err < 5.0, f"track error {err:.2f} m should be sub-cell"
+
+
+def test_stage4_peak_nms_separates_blobs():
+    """
+    One strong DIFFUSE blob must yield exactly ONE track; the second
+    slot must go to a distant weaker peak, not to the strong blob's
+    neighbour cell.  This was the "clustering" bug: without NMS the
+    top-K cells all came from the same blob and masked other targets.
+    """
+    env = _stage4_env(n_obstacles=0)
+    env.reset(seed=0)
+    env._belief_maps[0][:] = -5.0
+    # Strong blob around (10, 10): centre + neighbours all higher than
+    # the distant weak peak.
+    env._belief_maps[0, 10, 10] = 8.0
+    env._belief_maps[0, 10, 11] = 7.5
+    env._belief_maps[0, 11, 10] = 7.4
+    # Distant weaker target.
+    env._belief_maps[0, 20, 20] = 4.0
+
+    peak_pos, conf = env._extract_belief_peaks(
+        2, channel_idx=0, k_extract=2, nms_radius_cells=2,
+    )
+    cs = env.belief_cell_size
+    cells = {(int(p[0] / cs), int(p[1] / cs)) for p in peak_pos}
+    assert (10, 10) in cells, "strongest blob centre must be track 0"
+    assert (20, 20) in cells, (
+        f"2nd track must be the distant target, got cells {cells} — "
+        "NMS failed to suppress the strong blob's neighbours"
+    )
+
+
+def test_stage4_dead_reds_free_no_track_slots():
+    """
+    After a capture, only n_active tracks are extracted; the dead
+    slot must be conf-0 padded with zeroed edges and zero visibility.
+    """
+    env = _stage4_env(n_obstacles=0)
+    env.reset(seed=0)
+    env._red_active[0] = False           # simulate one captured red
+    obs = env.structured_belief_observation()
+    conf = obs["red_features"][:, 0]     # (n_red,) node feat = conf
+    n_real = int((conf > 0.0).sum())
+    assert n_real == 2, f"expected 2 live tracks, got {n_real}"
+    # The padded slot is the LAST one (real peaks sorted desc first).
+    N = env.n_blue
+    dead = 2                              # slot index of the padded track
+    assert np.all(obs["rb_edge_visible"][dead * N:(dead + 1) * N] == 0.0)
+    assert np.all(obs["rb_edge_features"][dead * N:(dead + 1) * N] == 0.0)
+
+
+def test_stage4_capture_wipes_dead_targets_belief():
+    """
+    A capture must reset the enemy belief around the capture point to
+    log-odds 0 — the dead target's stale blob cannot re-capture a
+    track slot.
+    """
+    env = _stage4_env(n_obstacles=0)
+    env.reset(seed=0)
+    cs = env.belief_cell_size
+    # Engineer a certain capture: blue 0 on top of red 0.
+    env._red_pos[0]  = np.array([65.0, 65.0], dtype=np.float32)
+    env._blue_pos[0] = np.array([65.5, 65.0], dtype=np.float32)
+    cxi = int(65.0 / cs)
+    cyi = int(65.0 / cs)
+    env._belief_maps[0, cxi, cyi] = 9.0   # strong stale blob at the kill
+    actions = {a: np.zeros(2, dtype=np.float32) for a in env.agents}
+    env.step(actions)
+    assert not env._red_active[0], "red 0 should have been captured"
+    # The blob is gone (0 before this step's sensor pass could only
+    # have re-added bounded evidence; assert well below the planted 9).
+    assert env._belief_maps[0, cxi, cyi] < 3.0, (
+        f"stale blob survived the capture wipe: "
+        f"L={env._belief_maps[0, cxi, cyi]:.2f}"
+    )
 
 
 def test_stage4_v61_occlusion_exact_catches_grazing_chord():
