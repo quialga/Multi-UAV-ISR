@@ -1373,6 +1373,7 @@ class PursuitEnv(ParallelEnv):
         channel_idx: int = 0,
         k_extract: Optional[int] = None,
         nms_radius_cells: int = 2,
+        exclude_cells: Optional[list] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Peak extraction with greedy NON-MAXIMUM SUPPRESSION from one
@@ -1406,6 +1407,11 @@ class PursuitEnv(ParallelEnv):
           reds).  Defaults to K.
         nms_radius_cells : int
           Chebyshev suppression radius, in cells.
+        exclude_cells : list of (cx, cy), optional
+          Cells to pre-seed the suppression set with — peaks within
+          ``nms_radius_cells`` of any excluded cell are skipped.  Used
+          so belief (memory) peaks do not duplicate live detection
+          tracks whose reds are already occupying a slot.
 
         Returns
         -------
@@ -1432,100 +1438,193 @@ class PursuitEnv(ParallelEnv):
 
         if k_extract > 0:
             order = np.argsort(-flat)                       # desc
+            # Seed the suppression set with the excluded cells so their
+            # neighbourhoods are skipped (but they do NOT consume slots).
+            suppress = list(exclude_cells) if exclude_cells else []
             picked_cells: list = []
             for idx in order:
                 cx = int(idx) // W
                 cy = int(idx) %  W
                 if any(max(abs(cx - px), abs(cy - py)) <= nms_radius_cells
-                       for (px, py) in picked_cells):
+                       for (px, py) in suppress):
                     continue
                 s = len(picked_cells)
                 peak_pos[s, 0] = (cx + 0.5) * cs
                 peak_pos[s, 1] = (cy + 0.5) * cs
                 conf[s] = flat[idx]
                 picked_cells.append((cx, cy))
+                suppress.append((cx, cy))
                 if len(picked_cells) == k_extract:
                     break
 
         return peak_pos, conf
 
-    def _attach_enemy_measurement(
-        self, blue_idx: int, peak_pos: np.ndarray,
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    def _build_enemy_tracks(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Live-sensor measurement attachment for one enemy track, for
-        one observing blue.
+        Populate the K = n_red enemy track slots DETECTION-FIRST.
 
-        Doctrine (matches real ISR systems): the fused belief GRID is
-        the memory/situational-awareness layer — it carries tracks for
-        targets nobody currently sees, at cell resolution.  But when a
-        target IS inside a UAV's sensor envelope, the radar reports a
-        CONTINUOUS measurement: position with small Gaussian error
-        (``sensor_pos_noise_std``, ~1 m at close range) and Doppler
-        velocity.  Cell-centre quantisation (±3.5 m worst case on a
-        5 m grid) would otherwise make the 3 m-capture endgame
-        physically unreliable no matter how good the policy is.
+        Doctrine: a directly-observed target is the strongest, cleanest
+        signal — it must never wait on, or be filtered by, the memory
+        (belief-map) layer.  So:
 
-        Model: find the active red nearest the peak (track
-        association).  If that red is within ``sensor_radius`` of THIS
-        blue -> return (true position + N(0, sigma^2) noise, true
-        velocity).  Otherwise -> (the grid peak position, zero
-        velocity): memory only.
+        1. LIVE tracks — one slot per active red that ANY blue currently
+           sees, seeded directly from that red (fused measured position,
+           conf 1, backing red index known).  No peak->red association:
+           the slot IS the red.  This removes the many-to-one collapse,
+           the belief-map lag, and the NMS-collapse of visible targets.
+        2. MEMORY tracks — belief-map peaks for the reds NOBODY sees,
+           with the live-track cells excluded so a visible red's
+           residual blob cannot also spawn a phantom memory track.
+        3. Remaining slots stay conf 0 (dead / padding).
 
         Returns
         -------
-        (src_pos (2,), src_vel (2,)) for the rb edge.
+        track_pos : (K, 2) float32 — world position (measured for live,
+          cell centre for memory, (0,0) for padding).
+        track_conf: (K,)   float32 — 1.0 live, peak conf memory, 0 pad.
+        track_red : (K,)   int32   — backing red index for LIVE tracks,
+          -1 for memory / padding (never measured).
         """
-        zero_v = np.zeros(2, dtype=np.float32)
+        K = self.n_red
+        track_pos  = np.zeros((K, 2), dtype=np.float32)
+        track_conf = np.zeros((K,),   dtype=np.float32)
+        track_red  = np.full((K,), -1, dtype=np.int32)
+
         active = np.where(self._red_active)[0]
-        if len(active) == 0:
-            return peak_pos.astype(np.float32), zero_v
-        d = np.linalg.norm(self._red_pos[active] - peak_pos[None, :], axis=1)
-        r = int(active[int(np.argmin(d))])
-        if (self.sensor_radius is None
-                or np.linalg.norm(self._red_pos[r] - self._blue_pos[blue_idx])
-                <= self.sensor_radius):
+        if len(active) == 0 or self._belief_maps is None:
+            return track_pos, track_conf, track_red
+
+        # Which active reds does ANY blue currently see?
+        if self.sensor_radius is None:
+            vis_mask = np.ones(len(active), dtype=bool)
+        else:
+            d = np.linalg.norm(
+                self._red_pos[active][:, None, :]
+                - self._blue_pos[None, :, :], axis=-1,
+            )                                   # (n_active, n_blue)
+            vis_mask = d.min(axis=1) <= self.sensor_radius
+        vis_reds    = active[vis_mask]
+        unseen_reds = active[~vis_mask]
+
+        cs = self.belief_cell_size
+        slot = 0
+
+        # 1. Live tracks: fused measured position (true + noise).
+        for r in vis_reds:
+            if slot >= K:
+                break
             pos = self._red_pos[r].astype(np.float32)
             if self.sensor_pos_noise_std > 0.0:
                 pos = pos + self._rng.normal(
                     0.0, self.sensor_pos_noise_std, size=2,
                 ).astype(np.float32)
-            return pos, self._red_vel[r].astype(np.float32)
-        return peak_pos.astype(np.float32), zero_v
+            track_pos[slot]  = pos
+            track_conf[slot] = 1.0
+            track_red[slot]  = int(r)
+            slot += 1
 
-    def _belief_graph_from_peaks(
+        # 2. Memory tracks: belief peaks for the unseen reds, excluding
+        #    cells already claimed by live tracks.
+        n_mem = min(len(unseen_reds), K - slot)
+        if n_mem > 0:
+            exclude = [
+                (int(track_pos[s, 0] / cs), int(track_pos[s, 1] / cs))
+                for s in range(slot)
+            ]
+            peaks_pos, peaks_conf = self._extract_belief_peaks(
+                n_mem, channel_idx=0, k_extract=n_mem,
+                nms_radius_cells=2, exclude_cells=exclude,
+            )
+            for i in range(n_mem):
+                if peaks_conf[i] <= 0.0:
+                    continue
+                track_pos[slot]  = peaks_pos[i]
+                track_conf[slot] = peaks_conf[i]
+                track_red[slot]  = -1        # memory: never measured
+                slot += 1
+
+        return track_pos, track_conf, track_red
+
+    def _enemy_graph_from_tracks(
+        self,
+        track_pos:  np.ndarray,   # (K, 2)
+        track_conf: np.ndarray,   # (K,)
+        track_red:  np.ndarray,   # (K,) int; -1 = memory / pad
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Build the actor-side enemy node + edge features from the K
+        detection-seeded tracks.  Same 7-D edge layout / ordering as
+        ``_belief_graph_from_peaks`` (for s in K, for b in N).
+
+        Per (track s, blue b):
+        - live track (track_red[s] >= 0) and its red within b's sensor
+          range -> CONTINUOUS measurement (true pos + own noise sample,
+          Doppler velocity).
+        - live track but red out of b's range -> the fused track
+          position (heard over TDL) + zero velocity.
+        - memory / padding (track_red[s] < 0) -> track position (belief
+          cell centre or 0) + zero velocity.
+        """
+        N = self.n_blue
+        K = track_pos.shape[0]
+        n_edges = K * N
+
+        src_pos = np.zeros((n_edges, 2), dtype=np.float32)
+        src_vel = np.zeros((n_edges, 2), dtype=np.float32)
+        dst_pos = np.zeros((n_edges, 2), dtype=np.float32)
+        dst_vel = np.zeros((n_edges, 2), dtype=np.float32)
+        edge_vis = np.zeros((n_edges,), dtype=np.float32)
+
+        for s in range(K):
+            r = int(track_red[s])
+            for b in range(N):
+                e = s * N + b
+                dst_pos[e] = self._blue_pos[b]
+                dst_vel[e] = self._blue_vel[b]
+                edge_vis[e] = track_conf[s]
+                if r >= 0 and (
+                    self.sensor_radius is None
+                    or np.linalg.norm(self._red_pos[r] - self._blue_pos[b])
+                    <= self.sensor_radius
+                ):
+                    # This blue can see the backing red -> own measurement.
+                    pos = self._red_pos[r].astype(np.float32)
+                    if self.sensor_pos_noise_std > 0.0:
+                        pos = pos + self._rng.normal(
+                            0.0, self.sensor_pos_noise_std, size=2,
+                        ).astype(np.float32)
+                    src_pos[e] = pos
+                    src_vel[e] = self._red_vel[r]
+                else:
+                    # Memory / out-of-range: fused track position, no vel.
+                    src_pos[e] = track_pos[s]
+
+        edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
+        edge_feat[edge_vis <= 0.0] = 0.0     # zero padded/dead slots
+        node_feat = track_conf.reshape(K, 1).astype(np.float32)
+        return node_feat, edge_feat, edge_vis
+
+    def _obstacle_graph_from_peaks(
         self,
         peak_pos: np.ndarray,   # (K, 2) world coords (shared track picture)
         conf:     np.ndarray,   # (K,)   peak confidences
-        static:   bool,
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Build the actor-side node + edge features for one entity type
-        (enemy or obstacle) from the GLOBAL belief peaks.
-
-        Every blue sees the SAME K tracks (common operational picture);
-        only the edge geometry (rel_pos / range / bearing to each
-        blue) differs per blue.
-
-        static=True  -> obstacles: object velocity 0, so ``rel_vel``
-          is driven purely by the blue's own motion (an rb edge with
-          the sender velocity zeroed — the user-chosen convention).
-        static=False -> enemies: precise radar velocity attached when
-          the nearest active red is within sensor range of that blue.
-
-        Returns
-        -------
-        node_feat : (K, 1)  track confidence
-        edge_feat : (K * N_blue, 7)  same 7-D layout as bb/rb edges
-        edge_vis  : (K * N_blue,)    per-edge visibility = confidence
-          Edge ordering matches _build_xb_edges: for s in K, for b in N.
+        Actor-side OBSTACLE node + edge features from the global belief
+        peaks (channel 1).  Obstacles are static: object velocity 0, so
+        ``rel_vel`` is driven purely by the blue's own motion (an rb-
+        style edge with the sender velocity zeroed).  No live-sensor
+        refinement — a static obstacle's belief blob is stable, and its
+        exact position is not endgame-critical the way a moving target's
+        is.  Same 7-D layout / (s outer, b inner) ordering as the enemy
+        graph.
         """
         N = self.n_blue
         K = peak_pos.shape[0]
         n_edges = K * N
 
         src_pos = np.zeros((n_edges, 2), dtype=np.float32)
-        src_vel = np.zeros((n_edges, 2), dtype=np.float32)
+        src_vel = np.zeros((n_edges, 2), dtype=np.float32)   # static
         dst_pos = np.zeros((n_edges, 2), dtype=np.float32)
         dst_vel = np.zeros((n_edges, 2), dtype=np.float32)
         edge_vis = np.zeros((n_edges,), dtype=np.float32)
@@ -1537,20 +1636,8 @@ class PursuitEnv(ParallelEnv):
                 dst_pos[e] = self._blue_pos[b]
                 dst_vel[e] = self._blue_vel[b]
                 edge_vis[e] = conf[s]
-                if not static and conf[s] > 0.0:
-                    # Live-sensor refinement: continuous noisy position
-                    # + Doppler velocity when THIS blue can see the
-                    # associated red; grid peak + zero velocity else.
-                    src_pos[e], src_vel[e] = self._attach_enemy_measurement(
-                        b, peak_pos[s],
-                    )
-                # static (obstacles): src stays (peak, 0).
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
-        # Padded (dead / unextracted) slots have conf 0: zero their edge
-        # features too so no garbage geometry leaks even though the
-        # visibility gate already nulls their messages — the Stage 3
-        # caught-red convention.
         edge_feat[edge_vis <= 0.0] = 0.0
         node_feat = conf.reshape(K, 1).astype(np.float32)
         return node_feat, edge_feat, edge_vis
@@ -1644,21 +1731,13 @@ class PursuitEnv(ParallelEnv):
             "true_rb_edge_features": base["rb_edge_features"],
         }
 
-        # ---- Actor belief-derived enemy graph (shared track picture) -----
-        # Only extract as many tracks as there are STILL-ACTIVE reds —
-        # the team performed the captures, so the remaining count is
-        # known over TDL.  Dead slots are conf-0 padded (zeroed edges).
-        if self._belief_maps is not None:
-            enemy_pos, enemy_conf = self._extract_belief_peaks(
-                self.n_red, channel_idx=0,
-                k_extract=int(self._red_active.sum()),
-                nms_radius_cells=2,
-            )
-        else:
-            enemy_pos  = np.zeros((self.n_red, 2), dtype=np.float32)
-            enemy_conf = np.zeros((self.n_red,),   dtype=np.float32)
-        red_node, rb_edge, rb_vis = self._belief_graph_from_peaks(
-            enemy_pos, enemy_conf, static=False,
+        # ---- Actor enemy graph: DETECTION-SEEDED tracks ------------------
+        # Live tracks (visible reds) seeded directly from the sensor;
+        # remaining slots filled from belief-map memory peaks.  See
+        # _build_enemy_tracks.  Dead slots are conf-0 padded.
+        track_pos, track_conf, track_red = self._build_enemy_tracks()
+        red_node, rb_edge, rb_vis = self._enemy_graph_from_tracks(
+            track_pos, track_conf, track_red,
         )
         out["red_features"]    = red_node
         out["rb_edge_features"] = rb_edge
@@ -1679,8 +1758,8 @@ class PursuitEnv(ParallelEnv):
             else:
                 obs_pos  = np.zeros((self.n_obstacles, 2), dtype=np.float32)
                 obs_conf = np.zeros((self.n_obstacles,),   dtype=np.float32)
-            ob_node, ob_edge, ob_vis = self._belief_graph_from_peaks(
-                obs_pos, obs_conf, static=True,
+            ob_node, ob_edge, ob_vis = self._obstacle_graph_from_peaks(
+                obs_pos, obs_conf,
             )
             out["obstacle_features"] = ob_node
             out["ob_edge_features"]  = ob_edge

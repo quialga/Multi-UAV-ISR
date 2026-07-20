@@ -27,12 +27,17 @@ def run(disable_measurement: bool, n_eps: int = 10, max_steps: int = 350):
             red_policy=stationary_red, seed=100 + ep,
         )
         if disable_measurement:
-            # Force the memory path: pretend no red is ever visible so
-            # edges always carry the cell-centre peak (old behaviour).
-            env._attach_enemy_measurement = (
-                lambda b, peak: (peak.astype(np.float32),
-                                 np.zeros(2, dtype=np.float32))
-            )
+            # Force MEMORY-ONLY tracks: every slot is a belief-map peak
+            # (cell-centre position, no velocity, track_red = -1) -- the
+            # pre-detection-seeded, quantised endgame.
+            def _mem_only(_e=env):
+                n_act = int(_e._red_active.sum())
+                pos, conf = _e._extract_belief_peaks(
+                    _e.n_red, channel_idx=0, k_extract=n_act,
+                    nms_radius_cells=2,
+                )
+                return pos, conf, np.full(_e.n_red, -1, dtype=np.int32)
+            env._build_enemy_tracks = _mem_only
         env.reset(seed=100 + ep)
         N = env.n_blue
         L = env.arena_size

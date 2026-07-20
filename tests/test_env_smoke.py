@@ -782,9 +782,13 @@ def test_stage4_v6_rb_position_comes_from_belief_when_unseen():
     env.reset(seed=0)
     cs = env.belief_cell_size
     L = env.arena_size
-    # Blue 0 far from every red (> sensor 40 m) -> memory path only.
-    env._blue_pos[0] = np.array([10.0, 10.0], dtype=np.float32)
-    env._red_pos[:]  = np.array([120.0, 120.0], dtype=np.float32)
+    # Exactly one active red, and EVERY blue far from it (> 40 m) so it
+    # is a MEMORY track (belief peak), not a live detection.
+    env._red_active[:] = False
+    env._red_active[0] = True
+    env._red_pos[0] = np.array([120.0, 120.0], dtype=np.float32)
+    for b in range(env.n_blue):
+        env._blue_pos[b] = np.array([10.0, 10.0 + 3.0 * b], dtype=np.float32)
     env._belief_maps[:] = -5.0
     env._belief_maps[0, 20, 20] = 8.0   # dominant peak, cell centre (102.5, 102.5)
     obs = env.structured_belief_observation()
@@ -799,38 +803,46 @@ def test_stage4_v6_rb_position_comes_from_belief_when_unseen():
 
 def test_stage4_visible_red_gets_continuous_measurement():
     """
-    When THIS blue can see the track's associated red, its rb edge
-    carries the CONTINUOUS measured position (true pos + noise; exact
-    with sigma=0), not the cell-centre peak — sub-cell endgame
-    guidance.  A far-away blue keeps the quantised memory path.
+    For a LIVE (detection-seeded) track:
+    - the blue that SEES the red gets the continuous measured position
+      (true pos, sigma=0) AND its Doppler velocity;
+    - a blue OUT of range gets the same fused track position over TDL
+      (true pos, sigma=0) but ZERO velocity (no own Doppler).
+    Neither uses the cell-centre peak — the live red's position is
+    known to the whole team, at sub-cell precision.
     """
     env = _stage4_env(n_obstacles=0, sensor_pos_noise_std=0.0)
     env.reset(seed=0)
-    cs = env.belief_cell_size
     L = env.arena_size
-    # Red 0 deliberately OFF-CENTRE in its cell (cell (13,13) centre is
-    # (67.5, 67.5); the red sits 1.8 m away at the cell edge).
-    env._red_pos[0] = np.array([69.3, 67.5], dtype=np.float32)
-    env._red_pos[1] = np.array([5.0, 125.0], dtype=np.float32)
-    env._red_pos[2] = np.array([125.0, 5.0], dtype=np.float32)
-    env._blue_pos[0] = np.array([60.0, 60.0], dtype=np.float32)   # 10 m away
-    env._blue_pos[1] = np.array([5.0, 5.0], dtype=np.float32)     # ~90 m away
+    env._red_active[:] = False
+    env._red_active[0] = True
+    env._red_pos[0] = np.array([69.3, 67.5], dtype=np.float32)   # off cell centre
+    env._red_vel[0] = np.array([0.3, -0.2], dtype=np.float32)
+    env._blue_pos[0] = np.array([60.0, 60.0], dtype=np.float32)  # 10 m -> sees it
+    env._blue_pos[1] = np.array([5.0, 5.0], dtype=np.float32)    # ~90 m -> TDL only
+    env._blue_vel[:] = 0.0
     env._belief_maps[:] = -5.0
-    env._belief_maps[0, 13, 13] = 8.0    # track for red 0 at its cell
+    env._belief_maps[0, 13, 13] = 8.0    # residual blob (should be ignored)
 
     obs = env.structured_belief_observation()
     rb = obs["rb_edge_features"]
     N = env.n_blue
-    # Blue 0 (visible): edge (s=0, b=0) -> TRUE red position.
-    expected_meas = (env._blue_pos[0] - env._red_pos[0]) / L
-    assert np.allclose(rb[0 * N + 0, :2], expected_meas, atol=1e-4), (
-        "visible blue should get the continuous measurement"
+    v_max = 1.5   # BLUE_UAV.v_max (edge rel_vel normaliser)
+
+    # Blue 0 (sees red 0): true position + Doppler velocity.
+    e0 = 0 * N + 0
+    assert np.allclose(rb[e0, :2], (env._blue_pos[0] - env._red_pos[0]) / L, atol=1e-4)
+    # rel_vel = blue_vel - red_vel = -red_vel (blue stationary).
+    assert np.allclose(rb[e0, 2:4], (-env._red_vel[0]) / v_max, atol=1e-4), (
+        "seeing blue should get Doppler velocity"
     )
-    # Blue 1 (not visible): edge (s=0, b=1) -> cell-centre peak.
-    peak = np.array([67.5, 67.5], dtype=np.float32)
-    expected_peak = (env._blue_pos[1] - peak) / L
-    assert np.allclose(rb[0 * N + 1, :2], expected_peak, atol=1e-4), (
-        "non-visible blue should keep the grid-peak memory path"
+    # Blue 1 (TDL only): same true position, ZERO velocity.
+    e1 = 0 * N + 1
+    assert np.allclose(rb[e1, :2], (env._blue_pos[1] - env._red_pos[0]) / L, atol=1e-4), (
+        "out-of-range blue should get the fused track position over TDL"
+    )
+    assert np.allclose(rb[e1, 2:4], 0.0, atol=1e-6), (
+        "out-of-range blue has no own Doppler -> zero velocity"
     )
 
 
@@ -1031,6 +1043,98 @@ def test_stage4_capture_wipes_dead_targets_belief():
     assert env._belief_maps[0, cxi, cyi] < 3.0, (
         f"stale blob survived the capture wipe: "
         f"L={env._belief_maps[0, cxi, cyi]:.2f}"
+    )
+
+
+def test_stage4_detection_seeded_two_close_visible_reds_split():
+    """
+    Two visible reds within one NMS radius (~one cell apart) must get
+    TWO distinct live track slots — the belief-map NMS collapse that
+    would have merged them is bypassed because live tracks are seeded
+    directly from the sensor, not from belief peaks.
+    """
+    env = _stage4_env(n_obstacles=0)
+    env.reset(seed=0)
+    env._red_active[:] = False
+    env._red_active[:2] = True
+    # ~4 m apart (< one 5 m cell) and both within blue 0's 40 m sensor.
+    env._red_pos[0] = np.array([64.0, 65.0], dtype=np.float32)
+    env._red_pos[1] = np.array([68.0, 65.0], dtype=np.float32)
+    env._blue_pos[0] = np.array([65.0, 60.0], dtype=np.float32)
+    track_pos, track_conf, track_red = env._build_enemy_tracks()
+    live = track_red[track_red >= 0]
+    assert set(live.tolist()) == {0, 1}, (
+        f"two close visible reds must be two live tracks, got {track_red}"
+    )
+    assert (track_conf[:2] == 1.0).all()
+
+
+def test_stage4_detection_seed_beats_belief_lag():
+    """
+    A visible red with NO belief peak yet (belief map all-negative)
+    still gets a LIVE precise track — detection does not wait on the
+    memory layer.
+    """
+    env = _stage4_env(n_obstacles=0)
+    env.reset(seed=0)
+    env._red_active[:] = False
+    env._red_active[0] = True
+    env._red_pos[0]  = np.array([65.0, 65.0], dtype=np.float32)
+    env._blue_pos[0] = np.array([60.0, 60.0], dtype=np.float32)   # in range
+    env._belief_maps[:] = -8.0        # belief has NOT tracked red 0 yet
+    track_pos, track_conf, track_red = env._build_enemy_tracks()
+    assert track_red[0] == 0, "visible red should be a live track despite belief lag"
+    assert track_conf[0] == 1.0
+
+
+def test_stage4_unseen_red_is_memory_track():
+    """A red no blue can see -> memory slot (track_red -1) from a belief peak."""
+    env = _stage4_env(n_obstacles=0)
+    env.reset(seed=0)
+    cs = env.belief_cell_size
+    env._red_active[:] = False
+    env._red_active[0] = True
+    # Red far from every blue (> 40 m).
+    env._red_pos[0] = np.array([120.0, 120.0], dtype=np.float32)
+    for b in range(env.n_blue):
+        env._blue_pos[b] = np.array([10.0, 10.0], dtype=np.float32)
+    env._belief_maps[:] = -5.0
+    env._belief_maps[0, 22, 22] = 6.0    # memory peak
+    track_pos, track_conf, track_red = env._build_enemy_tracks()
+    assert track_red[0] == -1, "unseen red must be a memory track"
+    assert track_conf[0] > 0.5
+    peak = np.array([(22 + 0.5) * cs, (22 + 0.5) * cs], dtype=np.float32)
+    assert np.allclose(track_pos[0], peak, atol=1e-3)
+
+
+def test_stage4_live_track_excludes_memory_duplicate():
+    """
+    A visible red's residual belief blob must NOT also spawn a memory
+    track: with 1 visible + 1 unseen red, the visible red's cell is
+    excluded from memory-peak extraction.
+    """
+    env = _stage4_env(n_obstacles=0)
+    env.reset(seed=0)
+    cs = env.belief_cell_size
+    env._red_active[:] = False
+    env._red_active[:2] = True
+    env._red_pos[0]  = np.array([65.0, 65.0], dtype=np.float32)   # visible
+    env._blue_pos[0] = np.array([64.0, 64.0], dtype=np.float32)
+    env._red_pos[1]  = np.array([120.0, 120.0], dtype=np.float32) # unseen
+    for b in range(1, env.n_blue):
+        env._blue_pos[b] = np.array([10.0, 10.0], dtype=np.float32)
+    env._belief_maps[:] = -5.0
+    env._belief_maps[0, 13, 13] = 9.0    # strong blob at the VISIBLE red's cell
+    env._belief_maps[0, 22, 22] = 5.0    # weaker blob at the unseen red
+    track_pos, track_conf, track_red = env._build_enemy_tracks()
+    # Slot 0: live red 0.  Slot 1: memory, and it must be the (22,22)
+    # peak, NOT the excluded (13,13) blob.
+    assert track_red[0] == 0
+    assert track_red[1] == -1
+    mem_cell = (int(track_pos[1, 0] / cs), int(track_pos[1, 1] / cs))
+    assert mem_cell == (22, 22), (
+        f"memory track landed on {mem_cell}; the live red's blob at "
+        "(13,13) was not excluded"
     )
 
 
