@@ -92,6 +92,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Live-sensor position accuracy (m) for visible "
                         "targets; continuous measurement replaces the "
                         "cell-centre peak on that blue's rb edge.")
+    p.add_argument("--actor-oracle", action="store_true",
+                   help="DIAGNOSTIC: feed the actor the ground-truth "
+                        "graph (critic view) instead of belief-derived "
+                        "features.  Upper-bound run to isolate whether "
+                        "the belief pipeline or the RL setup is the "
+                        "bottleneck.")
     # PPO
     p.add_argument("--n-envs",         type=int,   default=d["n_envs"])
     p.add_argument("--rollout-steps",  type=int,   default=d["rollout_steps"])
@@ -332,7 +338,10 @@ def main() -> None:
             # Tensorise the whole v6 graph obs, then split into
             # actor / critic dicts.
             obs_t = {k: _to_device(v, device) for k, v in obs_np.items()}
-            partial_obs, full_state = split_stage4_obs(obs_t)
+            partial_obs, full_state = split_stage4_obs(
+                obs_t, actor_oracle=args.actor_oracle,
+                n_blue=vec_env.n_blue,
+            )
 
             with torch.no_grad():
                 (action_t, log_p_t, _, value_t, new_hidden,
@@ -379,6 +388,8 @@ def main() -> None:
             normalize_adv   = STAGE4_DEFAULTS["normalize_adv"],
             target_kl       = target_kl_arg,
             aux_hidden_coef = args.aux_hidden_coef,
+            actor_oracle    = args.actor_oracle,
+            n_blue          = vec_env.n_blue,
         )
 
         ep_stats = vec_env.recent_episode_stats()
