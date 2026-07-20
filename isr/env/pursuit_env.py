@@ -140,6 +140,10 @@ class PursuitEnv(ParallelEnv):
         # enables them).
         enemy_belief_decay:       float = 1.0,   # gamma; < 1 = forgetting
         enemy_belief_diffusion:   float = 0.0,   # p_move; > 0 = motion spread
+        # Live-sensor position accuracy (m) for VISIBLE targets: the rb
+        # edge of a blue that can see the associated red uses the true
+        # position + N(0, sigma^2) instead of the cell-centre grid peak.
+        sensor_pos_noise_std:     float = 1.0,
     ):
         """
         sensor_radius: Stage 3 partial-observability knob.  When None
@@ -192,7 +196,19 @@ class PursuitEnv(ParallelEnv):
                                    mass that moves to its 8 neighbours per
                                    step (isotropic random-walk prediction,
                                    applied in PROBABILITY space via a 3x3
-                                   convolution).  0.0 = off.
+                                   convolution).  0.0 = off.  Calibrate to
+                                   target kinematics: p_move ~
+                                   v_red_max * dt / cell_size.
+        sensor_pos_noise_std       Live-sensor position accuracy (m).
+                                   When a red is inside a blue's sensor
+                                   disk, that blue's rb edge uses the
+                                   TRUE position + N(0, sigma^2) instead
+                                   of the cell-centre grid peak — real
+                                   radar reports continuous measurements;
+                                   the grid is only the fusion/memory
+                                   layer.  Without this the endgame is
+                                   cell-quantised (up to 3.5 m error on a
+                                   5 m grid vs 3 m capture radius).
         """
         super().__init__()
         self.n_blue         = int(n_blue)
@@ -224,6 +240,8 @@ class PursuitEnv(ParallelEnv):
         self.enemy_belief_diffusion   = float(enemy_belief_diffusion)
         assert 0.0 < self.enemy_belief_decay <= 1.0
         assert 0.0 <= self.enemy_belief_diffusion < 1.0
+        self.sensor_pos_noise_std     = float(sensor_pos_noise_std)
+        assert self.sensor_pos_noise_std >= 0.0
         # Derived quantities.
         self.belief_cell_size = self.arena_size / max(1, self.belief_grid_size)
         # Log-odds evidence constants — same for both channels in v1.
@@ -1431,26 +1449,49 @@ class PursuitEnv(ParallelEnv):
 
         return peak_pos, conf
 
-    def _attach_enemy_velocity(self, blue_idx: int, peak_pos: np.ndarray) -> np.ndarray:
+    def _attach_enemy_measurement(
+        self, blue_idx: int, peak_pos: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Radar-velocity attachment for a belief-derived enemy detection.
+        Live-sensor measurement attachment for one enemy track, for
+        one observing blue.
 
-        The belief peak gives a (noisy) POSITION; Doppler radar gives
-        precise VELOCITY, but only for targets the UAV can actually
-        sense.  Model: attach the true velocity of the active red
-        nearest the peak, IF that red is within ``sensor_radius`` of
-        this UAV; otherwise the velocity is unknown -> 0.
+        Doctrine (matches real ISR systems): the fused belief GRID is
+        the memory/situational-awareness layer — it carries tracks for
+        targets nobody currently sees, at cell resolution.  But when a
+        target IS inside a UAV's sensor envelope, the radar reports a
+        CONTINUOUS measurement: position with small Gaussian error
+        (``sensor_pos_noise_std``, ~1 m at close range) and Doppler
+        velocity.  Cell-centre quantisation (±3.5 m worst case on a
+        5 m grid) would otherwise make the 3 m-capture endgame
+        physically unreliable no matter how good the policy is.
+
+        Model: find the active red nearest the peak (track
+        association).  If that red is within ``sensor_radius`` of THIS
+        blue -> return (true position + N(0, sigma^2) noise, true
+        velocity).  Otherwise -> (the grid peak position, zero
+        velocity): memory only.
+
+        Returns
+        -------
+        (src_pos (2,), src_vel (2,)) for the rb edge.
         """
+        zero_v = np.zeros(2, dtype=np.float32)
         active = np.where(self._red_active)[0]
         if len(active) == 0:
-            return np.zeros(2, dtype=np.float32)
+            return peak_pos.astype(np.float32), zero_v
         d = np.linalg.norm(self._red_pos[active] - peak_pos[None, :], axis=1)
         r = int(active[int(np.argmin(d))])
         if (self.sensor_radius is None
                 or np.linalg.norm(self._red_pos[r] - self._blue_pos[blue_idx])
                 <= self.sensor_radius):
-            return self._red_vel[r].astype(np.float32)
-        return np.zeros(2, dtype=np.float32)
+            pos = self._red_pos[r].astype(np.float32)
+            if self.sensor_pos_noise_std > 0.0:
+                pos = pos + self._rng.normal(
+                    0.0, self.sensor_pos_noise_std, size=2,
+                ).astype(np.float32)
+            return pos, self._red_vel[r].astype(np.float32)
+        return peak_pos.astype(np.float32), zero_v
 
     def _belief_graph_from_peaks(
         self,
@@ -1496,9 +1537,14 @@ class PursuitEnv(ParallelEnv):
                 dst_pos[e] = self._blue_pos[b]
                 dst_vel[e] = self._blue_vel[b]
                 edge_vis[e] = conf[s]
-                if not static:
-                    src_vel[e] = self._attach_enemy_velocity(b, peak_pos[s])
-                # static: src_vel stays 0.
+                if not static and conf[s] > 0.0:
+                    # Live-sensor refinement: continuous noisy position
+                    # + Doppler velocity when THIS blue can see the
+                    # associated red; grid peak + zero velocity else.
+                    src_pos[e], src_vel[e] = self._attach_enemy_measurement(
+                        b, peak_pos[s],
+                    )
+                # static (obstacles): src stays (peak, 0).
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
         # Padded (dead / unextracted) slots have conf 0: zero their edge

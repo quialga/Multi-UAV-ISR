@@ -40,8 +40,23 @@ STAGE4_DEFAULTS = {
     #              applied in probability space).
     # Obstacle channel untouched (static -> prediction = identity).
     # Set 1.0 / 0.0 to recover pre-Phase-A behaviour exactly.
-    "enemy_belief_decay":     0.97,
-    "enemy_belief_diffusion": 0.4,
+    # CALIBRATED to red kinematics (v_max 1 m/s, dt 1 s, cell 5 m):
+    # a red crosses at most ~0.2-0.28 cells/step, so p_move 0.2; the
+    # original 0.4 implied ~2 m/s targets and made unobserved tracks
+    # go mushy within 3-4 steps.  decay 0.99 (confidence half-life ~69
+    # steps) suits 350-step episodes; 0.97 (~23 steps) was too
+    # forgetful.
+    "enemy_belief_decay":     0.99,
+    "enemy_belief_diffusion": 0.2,
+
+    # Live-sensor position accuracy (m) for VISIBLE targets: a blue
+    # that can see the associated red gets the true position +
+    # N(0, sigma^2) on its rb edge instead of the cell-centre grid
+    # peak.  Fixes the endgame: cell-quantised tracks are up to 3.5 m
+    # off on a 5 m grid, vs a 3 m capture radius -- flying exactly to
+    # the peak could still miss the capture.  Radar range accuracy of
+    # ~1 m at close range is realistic.
+    "sensor_pos_noise_std":   1.0,
 
     # ----- Sensor model --------------------------------------------------
     "p_TP":                0.85,

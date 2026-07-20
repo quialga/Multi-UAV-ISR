@@ -771,20 +771,22 @@ def test_stage4_v6_no_obstacle_keys_when_disabled():
         assert k not in obs
 
 
-def test_stage4_v6_rb_position_comes_from_belief():
+def test_stage4_v6_rb_position_comes_from_belief_when_unseen():
     """
-    The actor's rb_edge geometry (rel_pos) is reconstructed from the
-    belief-map PEAK, not from ground truth.  Plant a dominant enemy
-    peak in the GLOBAL map and verify edge (r=0, b=0)'s rel_pos points
-    at that cell.  Edge layout: [rel_pos(2), rel_vel(2), range(1),
-    bearing(2)]; rel_pos = blue_pos - peak_pos (normalised by L).
+    For a target NO blue can currently see, the rb_edge geometry is
+    reconstructed from the belief-map PEAK (memory path).  Edge layout:
+    [rel_pos(2), rel_vel(2), range(1), bearing(2)];
+    rel_pos = blue_pos - peak_pos (normalised by L).
     """
     env = _stage4_env(n_obstacles=0)
     env.reset(seed=0)
     cs = env.belief_cell_size
     L = env.arena_size
+    # Blue 0 far from every red (> sensor 40 m) -> memory path only.
+    env._blue_pos[0] = np.array([10.0, 10.0], dtype=np.float32)
+    env._red_pos[:]  = np.array([120.0, 120.0], dtype=np.float32)
     env._belief_maps[:] = -5.0
-    env._belief_maps[0, 20, 20] = 8.0   # dominant enemy peak (global map)
+    env._belief_maps[0, 20, 20] = 8.0   # dominant peak, cell centre (102.5, 102.5)
     obs = env.structured_belief_observation()
     rb = obs["rb_edge_features"]             # (n_rb, 7)
     peak = np.array([(20 + 0.5) * cs, (20 + 0.5) * cs], dtype=np.float32)
@@ -792,6 +794,43 @@ def test_stage4_v6_rb_position_comes_from_belief():
     # Edge (s=0, b=0) is index 0 in the (s outer, b inner) ordering.
     assert np.allclose(rb[0, :2], expected_relpos, atol=1e-3), (
         f"rb rel_pos {rb[0, :2]} != belief-peak-derived {expected_relpos}"
+    )
+
+
+def test_stage4_visible_red_gets_continuous_measurement():
+    """
+    When THIS blue can see the track's associated red, its rb edge
+    carries the CONTINUOUS measured position (true pos + noise; exact
+    with sigma=0), not the cell-centre peak — sub-cell endgame
+    guidance.  A far-away blue keeps the quantised memory path.
+    """
+    env = _stage4_env(n_obstacles=0, sensor_pos_noise_std=0.0)
+    env.reset(seed=0)
+    cs = env.belief_cell_size
+    L = env.arena_size
+    # Red 0 deliberately OFF-CENTRE in its cell (cell (13,13) centre is
+    # (67.5, 67.5); the red sits 1.8 m away at the cell edge).
+    env._red_pos[0] = np.array([69.3, 67.5], dtype=np.float32)
+    env._red_pos[1] = np.array([5.0, 125.0], dtype=np.float32)
+    env._red_pos[2] = np.array([125.0, 5.0], dtype=np.float32)
+    env._blue_pos[0] = np.array([60.0, 60.0], dtype=np.float32)   # 10 m away
+    env._blue_pos[1] = np.array([5.0, 5.0], dtype=np.float32)     # ~90 m away
+    env._belief_maps[:] = -5.0
+    env._belief_maps[0, 13, 13] = 8.0    # track for red 0 at its cell
+
+    obs = env.structured_belief_observation()
+    rb = obs["rb_edge_features"]
+    N = env.n_blue
+    # Blue 0 (visible): edge (s=0, b=0) -> TRUE red position.
+    expected_meas = (env._blue_pos[0] - env._red_pos[0]) / L
+    assert np.allclose(rb[0 * N + 0, :2], expected_meas, atol=1e-4), (
+        "visible blue should get the continuous measurement"
+    )
+    # Blue 1 (not visible): edge (s=0, b=1) -> cell-centre peak.
+    peak = np.array([67.5, 67.5], dtype=np.float32)
+    expected_peak = (env._blue_pos[1] - peak) / L
+    assert np.allclose(rb[0 * N + 1, :2], expected_peak, atol=1e-4), (
+        "non-visible blue should keep the grid-peak memory path"
     )
 
 

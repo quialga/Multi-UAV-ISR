@@ -87,6 +87,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--enemy-belief-diffusion", type=float,
                    default=d.get("enemy_belief_diffusion", 0.0),
                    help="Motion-model spread p_move (0.0 = off).")
+    p.add_argument("--sensor-pos-noise-std", type=float,
+                   default=d.get("sensor_pos_noise_std", 1.0),
+                   help="Live-sensor position accuracy (m) for visible "
+                        "targets; continuous measurement replaces the "
+                        "cell-centre peak on that blue's rb edge.")
     # PPO
     p.add_argument("--n-envs",         type=int,   default=d["n_envs"])
     p.add_argument("--rollout-steps",  type=int,   default=d["rollout_steps"])
@@ -212,6 +217,7 @@ def main() -> None:
         ray_step_size           = args.ray_step_size,
         enemy_belief_decay      = args.enemy_belief_decay,
         enemy_belief_diffusion  = args.enemy_belief_diffusion,
+        sensor_pos_noise_std    = args.sensor_pos_noise_std,
     )
 
     # Red policy mix parsing.
