@@ -801,15 +801,16 @@ def test_stage4_v6_rb_position_comes_from_belief_when_unseen():
     )
 
 
-def test_stage4_visible_red_gets_continuous_measurement():
+def test_stage4_shared_position_own_doppler_velocity():
     """
-    For a LIVE (detection-seeded) track:
-    - the blue that SEES the red gets the continuous measured position
-      (true pos, sigma=0) AND its Doppler velocity;
-    - a blue OUT of range gets the same fused track position over TDL
-      (true pos, sigma=0) but ZERO velocity (no own Doppler).
-    Neither uses the cell-centre peak — the live red's position is
-    known to the whole team, at sub-cell precision.
+    For a LIVE (detection-seeded) track, POSITION is the ONE shared/
+    fused track position for every blue; the only per-blue difference is
+    VELOCITY (own-sensor Doppler when the red is visible, else 0).
+    - the blue that SEES the red gets the shared position + Doppler;
+    - a blue OUT of range gets the SAME shared position (over TDL) but
+      ZERO velocity.
+    With sigma=0 the shared position equals the true red position
+    exactly, at sub-cell precision; neither blue uses the cell peak.
     """
     env = _stage4_env(n_obstacles=0, sensor_pos_noise_std=0.0)
     env.reset(seed=0)
@@ -828,18 +829,18 @@ def test_stage4_visible_red_gets_continuous_measurement():
     rb = obs["rb_edge_features"]
     N = env.n_blue
     v_max = 1.5   # BLUE_UAV.v_max (edge rel_vel normaliser)
+    e0 = 0 * N + 0    # track 0 -> blue 0 (sees red 0)
+    e1 = 0 * N + 1    # track 0 -> blue 1 (TDL only)
 
-    # Blue 0 (sees red 0): true position + Doppler velocity.
-    e0 = 0 * N + 0
+    # Both blues get the SHARED position (= true red pos at sigma=0).
     assert np.allclose(rb[e0, :2], (env._blue_pos[0] - env._red_pos[0]) / L, atol=1e-4)
-    # rel_vel = blue_vel - red_vel = -red_vel (blue stationary).
-    assert np.allclose(rb[e0, 2:4], (-env._red_vel[0]) / v_max, atol=1e-4), (
-        "seeing blue should get Doppler velocity"
-    )
-    # Blue 1 (TDL only): same true position, ZERO velocity.
-    e1 = 0 * N + 1
     assert np.allclose(rb[e1, :2], (env._blue_pos[1] - env._red_pos[0]) / L, atol=1e-4), (
-        "out-of-range blue should get the fused track position over TDL"
+        "out-of-range blue gets the same shared track position over TDL"
+    )
+    # Velocity is the ONLY difference: seeing blue = Doppler, other = 0.
+    # rel_vel = blue_vel - red_vel = -red_vel (blues stationary).
+    assert np.allclose(rb[e0, 2:4], (-env._red_vel[0]) / v_max, atol=1e-4), (
+        "seeing blue should get own-sensor Doppler velocity"
     )
     assert np.allclose(rb[e1, 2:4], 0.0, atol=1e-6), (
         "out-of-range blue has no own Doppler -> zero velocity"

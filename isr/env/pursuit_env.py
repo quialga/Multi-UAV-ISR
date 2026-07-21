@@ -1556,14 +1556,13 @@ class PursuitEnv(ParallelEnv):
         detection-seeded tracks.  Same 7-D edge layout / ordering as
         ``_obstacle_graph_from_peaks`` (for s in K, for b in N).
 
-        Per (track s, blue b):
-        - live track (track_red[s] >= 0) and its red within b's sensor
-          range -> CONTINUOUS measurement (true pos + own noise sample,
-          Doppler velocity).
-        - live track but red out of b's range -> the fused track
-          position (heard over TDL) + zero velocity.
-        - memory / padding (track_red[s] < 0) -> track position (belief
-          cell centre or 0) + zero velocity.
+        Per (track s, blue b): POSITION is always ``track_pos[s]`` -- the
+        single shared/fused track position (measured+noise for a live
+        track, belief cell centre for a memory track).  VELOCITY is the
+        only per-blue difference:
+        - live track (track_red[s] >= 0) whose red is within b's sensor
+          range -> own-sensor Doppler velocity.
+        - otherwise (out of range, or memory / padding) -> zero velocity.
 
         TDL = Tactical Data Link.
         The military term for the standardised radio networks that let
@@ -1605,10 +1604,19 @@ class PursuitEnv(ParallelEnv):
         dst_vel = np.zeros((n_edges, 2), dtype=np.float32)
         edge_vis = np.zeros((n_edges,), dtype=np.float32)
 
+        # POSITION is always the ONE shared/fused track position (the
+        # value seeded in _build_enemy_tracks: measured+noise for a live
+        # track, belief cell centre for a memory track).  The ONLY
+        # per-blue difference is VELOCITY: a blue that can see the
+        # backing red gets its own-sensor Doppler; everyone else gets 0.
+        # This keeps the TDL doctrine exact -- position is the shared
+        # network track, velocity is own-sensor -- with no second,
+        # inconsistent position draw.
         for s in range(K):
             r = int(track_red[s])
             for b in range(N):
                 e = s * N + b
+                src_pos[e] = track_pos[s]
                 dst_pos[e] = self._blue_pos[b]
                 dst_vel[e] = self._blue_vel[b]
                 edge_vis[e] = track_conf[s]
@@ -1617,17 +1625,9 @@ class PursuitEnv(ParallelEnv):
                     or np.linalg.norm(self._red_pos[r] - self._blue_pos[b])
                     <= self.sensor_radius
                 ):
-                    # This blue can see the backing red -> own measurement.
-                    pos = self._red_pos[r].astype(np.float32)
-                    if self.sensor_pos_noise_std > 0.0:
-                        pos = pos + self._rng.normal(
-                            0.0, self.sensor_pos_noise_std, size=2,
-                        ).astype(np.float32)
-                    src_pos[e] = pos
+                    # This blue sees the backing red -> own-sensor Doppler.
                     src_vel[e] = self._red_vel[r]
-                else:
-                    # Memory / out-of-range: fused track position, no vel.
-                    src_pos[e] = track_pos[s]
+                # else: memory / out-of-range -> velocity stays 0.
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
         edge_feat[edge_vis <= 0.0] = 0.0     # zero padded/dead slots
