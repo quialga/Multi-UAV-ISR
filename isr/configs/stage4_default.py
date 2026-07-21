@@ -88,14 +88,20 @@ STAGE4_DEFAULTS = {
     # warm-starts (shape-matched copy).
     "warm_start_critic": "runs/stage1/scaling_gnn/best.pt",
 
-    # ----- Aux loss ------------------------------------------------------
-    # v6.2: aux hidden loss ported from Stage 3 (opt-C, live critic
-    # target).  MSE(actor_h_blue, critic_h_blue.detach()) encourages the
-    # actor's GNN embedding (from noisy belief-derived positions) to
-    # match the critic's (from ground truth).  Stage 3 landed on 0.1
-    # for live-critic; 0.2 needed freeze-critic (which requires warm
-    # start, not available in v6).
-    "aux_hidden_coef":   0.0,
+    # ----- PPO (pinned to Stage 3's WINNING recipe) ----------------------
+    # The Stage 4 v6 runs regressed because they dropped three coupled
+    # Stage 3 stabilisers at once: 2 message rounds, a warm-started
+    # critic, and aux 0.2.  Pinning the winning values here so a bare
+    # run reproduces the Stage 3 setup (base STAGE1 defaults were
+    # lr 3e-4 / ent 0.018, which Stage 3 overrode on the CLI).
+    "lr":                1e-4,
+    "ent_coef":          0.008,
+    # aux 0.2 ONLY helps with the warm-started critic: the target is
+    # critic_h_blue.detach(), so a cold/random critic makes aux a
+    # garbage target (this is why aux 0.02 hurt in the cold-start
+    # experiment).  Warm start + aux 0.2 is the proven Stage 3 combo.
+    "aux_hidden_coef":   0.2,
     "freeze_critic":     False,     # not supported in v6 (cold start)
     "use_hidden_in_gnn": True,      # Stage 3 opt-1 hidden-in-GNN kept on
+    # n_msg_rounds inherited = 2 (Stage 3); do NOT run with 1.
 }
