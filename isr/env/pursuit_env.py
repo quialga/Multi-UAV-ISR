@@ -1554,7 +1554,7 @@ class PursuitEnv(ParallelEnv):
         """
         Build the actor-side enemy node + edge features from the K
         detection-seeded tracks.  Same 7-D edge layout / ordering as
-        ``_belief_graph_from_peaks`` (for s in K, for b in N).
+        ``_obstacle_graph_from_peaks`` (for s in K, for b in N).
 
         Per (track s, blue b):
         - live track (track_red[s] >= 0) and its red within b's sensor
@@ -1564,6 +1564,36 @@ class PursuitEnv(ParallelEnv):
           position (heard over TDL) + zero velocity.
         - memory / padding (track_red[s] < 0) -> track position (belief
           cell centre or 0) + zero velocity.
+
+        TDL = Tactical Data Link.
+        The military term for the standardised radio networks that let
+        platforms (aircraft, ships, ground stations, UAVs) automatically
+        share a real-time tactical picture -- own positions, detected
+        tracks, targeting data -- without voice.  The best-known example
+        is Link 16 (used across NATO); others include Link 11, Link 22,
+        and SADL.
+
+        In this code, "heard over TDL" is shorthand for the shared
+        COMMON OPERATIONAL PICTURE: when one blue UAV sees a target, that
+        contact is broadcast to the whole team over the data link, so
+        every ally knows the track's position even if it is outside their
+        own sensor range.  This is the modelling assumption behind two
+        design choices:
+
+        * The GLOBAL FUSED belief map -- one shared grid for the team,
+          because they pool detections over the link (Bayesian fusion of
+          independent sensors is log-odds addition).
+        * ``bb_edge_visible`` == 1 (allies always share GPS) and the
+          "out-of-range blue gets the fused track position, zero
+          velocity" branch above -- a UAV that cannot see a red itself
+          still knows WHERE it is (position broadcast over TDL) but has
+          no own-sensor Doppler for its VELOCITY, hence velocity = 0 for
+          that edge.
+
+        So the realistic split is: "precise position over TDL, but zero
+        velocity unless you can see it yourself" -- the network shares
+        POSITION (fused tracks), but VELOCITY is your own radar's Doppler
+        measurement.
         """
         N = self.n_blue
         K = track_pos.shape[0]
