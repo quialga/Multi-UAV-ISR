@@ -40,7 +40,7 @@ from isr.agents.heuristics import (
     run_from_nearest_uav, stationary_red, random_red,
 )
 from isr.agents.policy_loader import (
-    TrainedBlueAgent, TrainedCTDEBlueAgent, build_trained_agent, load_policy,
+    TrainedBlueAgent, build_trained_agent, load_policy,
 )
 from isr.env.pursuit_env import PursuitEnv
 from isr.utils.render import animate_episode
@@ -245,10 +245,8 @@ def main() -> None:
                    help="seed used for the qualitative GIFs (single episode)")
     p.add_argument("--fps",        type=int, default=10)
     p.add_argument("--results-md", default=None,
-                   help="output markdown writeup path.  When omitted, "
-                        "defaults to docs/stage2_results.md for a gnn "
-                        "checkpoint and docs/stage3_results.md for a "
-                        "gnn_ctde checkpoint.")
+                   help="output markdown writeup path.  Defaults to "
+                        "docs/stage2_results.md.")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -265,8 +263,8 @@ def main() -> None:
         max_steps      = train_args["max_steps"],
         capture_radius = train_args["capture_radius"],
     )
-    # Stage 3 checkpoints carry sensor_radius — propagate it so the
-    # trained policy sees the same partial-obs regime it was trained on.
+    # Propagate sensor_radius if the checkpoint carries one, so the
+    # trained policy sees the same observability regime it trained on.
     if train_args.get("sensor_radius") is not None:
         env_kwargs["sensor_radius"] = train_args["sensor_radius"]
 
@@ -282,9 +280,8 @@ def main() -> None:
     blue_factories = {
         "Random":  lambda: RandomAgent(seed=0),
         "Greedy":  lambda: GreedyPursuer(),
-        # ``build_trained_agent`` picks TrainedBlueAgent (Stage 1/2)
-        # or TrainedCTDEBlueAgent (Stage 3, recurrent) based on the
-        # loaded policy's class — no branch needed here.
+        # ``build_trained_agent`` picks the right adapter (Stage 1/2
+        # TrainedBlueAgent) from the loaded policy's class.
         "Trained": lambda: build_trained_agent(policy, device, deterministic=True),
     }
     red_factories = {
@@ -318,27 +315,11 @@ def main() -> None:
     trained_caught = results["Trained"]["RunFromNearest"]["mean_caught"]
     greedy_caught  = results["Greedy"]["RunFromNearest"]["mean_caught"]
 
-    if policy_type == "gnn_ctde":
-        # Stage 3 acceptance — see docs/stage3_design.md §9.
-        bar_return  = greedy_vs_run + 5.0
-        bar_caught  = max(greedy_caught + 0.5, 2.7)
-        ok_return   = trained_vs_run >= bar_return
-        ok_caught   = trained_caught  >= bar_caught
-        verdict = "PASS" if (ok_return and ok_caught) else "FAIL"
-        print(f"\nAcceptance (Stage 3):")
-        print(f"  return:  trained={trained_vs_run:+.2f}  "
-              f"bar=Greedy+5={bar_return:+.2f}  -> {'OK' if ok_return else 'FAIL'}")
-        print(f"  caught:  trained={trained_caught:.2f}  "
-              f"bar=max(Greedy+0.5, 2.7)={bar_caught:.2f}  "
-              f"-> {'OK' if ok_caught else 'FAIL'}")
-        print(f"  verdict: {verdict}")
-        bar = bar_return   # used by write_results_md for the header line
-    else:
-        # Stage 1/2 acceptance = 1.2 × Greedy on mean_return.
-        bar = 1.20 * greedy_vs_run
-        verdict = "PASS" if trained_vs_run >= bar else "FAIL"
-        print(f"\nAcceptance: trained={trained_vs_run:+.2f}  "
-              f"bar=1.20×Greedy={bar:+.2f}  -> {verdict}")
+    # Stage 1/2 acceptance = 1.2 × Greedy on mean_return.
+    bar = 1.20 * greedy_vs_run
+    verdict = "PASS" if trained_vs_run >= bar else "FAIL"
+    print(f"\nAcceptance: trained={trained_vs_run:+.2f}  "
+          f"bar=1.20×Greedy={bar:+.2f}  -> {verdict}")
 
     # ---- Render GIFs (one per red policy + one Greedy-vs-Run reference) -
     gif_dir = ckpt_path.parent / "eval_gifs"
@@ -383,15 +364,9 @@ def main() -> None:
         }, f, indent=2)
     print(f"\nResults JSON: {results_json_path}")
 
-    md_default = ("docs/stage3_results.md" if policy_type == "gnn_ctde"
-                  else "docs/stage2_results.md")
-    md_path = Path(args.results_md or md_default).resolve()
-    if policy_type == "gnn_ctde":
-        stage_label = "Stage 3"
-        bar_label = "GreedyPursuer + 5 (Stage 3 §9 return criterion)"
-    else:
-        stage_label = "Stage 2"
-        bar_label = "1.20 × GreedyPursuer"
+    md_path = Path(args.results_md or "docs/stage2_results.md").resolve()
+    stage_label = "Stage 2"
+    bar_label = "1.20 × GreedyPursuer"
     write_results_md(
         out_path        = md_path,
         ckpt_path       = ckpt_path,

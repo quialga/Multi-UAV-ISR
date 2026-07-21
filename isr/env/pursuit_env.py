@@ -150,9 +150,10 @@ class PursuitEnv(ParallelEnv):
             (default), the env is fully observable (Stage 1/2 behaviour).
             When set to a positive value, each blue UAV only "sees"
             entities within this Euclidean distance.  Visibility is
-            per-receiver (each blue has its own view), exposed via
-            ``structured_partial_observation()`` as per-edge masks so
-            the graph tensor shape stays constant across timesteps.
+            per-receiver (each blue has its own view), computed by
+            ``_compute_edge_visibility()`` and consumed as per-edge
+            masks (e.g. ``bb_edge_visible`` in the Stage 4 obs) so the
+            graph tensor shape stays constant across timesteps.
             The full-state ``structured_observation()`` remains
             unaffected — used by the CTDE critic.
 
@@ -1811,29 +1812,3 @@ class PursuitEnv(ParallelEnv):
         out["true_occupancy"] = self._true_occupancy()
         return out
 
-    def structured_partial_observation(self) -> Dict[str, np.ndarray]:
-        """
-        Partial-observability variant of ``structured_observation()``
-        for the Stage 3 actor.
-
-        Returns the Stage 2 dict extended with two extra keys:
-        - ``bb_edge_visible`` : (n_bb, ) float32, 1.0 if the bb edge is
-          within sensor range of its receiver, 0.0 otherwise.
-        - ``rb_edge_visible`` : (n_rb, ) float32, same convention.
-
-        Consumers (the Stage 3 actor's GNN) multiply message tensors by
-        the visibility masks before aggregation so hidden edges
-        contribute zero — same tensor shape as the fully-observable
-        graph, just with masked contributions.
-
-        The Stage 2 fields (node features, edge features) are
-        unchanged; the mask is a *separate* signal.  If a downstream
-        consumer wants the raw obs it can still call
-        ``structured_observation()`` to get the full-state graph
-        (used by the CTDE critic).
-        """
-        obs = self._build_structured_obs()
-        bb_visible, rb_visible = self._compute_edge_visibility()
-        obs["bb_edge_visible"] = bb_visible
-        obs["rb_edge_visible"] = rb_visible
-        return obs

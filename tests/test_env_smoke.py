@@ -246,24 +246,18 @@ def test_greedy_catches_stationary_reds():
 # ---------------------------------------------------------------------------
 
 def test_full_obs_when_sensor_radius_none():
-    """Default env is fully observable — masks all ones."""
+    """Default env is fully observable — visibility masks all ones."""
     env = PursuitEnv(n_blue=3, n_red=2, seed=0)   # sensor_radius=None (default)
     env.reset(seed=0)
-    obs = env.structured_partial_observation()
-    assert set(obs.keys()) >= {"bb_edge_visible", "rb_edge_visible"}
-    assert np.all(obs["bb_edge_visible"] == 1.0)
-    assert np.all(obs["rb_edge_visible"] == 1.0)
-    # bb_edge_features and rb_edge_features must still be identical to
-    # the Stage 2 full obs (unchanged in partial mode; only the mask
-    # is separate).
-    full = env.structured_observation()
-    assert np.allclose(obs["bb_edge_features"], full["bb_edge_features"])
-    assert np.allclose(obs["rb_edge_features"], full["rb_edge_features"])
+    bb_v, rb_v = env._compute_edge_visibility()
+    assert np.all(bb_v == 1.0)
+    assert np.all(rb_v == 1.0)
 
 
 def test_visibility_masks_reflect_within_radius():
     """
     Place agents at known positions and verify the visibility masks
+    (``_compute_edge_visibility``, shared by the Stage 4 bb_edge_visible)
     match hand-computed distances vs sensor_radius.
     """
     env = PursuitEnv(n_blue=3, n_red=2, arena_size=100.0,
@@ -278,9 +272,7 @@ def test_visibility_masks_reflect_within_radius():
     env._red_pos[0]  = np.array([60.0, 50.0], dtype=np.float32)
     env._red_pos[1]  = np.array([95.0, 95.0], dtype=np.float32)
 
-    obs = env.structured_partial_observation()
-    bb_v = obs["bb_edge_visible"]
-    rb_v = obs["rb_edge_visible"]
+    bb_v, rb_v = env._compute_edge_visibility()
 
     # For each bb edge, verify visibility by manual distance check.
     for e in range(env.n_bb_edges):
@@ -311,8 +303,7 @@ def test_bb_visibility_is_symmetric():
     env = PursuitEnv(n_blue=5, n_red=3, arena_size=130.0,
                      sensor_radius=40.0, seed=42)
     env.reset(seed=42)
-    obs = env.structured_partial_observation()
-    bb_v = obs["bb_edge_visible"]
+    bb_v, _ = env._compute_edge_visibility()
     for e in range(env.n_bb_edges):
         s, d = int(env.bb_edge_src[e]), int(env.bb_edge_dst[e])
         # Find the reverse-direction edge.
@@ -343,15 +334,15 @@ def test_caught_reds_are_hidden_regardless_of_range():
     env._red_pos[1]  = np.array([70.0, 70.0], dtype=np.float32)  # still alive
     env.step({"blue_0": np.zeros(2, dtype=np.float32)})
     assert not env._red_active[0]
-    obs = env.structured_partial_observation()
+    _, rb_v = env._compute_edge_visibility()
     for e in range(env.n_rb_edges):
         r = int(env.rb_edge_src[e])
         if r == 0:
-            assert obs["rb_edge_visible"][e] == 0.0, (
+            assert rb_v[e] == 0.0, (
                 f"rb edge {e} from caught red {r} should be hidden"
             )
         else:
-            assert obs["rb_edge_visible"][e] == 1.0, (
+            assert rb_v[e] == 1.0, (
                 f"rb edge {e} from alive red {r} should be visible"
             )
 
@@ -1171,8 +1162,8 @@ def test_stage4_backward_compat_when_flags_off():
     assert env._obstacle_pos is not None   # populated as empty array
     assert env._obstacle_pos.shape == (0, 2)
     assert env._belief_maps is None
-    # Stage 3 obs dict still works.
-    obs = env.structured_partial_observation()
+    # The base structured obs still works and carries no Stage 4 keys.
+    obs = env.structured_observation()
     assert "belief_maps" not in obs
     assert "obstacle_positions" not in obs
     assert "true_occupancy" not in obs

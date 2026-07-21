@@ -29,7 +29,6 @@ import torch
 
 from isr.agents.heuristics import HeuristicBlueAgent
 from isr.agents.gnn_policy import GNNActorCritic
-from isr.agents.gnn_ctde_policy import GNNCTDEPolicy
 from isr.configs.stage1_default import STAGE1_DEFAULTS
 from isr.env.pursuit_env import PursuitEnv
 
@@ -48,10 +47,10 @@ def load_policy(
     Load a checkpoint and return a constructed + loaded policy.
 
     Dispatches on ``args['policy_type']``:
-      - ``'gnn'``       -> ``GNNActorCritic`` (Stage 1/2 fully-obs).
-      - ``'gnn_ctde'``  -> ``GNNCTDEPolicy``  (Stage 3 partial-obs +
-                            GRU + CTDE critic).
+      - ``'gnn'``  -> ``GNNActorCritic`` (Stage 1/2 fully-obs).
 
+    (The Stage 3 ``'gnn_ctde'`` path was retired with the Stage 3
+    pipeline; Stage 4 has its own eval in scripts/train_stage4.py.)
     Pre-Stage-2 MLP checkpoints raise a clear error at load time.
     """
     path = Path(path)
@@ -71,26 +70,11 @@ def load_policy(
             n_msg_rounds  = int(args.get("n_msg_rounds", 2)),
             init_log_std  = STAGE1_DEFAULTS["init_log_std"],
         ).to(device)
-    elif policy_type == "gnn_ctde":
-        policy = GNNCTDEPolicy(
-            n_blue            = int(args["n_blue"]),
-            n_red             = int(args["n_red"]),
-            blue_feat_dim     = 8,
-            red_feat_dim      = 1,
-            edge_feat_dim     = 7,
-            action_dim        = 2,
-            d_hidden          = int(args.get("d_hidden", 64)),
-            n_msg_rounds      = int(args.get("n_msg_rounds", 2)),
-            init_log_std      = STAGE1_DEFAULTS["init_log_std"],
-            use_hidden_in_gnn = bool(args.get("share_hidden_via_gnn",
-                                              args.get("use_hidden_in_gnn",
-                                                       False))),
-        ).to(device)
     else:
         raise RuntimeError(
             f"Checkpoint at {path} has policy_type={policy_type!r}; only "
-            f"'gnn' (Stage 1/2) and 'gnn_ctde' (Stage 3) are supported "
-            f"after the July-2026 MLP cleanup.  See docs/stage2_results.md."
+            f"'gnn' (Stage 1/2) is supported here.  Stage 3 ('gnn_ctde') "
+            f"was retired; Stage 4 evaluates via scripts/train_stage4.py."
         )
 
     policy.load_state_dict(ckpt["policy_state"])
@@ -108,8 +92,6 @@ def build_trained_agent(
     loaded policy — dispatches on the policy's class rather than
     forcing the caller to know.
     """
-    if isinstance(policy, GNNCTDEPolicy):
-        return TrainedCTDEBlueAgent(policy, device, deterministic)
     if isinstance(policy, GNNActorCritic):
         return TrainedBlueAgent(policy, device, deterministic)
     raise TypeError(f"Unsupported policy class: {type(policy).__name__}")
@@ -150,73 +132,4 @@ class TrainedBlueAgent(HeuristicBlueAgent):
         # action_t: (1, N_blue, 2).  Pick out the acting agent.
         idx = env.possible_agents.index(agent)
         a = action_t[0, idx].cpu().numpy().astype(np.float32)
-        return np.clip(a, -1.0, 1.0)
-
-
-class TrainedCTDEBlueAgent(HeuristicBlueAgent):
-    """
-    Adapter for the Stage 3 CTDE + recurrent policy (``GNNCTDEPolicy``).
-
-    Two differences vs ``TrainedBlueAgent`` matter at eval time:
-
-    1. **Hidden state.**  The actor's per-blue GRU carries a hidden
-       state across timesteps.  It must be initialised to zeros at
-       episode start (a fresh instance of this class per episode is
-       enough — that's what ``eval_matrix`` does) and advanced once
-       per env-step.
-    2. **Partial obs.**  The actor consumes
-       ``structured_partial_observation()`` (base features + edge
-       visibility masks), not ``structured_observation()``.  This is
-       the OOD-safe path — the policy was never trained under masks-
-       all-ones and would behave weirdly under full obs.
-
-    Because ``run_episode`` calls ``.act(obs, env, agent)`` once per
-    (agent, step) — i.e. ``N_blue`` calls per env-step — we run the
-    actor forward once per new ``env._t`` and cache the joint action
-    tensor across the per-agent slot-ins.
-    """
-
-    def __init__(
-        self,
-        policy:        GNNCTDEPolicy,
-        device:        torch.device,
-        deterministic: bool = True,
-    ) -> None:
-        self.policy        = policy
-        self.device        = device
-        self.deterministic = deterministic
-        # Initial hidden = zeros; shape (1, N_blue, d_hidden).
-        self.hidden = policy.initial_hidden(n_envs=1, device=device)
-        # Per-step cache: valid iff self._cached_t == env._t.
-        self._cached_t:           int   = -1
-        self._cached_actions           = None    # (1, N_blue, action_dim) tensor
-        self._pending_new_hidden       = None    # rolled into self.hidden on next new step
-
-    def act(self, obs: np.ndarray, env: PursuitEnv, agent: str) -> np.ndarray:
-        if int(env._t) != self._cached_t:
-            # New env-step.  Roll the pending hidden into the current one.
-            if self._pending_new_hidden is not None:
-                self.hidden = self._pending_new_hidden
-
-            partial = env.structured_partial_observation()
-            obs_dict = {
-                k: torch.from_numpy(v).float().unsqueeze(0).to(self.device)
-                for k, v in partial.items()
-            }
-            with torch.no_grad():
-                if self.deterministic:
-                    action_t, new_hidden = self.policy.act_deterministic(
-                        obs_dict, self.hidden,
-                    )
-                else:
-                    full_state = {k: obs_dict[k] for k in _BASE_OBS_KEYS}
-                    action_t, _, _, _, new_hidden = self.policy.get_action_and_value(
-                        obs_dict, full_state, self.hidden,
-                    )
-            self._cached_actions     = action_t          # (1, N_blue, 2)
-            self._pending_new_hidden = new_hidden
-            self._cached_t           = int(env._t)
-
-        idx = env.possible_agents.index(agent)
-        a = self._cached_actions[0, idx].cpu().numpy().astype(np.float32)
         return np.clip(a, -1.0, 1.0)
