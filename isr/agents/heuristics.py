@@ -149,12 +149,16 @@ def stationary_red(
     blue_pos:   np.ndarray,
     red_pos:    np.ndarray,
     red_active: np.ndarray,
+    obstacle_pos: Optional[np.ndarray] = None,   # accepted, unused
+    obstacle_r:   Optional[np.ndarray] = None,   # accepted, unused
 ) -> np.ndarray:
     """
     Red doesn't move.  Easiest possible adversary — given Stage 1's
     blue/red speed advantage, blue should reliably catch every red
     within max_steps.  Useful as the absolute floor in benchmarks
     ("if blue can't beat this, the training pipeline is broken").
+    Obstacle args are accepted for a uniform red-policy signature and
+    ignored (a stationary target needs no collision-avoidance).
     """
     return np.zeros_like(red_pos, dtype=np.float32)
 
@@ -164,7 +168,9 @@ def random_red(seed: Optional[int] = None):
     Returns a closure: red picks uniform random acceleration each step.
     Slightly harder than stationary (red occasionally drifts in a useful
     direction), much easier than ``run_from_nearest_uav``.  Used to
-    bracket the difficulty curve.
+    bracket the difficulty curve.  Obstacle args accepted and ignored
+    (a random walk needs no collision-avoidance; obstacle kinematic
+    clipping still stops it physically).
     """
     rng = np.random.default_rng(seed)
 
@@ -172,6 +178,8 @@ def random_red(seed: Optional[int] = None):
         blue_pos:   np.ndarray,
         red_pos:    np.ndarray,
         red_active: np.ndarray,
+        obstacle_pos: Optional[np.ndarray] = None,
+        obstacle_r:   Optional[np.ndarray] = None,
     ) -> np.ndarray:
         out = rng.uniform(-1.0, 1.0, size=red_pos.shape).astype(np.float32)
         out[~red_active] = 0.0

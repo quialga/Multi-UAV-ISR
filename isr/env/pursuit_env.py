@@ -28,21 +28,30 @@ from isr.env.entities import BLUE_UAV, RED_TARGET
 # ---------------------------------------------------------------------------
 
 def run_from_nearest_uav(
-    blue_pos:   np.ndarray,   # (N_blue, 2)
-    red_pos:    np.ndarray,   # (N_red,  2)
-    red_active: np.ndarray,   # (N_red,) bool
+    blue_pos:     np.ndarray,           # (N_blue, 2)
+    red_pos:      np.ndarray,           # (N_red,  2)
+    red_active:   np.ndarray,           # (N_red,) bool
+    obstacle_pos: Optional[np.ndarray] = None,   # (N_obs, 2)
+    obstacle_r:   Optional[np.ndarray] = None,   # (N_obs,)
 ) -> np.ndarray:
     """
-    Scripted red policy used by ``PursuitEnv`` in Stage 1.
+    Scripted red policy used by ``PursuitEnv``.
 
-    Each *active* red target computes the unit vector pointing **away**
-    from its nearest blue UAV and uses that as its acceleration command
-    (magnitude exactly 1.0 — the policy is "always run at max
-    effort").  Caught reds (``active=False``) return zero acceleration.
+    Each *active* red target flees along the unit vector pointing
+    **away** from its nearest blue UAV (max-effort evasion).  Caught
+    reds (``active=False``) return zero acceleration.
 
-    The function is pure (no hidden state) so it's safe to swap out for
-    a learned policy in Stage 4 by passing a different callable to the
-    env's ``red_policy`` constructor argument.
+    Collision-avoidance (Stage 4 obstacles): when obstacle geometry is
+    supplied, a short-range REPULSION term from nearby obstacle
+    surfaces is blended into the flee vector, so a fleeing red steers
+    *around* obstacles instead of pinning itself against them (which
+    would make it trivially cornerable — a strawman adversary).  The
+    repulsion is limited to obstacles within ``influence`` metres of
+    the boundary and falls off with distance; the result is renormalised
+    to unit magnitude (still max-effort).  With no obstacles supplied
+    the behaviour is byte-identical to the original.
+
+    The function is pure (no hidden state).
 
     Returns
     -------
@@ -50,16 +59,42 @@ def run_from_nearest_uav(
     """
     n_red = red_pos.shape[0]
     out = np.zeros((n_red, 2), dtype=np.float32)
+
+    has_obs = (obstacle_pos is not None and len(obstacle_pos) > 0
+               and obstacle_r is not None)
+    influence = 12.0        # metres beyond the surface where repulsion acts
+    w_repulse = 1.5         # weight of repulsion vs the flee direction
+
     for i in range(n_red):
         if not red_active[i]:
             continue
+        # 1. Flee direction: unit vector away from the nearest blue.
         diffs = red_pos[i] - blue_pos              # vectors blue -> this red
         dists = np.linalg.norm(diffs, axis=1)
         nearest = int(np.argmin(dists))
         d_vec = diffs[nearest]
         norm = float(np.linalg.norm(d_vec))
-        if norm > 1e-8:
-            out[i] = d_vec / norm                  # unit vector AWAY from nearest blue
+        flee = d_vec / norm if norm > 1e-8 else np.zeros(2, dtype=np.float32)
+
+        # 2. Obstacle repulsion: sum of outward pushes from nearby disks,
+        #    each scaled by how deep inside the influence band the red is.
+        repulse = np.zeros(2, dtype=np.float32)
+        if has_obs:
+            oc = red_pos[i] - obstacle_pos          # (N_obs, 2) centre -> red
+            od = np.linalg.norm(oc, axis=1)         # (N_obs,)  centre distance
+            surf = od - obstacle_r                   # distance to the surface
+            for o in range(obstacle_pos.shape[0]):
+                if surf[o] < influence and od[o] > 1e-6:
+                    strength = (influence - surf[o]) / influence   # in (0, 1]
+                    strength = float(np.clip(strength, 0.0, 1.0))
+                    repulse += strength * (oc[o] / od[o])          # outward unit
+
+        vec = flee + w_repulse * repulse
+        v_norm = float(np.linalg.norm(vec))
+        if v_norm > 1e-8:
+            out[i] = vec / v_norm                   # renormalise: max effort
+        else:
+            out[i] = flee                           # degenerate: keep fleeing
     return out
 
 
@@ -404,7 +439,13 @@ class PursuitEnv(ParallelEnv):
                 )
 
         # 2. Red scripted action (only active reds will produce non-zero).
-        red_a = self.red_policy(self._blue_pos, self._red_pos, self._red_active)
+        # Pass obstacle geometry so obstacle-aware red policies (e.g.
+        # run_from_nearest_uav's collision-avoidance) can steer around
+        # them.  Policies that don't use it accept and ignore the args.
+        red_a = self.red_policy(
+            self._blue_pos, self._red_pos, self._red_active,
+            self._obstacle_pos, self._obstacle_r,
+        )
         red_a = np.clip(red_a.astype(np.float32), -1.0, 1.0)
         red_a[~self._red_active] = 0.0  # defensive
 

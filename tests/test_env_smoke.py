@@ -13,7 +13,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from isr.env.pursuit_env import PursuitEnv
+from isr.env.pursuit_env import PursuitEnv, run_from_nearest_uav
 from isr.env.entities import BLUE_UAV, RED_TARGET
 from isr.agents.heuristics import GreedyPursuer, stationary_red
 
@@ -1148,6 +1148,59 @@ def test_stage4_v61_occlusion_exact_catches_grazing_chord():
     occ = env._rays_occluded_by_obstacles(uav, cells)
     assert bool(occ[0]), "grazing chord shorter than 2.5 m must occlude"
     assert not bool(occ[1]), "ray well clear of the disk must not occlude"
+
+
+def test_run_heuristic_unchanged_without_obstacles():
+    """
+    With no obstacle geometry supplied, run_from_nearest_uav must be
+    byte-identical to the original pure-flee behaviour (the no-obstacle
+    baseline stays comparable).
+    """
+    blue = np.array([[50.0, 50.0]], dtype=np.float32)
+    red  = np.array([[60.0, 50.0]], dtype=np.float32)   # flee dir = +x
+    active = np.array([True])
+    a = run_from_nearest_uav(blue, red, active)
+    assert np.allclose(a[0], [1.0, 0.0], atol=1e-6)
+    # Empty obstacle arrays behave the same as None.
+    a2 = run_from_nearest_uav(blue, red, active,
+                              np.zeros((0, 2), np.float32),
+                              np.zeros((0,), np.float32))
+    assert np.allclose(a2[0], [1.0, 0.0], atol=1e-6)
+
+
+def test_run_heuristic_steers_around_obstacle():
+    """
+    A red fleeing toward an obstacle just off its flee axis must steer
+    AWAY from the obstacle (nonzero lateral component pointing away),
+    not drive straight into it.
+    """
+    blue = np.array([[50.0, 50.0]], dtype=np.float32)
+    red  = np.array([[60.0, 50.0]], dtype=np.float32)   # pure flee = +x
+    active = np.array([True])
+    # Obstacle up-and-ahead of the red (surface ~2.8 m away, within the
+    # 12 m influence band).
+    obs_pos = np.array([[70.0, 54.0]], dtype=np.float32)
+    obs_r   = np.array([8.0], dtype=np.float32)
+
+    a = run_from_nearest_uav(blue, red, active, obs_pos, obs_r)
+    # Still unit magnitude (max effort).
+    assert np.isclose(np.linalg.norm(a[0]), 1.0, atol=1e-5)
+    # Steered DOWN (-y), away from the obstacle sitting at +y.
+    assert a[0, 1] < -0.05, f"expected downward steer, got {a[0]}"
+    # And it is no longer pure +x flee.
+    assert not np.allclose(a[0], [1.0, 0.0], atol=1e-2)
+
+
+def test_run_heuristic_caught_reds_stay_still():
+    """Caught reds return zero regardless of obstacles."""
+    blue = np.array([[50.0, 50.0]], dtype=np.float32)
+    red  = np.array([[60.0, 50.0], [40.0, 40.0]], dtype=np.float32)
+    active = np.array([False, True])
+    obs_pos = np.array([[65.0, 50.0]], dtype=np.float32)
+    obs_r   = np.array([6.0], dtype=np.float32)
+    a = run_from_nearest_uav(blue, red, active, obs_pos, obs_r)
+    assert np.allclose(a[0], 0.0)          # caught -> zero
+    assert np.linalg.norm(a[1]) > 0.5      # active -> fleeing
 
 
 def test_stage4_backward_compat_when_flags_off():
