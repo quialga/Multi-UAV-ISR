@@ -43,7 +43,7 @@ from isr.configs.stage4_default import STAGE4_DEFAULTS
 from isr.env.pursuit_env    import PursuitEnv
 from isr.agents.heuristics  import (
     GreedyPursuer, RandomAgent,
-    run_from_nearest_uav, stationary_red,
+    run_from_nearest_uav, stationary_red, random_red,
 )
 from isr.agents.gnn_stage4_policy import GNNStage4Policy, split_stage4_obs
 from isr.train.graph_buffer       import Stage4RolloutBuffer
@@ -98,6 +98,18 @@ def _parse_args() -> argparse.Namespace:
                         "features.  Upper-bound run to isolate whether "
                         "the belief pipeline or the RL setup is the "
                         "bottleneck.")
+    p.add_argument("--eval-interval", type=int, default=25,
+                   help="Every N rollouts, DETERMINISTICALLY evaluate the "
+                        "learned policy (the metric comparable to Stage 3; "
+                        "the training caught stat is stochastic and lower). "
+                        "0 disables.")
+    p.add_argument("--eval-episodes", type=int, default=20,
+                   help="Episodes per red policy in the deterministic eval.")
+    p.add_argument("--warm-start-critic",
+                   default=d.get("warm_start_critic", None),
+                   help="Path to a Stage 1/2 GNN checkpoint to warm-start "
+                        "the critic (Stage 3's stabiliser).  'none' to "
+                        "cold-start.")
     # PPO
     p.add_argument("--n-envs",         type=int,   default=d["n_envs"])
     p.add_argument("--rollout-steps",  type=int,   default=d["rollout_steps"])
@@ -177,6 +189,48 @@ def evaluate_heuristic_baseline(
 
 def _to_device(np_arr, device):
     return torch.from_numpy(np_arr).float().to(device)
+
+
+@torch.no_grad()
+def evaluate_policy_deterministic(
+    policy, env_kwargs: Dict, red_policy, n_episodes: int, device,
+    actor_oracle: bool, n_blue: int, seed_base: int = 30_000,
+) -> Dict[str, float]:
+    """
+    Roll the LEARNED policy DETERMINISTICALLY (action = distribution
+    mean, no exploration noise) — the metric comparable to Stage 3's
+    eval.  The training-loop ``caught`` stat is stochastic and always
+    lower; this is the number to judge convergence by.
+    """
+    returns, caught, steps = [], [], []
+    for ep in range(n_episodes):
+        env = PursuitEnv(**env_kwargs, red_policy=red_policy,
+                         seed=seed_base + ep)
+        env.reset(seed=seed_base + ep)
+        hidden = policy.initial_hidden(1, device)
+        total = 0.0
+        agents = env.possible_agents
+        while env.agents:
+            obs = env.structured_belief_observation()
+            obs_t = {k: _to_device(v, device).unsqueeze(0)
+                     for k, v in obs.items()}
+            partial_obs, _ = split_stage4_obs(
+                obs_t, actor_oracle=actor_oracle, n_blue=n_blue,
+            )
+            mean, hidden = policy.act_deterministic(partial_obs, hidden)
+            a_np = mean.squeeze(0).cpu().numpy().astype(np.float32)  # (n_blue, 2)
+            actions = {agents[i]: a_np[i] for i in range(len(agents))}
+            _, rew_d, _, _, _ = env.step(actions)
+            total += rew_d[agents[0]]
+        snap = env.state_snapshot()
+        returns.append(total)
+        caught.append(int((~snap["red_active"]).sum()))
+        steps.append(int(snap["t"]))
+    return {
+        "mean_return": float(np.mean(returns)),
+        "mean_caught": float(np.mean(caught)),
+        "mean_steps":  float(np.mean(steps)),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -288,12 +342,24 @@ def main() -> None:
         init_log_std      = STAGE4_DEFAULTS.get("init_log_std", 0.0),
         use_hidden_in_gnn = args.share_hidden_via_gnn,
     ).to(device)
-    optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     n_params = sum(p.numel() for p in policy.parameters())
     log(f"Policy: GNNStage4Policy (v6) d_hidden={args.d_hidden} "
         f"rounds={args.n_msg_rounds} n_obs={vec_env.n_obstacles} "
         f"params={n_params}")
-    log("Critic COLD-STARTED (typed GNN, no CNN).")
+
+    # Warm-start the critic (Stage 3's stabiliser) unless disabled.
+    ws = args.warm_start_critic
+    if ws and str(ws).lower() != "none" and Path(ws).exists():
+        n_copied = policy.load_pretrained_critic(ws)
+        log(f"Critic WARM-STARTED from {ws} ({n_copied} tensors copied).")
+    else:
+        if ws and str(ws).lower() != "none":
+            log(f"WARN: warm-start ckpt not found ({ws}); cold-starting.")
+        log("Critic COLD-STARTED (typed GNN, no CNN).")
+
+    # Build the optimizer AFTER warm-start so Adam's moment buffers are
+    # fresh for the loaded weights.
+    optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
 
     args_dict_saved = {**vars(args), "policy_type": "gnn_stage4_v6"}
 
@@ -438,6 +504,30 @@ def main() -> None:
                               update_metrics["aux_hidden_loss"], global_step)
         if not np.isnan(track_err):
             writer.add_scalar("belief/track_error_m", track_err, global_step)
+
+        # Deterministic evaluation of the LEARNED policy — the metric
+        # comparable to Stage 3 (the training `caught` above is
+        # stochastic and always lower).
+        if args.eval_interval > 0 and (rollout + 1) % args.eval_interval == 0:
+            det = {}
+            for name, red in (("stationary", stationary_red),
+                              ("random", random_red(seed=12345)),
+                              ("run", run_from_nearest_uav)):
+                r = evaluate_policy_deterministic(
+                    policy, env_kwargs, red, args.eval_episodes, device,
+                    actor_oracle=args.actor_oracle, n_blue=vec_env.n_blue,
+                )
+                det[name] = r["mean_caught"]
+                writer.add_scalar(f"eval_det/caught_{name}",
+                                  r["mean_caught"], global_step)
+            det_mean = float(np.mean(list(det.values())))
+            writer.add_scalar("eval_det/caught_mean", det_mean, global_step)
+            log(
+                f"    [det eval @ {rollout+1}]  "
+                f"caught  stat={det['stationary']:.2f}  "
+                f"rand={det['random']:.2f}  run={det['run']:.2f}  "
+                f"mean={det_mean:.2f}/{args.n_red}"
+            )
 
         # Best-ckpt tracking.
         n_completed = int(ep_stats.get("n_completed", 0))

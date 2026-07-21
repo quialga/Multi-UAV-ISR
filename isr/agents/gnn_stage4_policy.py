@@ -507,3 +507,50 @@ class GNNStage4Policy(nn.Module):
 
     def initial_hidden(self, n_envs: int, device: torch.device) -> torch.Tensor:
         return torch.zeros(n_envs, self.n_blue, self.d_hidden, device=device)
+
+    # ------------------------------------------------------------------ #
+    #  Critic warm-start (ported from Stage 3's load_stage2_critic)        #
+    # ------------------------------------------------------------------ #
+
+    def load_pretrained_critic(self, path) -> int:
+        """
+        Copy a pre-trained single-encoder GNN actor-critic (Stage 1/2
+        scaling_gnn) into THIS policy's CRITIC sub-modules, leaving the
+        actor random.  A pre-trained critic gives meaningful value
+        estimates (and therefore meaningful PPO advantages) from
+        rollout 0 — the ingredient Stage 3 relied on, dropped in the
+        Stage 4 cold-start.
+
+        Mapping (source root -> target):
+          {blue,red}_input_mlp, {bb,rb}_edge_mlp, msg_mlp, update_mlp
+                                        -> critic_encoder.<same>
+          critic_trunk, critic_head     -> <same>
+        Only tensors whose shapes match are copied (so the obstacle
+        config, where critic_trunk widens, safely skips trunk/head and
+        warm-starts just the encoder).  Returns the count copied.
+        """
+        import torch as _torch
+        ckpt = _torch.load(path, map_location="cpu", weights_only=False)
+        src = ckpt["policy_state"] if "policy_state" in ckpt else ckpt
+
+        encoder_roots = {
+            "blue_input_mlp", "red_input_mlp",
+            "bb_edge_mlp", "rb_edge_mlp", "msg_mlp", "update_mlp",
+        }
+        head_roots = {"critic_trunk", "critic_head"}
+
+        my_sd = self.state_dict()
+        n_copied = 0
+        for k, v in src.items():
+            root = k.split(".", 1)[0]
+            if root in encoder_roots:
+                target = f"critic_encoder.{k}"
+            elif root in head_roots:
+                target = k
+            else:
+                continue
+            if target in my_sd and my_sd[target].shape == v.shape:
+                my_sd[target].copy_(v)
+                n_copied += 1
+        self.load_state_dict(my_sd)
+        return n_copied

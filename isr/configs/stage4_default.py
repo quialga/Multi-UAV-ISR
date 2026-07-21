@@ -79,9 +79,14 @@ STAGE4_DEFAULTS = {
     "bb_edge_visible_always_on": True,
 
     # ----- Warm start ----------------------------------------------------
-    # Stage 3 checkpoints have red-side tensors + different critic input
-    # shapes.  Cold-start.
-    "warm_start_critic": None,
+    # v6.3: warm-start the CRITIC from the Stage 1 single-encoder GNN,
+    # exactly as Stage 3 did (its encoder MLPs + critic trunk/head map
+    # onto our critic for n_obstacles=0).  A pre-trained critic gives
+    # meaningful advantages from rollout 0 -- the stabiliser Stage 3
+    # relied on and the Stage 4 cold-start dropped.  Set None to
+    # cold-start.  With obstacles the trunk widens, so only the encoder
+    # warm-starts (shape-matched copy).
+    "warm_start_critic": "runs/stage1/scaling_gnn/best.pt",
 
     # ----- Aux loss ------------------------------------------------------
     # v6.2: aux hidden loss ported from Stage 3 (opt-C, live critic
