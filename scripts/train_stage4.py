@@ -92,12 +92,6 @@ def _parse_args() -> argparse.Namespace:
                    help="Live-sensor position accuracy (m) for visible "
                         "targets; continuous measurement replaces the "
                         "cell-centre peak on that blue's rb edge.")
-    p.add_argument("--actor-oracle", action="store_true",
-                   help="DIAGNOSTIC: feed the actor the ground-truth "
-                        "graph (critic view) instead of belief-derived "
-                        "features.  Upper-bound run to isolate whether "
-                        "the belief pipeline or the RL setup is the "
-                        "bottleneck.")
     p.add_argument("--eval-interval", type=int, default=25,
                    help="Every N rollouts, DETERMINISTICALLY evaluate the "
                         "learned policy (the metric comparable to Stage 3; "
@@ -194,7 +188,7 @@ def _to_device(np_arr, device):
 @torch.no_grad()
 def evaluate_policy_deterministic(
     policy, env_kwargs: Dict, red_policy, n_episodes: int, device,
-    actor_oracle: bool, n_blue: int, seed_base: int = 30_000,
+    seed_base: int = 30_000,
 ) -> Dict[str, float]:
     """
     Roll the LEARNED policy DETERMINISTICALLY (action = distribution
@@ -214,9 +208,7 @@ def evaluate_policy_deterministic(
             obs = env.structured_belief_observation()
             obs_t = {k: _to_device(v, device).unsqueeze(0)
                      for k, v in obs.items()}
-            partial_obs, _ = split_stage4_obs(
-                obs_t, actor_oracle=actor_oracle, n_blue=n_blue,
-            )
+            partial_obs, _ = split_stage4_obs(obs_t)
             mean, hidden = policy.act_deterministic(partial_obs, hidden)
             a_np = mean.squeeze(0).cpu().numpy().astype(np.float32)  # (n_blue, 2)
             actions = {agents[i]: a_np[i] for i in range(len(agents))}
@@ -404,10 +396,7 @@ def main() -> None:
             # Tensorise the whole v6 graph obs, then split into
             # actor / critic dicts.
             obs_t = {k: _to_device(v, device) for k, v in obs_np.items()}
-            partial_obs, full_state = split_stage4_obs(
-                obs_t, actor_oracle=args.actor_oracle,
-                n_blue=vec_env.n_blue,
-            )
+            partial_obs, full_state = split_stage4_obs(obs_t)
 
             with torch.no_grad():
                 (action_t, log_p_t, _, value_t, new_hidden,
@@ -454,8 +443,6 @@ def main() -> None:
             normalize_adv   = STAGE4_DEFAULTS["normalize_adv"],
             target_kl       = target_kl_arg,
             aux_hidden_coef = args.aux_hidden_coef,
-            actor_oracle    = args.actor_oracle,
-            n_blue          = vec_env.n_blue,
         )
 
         ep_stats = vec_env.recent_episode_stats()
@@ -515,7 +502,6 @@ def main() -> None:
                               ("run", run_from_nearest_uav)):
                 r = evaluate_policy_deterministic(
                     policy, env_kwargs, red, args.eval_episodes, device,
-                    actor_oracle=args.actor_oracle, n_blue=vec_env.n_blue,
                 )
                 det[name] = r["mean_caught"]
                 writer.add_scalar(f"eval_det/caught_{name}",

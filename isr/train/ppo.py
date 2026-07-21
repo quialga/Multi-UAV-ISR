@@ -333,8 +333,6 @@ def ppo_update_stage4(
     normalize_adv:   bool  = True,
     target_kl:       float = None,
     aux_hidden_coef: float = 0.0,
-    actor_oracle:    bool  = False,
-    n_blue:          int   = 0,
 ) -> Dict[str, float]:
     """
     Stage 4 (v6) PPO update.  Same clipped-objective PPO as
@@ -366,9 +364,7 @@ def ppo_update_stage4(
         epoch_kl_sum = 0.0
         epoch_mb_count = 0
         for batch in buffer.iter_minibatches(mb_size):
-            partial_obs, full_state = split_stage4_obs(
-                batch, actor_oracle=actor_oracle, n_blue=n_blue,
-            )
+            partial_obs, full_state = split_stage4_obs(batch)
             old_actions   = batch["actions"]
             old_log_probs = batch["log_probs"]
             old_values    = batch["values"]

@@ -83,11 +83,7 @@ _CRITIC_TRUE_MAP = {
 }
 
 
-def split_stage4_obs(
-    obs: Dict[str, object],
-    actor_oracle: bool = False,
-    n_blue: int = 0,
-) -> Tuple[Dict, Dict]:
+def split_stage4_obs(obs: Dict[str, object]) -> Tuple[Dict, Dict]:
     """
     Split a combined Stage 4 v6 obs dict into ``(partial_obs, full_state)``
     for the actor and critic respectively.
@@ -95,41 +91,12 @@ def split_stage4_obs(
     - partial_obs: the belief-derived actor keys that are present.
     - full_state:  shared precise keys + the ``true_*`` critic keys
       remapped to the plain node/edge names the GNNEncoder expects.
-
-    ``actor_oracle`` (DIAGNOSTIC ONLY): feed the actor the ground-truth
-    graph instead of the belief-derived one — red/obstacle node + edge
-    features from the ``true_*`` keys, with per-edge visibility = the
-    entity's active flag (broadcast per blue; requires ``n_blue``).
-    Upper-bound experiment to separate "belief-derived obs is hard to
-    learn from" vs "the learning setup itself is the bottleneck".
     """
+    partial_obs = {k: obs[k] for k in _ACTOR_KEYS if k in obs}
     full_state = {k: obs[k] for k in _CRITIC_SHARED if k in obs}
     for src, dst in _CRITIC_TRUE_MAP.items():
         if src in obs:
             full_state[dst] = obs[src]
-
-    if not actor_oracle:
-        partial_obs = {k: obs[k] for k in _ACTOR_KEYS if k in obs}
-        return partial_obs, full_state
-
-    assert n_blue > 0, "actor_oracle requires n_blue for mask broadcast"
-    partial_obs = {
-        "blue_features":    obs["blue_features"],
-        "bb_edge_features": obs["bb_edge_features"],
-        "bb_edge_visible":  obs["bb_edge_visible"],
-        "red_features":     full_state["red_features"],
-        "rb_edge_features": full_state["rb_edge_features"],
-        # vis[s*N + b] = active flag of red s, for every blue b.
-        "rb_edge_visible":  full_state["red_features"][..., 0]
-                                .repeat_interleave(n_blue, dim=-1),
-    }
-    if "obstacle_features" in full_state:
-        partial_obs["obstacle_features"] = full_state["obstacle_features"]
-        partial_obs["ob_edge_features"]  = full_state["ob_edge_features"]
-        partial_obs["ob_edge_visible"]   = (
-            full_state["obstacle_features"][..., 0]
-                .repeat_interleave(n_blue, dim=-1)
-        )
     return partial_obs, full_state
 
 
