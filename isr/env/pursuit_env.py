@@ -179,6 +179,14 @@ class PursuitEnv(ParallelEnv):
         # edge of a blue that can see the associated red uses the true
         # position + N(0, sigma^2) instead of the cell-centre grid peak.
         sensor_pos_noise_std:     float = 1.0,
+        # ----- Crash penalties (per-agent shaped reward) ------------------
+        # Both default 0.0 (off) so the shared-team-reward behaviour is
+        # byte-preserved unless enabled.  When > 0, a crashing blue takes
+        # an INDIVIDUAL reward hit r_crash_i (r_i = r_team + r_crash_i);
+        # the episode is NOT terminated (soft stop, backlog §1 v1).
+        crash_obstacle_penalty:   float = 0.0,   # magnitude; applied as -x
+        crash_blue_penalty:       float = 0.0,   # magnitude; applied as -x
+        blue_collision_radius:    float = 2.0,   # m; < capture_radius (3)
     ):
         """
         sensor_radius: Stage 3 partial-observability knob.  When None
@@ -280,6 +288,16 @@ class PursuitEnv(ParallelEnv):
         assert 0.0 <= self.enemy_belief_diffusion < 1.0
         self.sensor_pos_noise_std     = float(sensor_pos_noise_std)
         assert self.sensor_pos_noise_std >= 0.0
+        # Crash-penalty knobs (per-agent shaped reward).
+        self.crash_obstacle_penalty   = float(crash_obstacle_penalty)
+        self.crash_blue_penalty       = float(crash_blue_penalty)
+        self.blue_collision_radius    = float(blue_collision_radius)
+        assert self.crash_obstacle_penalty >= 0.0
+        assert self.crash_blue_penalty >= 0.0
+        assert self.blue_collision_radius >= 0.0
+        # Diagnostic: crash counts for the LAST step (rendering/logging).
+        self._last_obstacle_crashes: int = 0
+        self._last_blue_crashes:     int = 0
         # Derived quantities.
         self.belief_cell_size = self.arena_size / max(1, self.belief_grid_size)
         # Log-odds evidence constants — same for both channels in v1.
@@ -458,10 +476,13 @@ class PursuitEnv(ParallelEnv):
             self._blue_pos, self._blue_vel, blue_a, BLUE_UAV.v_max,
         )
         # Stage 4: reject moves that land inside any obstacle (soft
-        # crash — position rolled back, velocity zeroed; explicit crash
-        # penalty is a backlog item, see docs/stage4_backlog.md §1).
+        # crash — position rolled back, velocity zeroed).  The collision
+        # mask feeds the per-agent crash penalty below (episode is NOT
+        # terminated, backlog §1 v1).
+        blue_obstacle_crash = np.zeros(self.n_blue, dtype=bool)
         if self.n_obstacles > 0:
-            self._blue_pos, self._blue_vel = self._clip_positions_from_obstacles(
+            (self._blue_pos, self._blue_vel,
+             blue_obstacle_crash) = self._clip_positions_from_obstacles(
                 self._blue_pos, prev_blue_pos, self._blue_vel,
             )
 
@@ -471,7 +492,7 @@ class PursuitEnv(ParallelEnv):
             self._red_pos, self._red_vel, red_a, RED_TARGET.v_max,
         )
         if self.n_obstacles > 0:
-            self._red_pos, self._red_vel = self._clip_positions_from_obstacles(
+            self._red_pos, self._red_vel, _ = self._clip_positions_from_obstacles(
                 self._red_pos, prev_red_pos, self._red_vel,
             )
         # Caught reds stay frozen at their last position.
@@ -500,11 +521,32 @@ class PursuitEnv(ParallelEnv):
                 self._clear_enemy_belief_at(self._red_pos[newly_caught])
         self._last_n_caught = n_caught_this_step
 
-        # 6. Reward — see docs/design.md §3.7.
+        # 6. Reward.
+        # 6a. TEAM (shared) component — see docs/design.md §3.7.
         catch_bonus = 10.0 * n_caught_this_step
         action_cost = 0.01 * float(np.sum(blue_a ** 2))   # sum over UAVs and axes
         step_cost   = 0.05
-        r = catch_bonus - action_cost - step_cost
+        r_team = catch_bonus - action_cost - step_cost
+
+        # 6b. Blue-blue collisions (per-agent): any two blues within
+        #     blue_collision_radius each take the ally-crash penalty.
+        blue_ally_crash = np.zeros(self.n_blue, dtype=bool)
+        if self.crash_blue_penalty > 0.0 and self.n_blue > 1:
+            bb = np.linalg.norm(
+                self._blue_pos[:, None, :] - self._blue_pos[None, :, :], axis=-1,
+            )
+            np.fill_diagonal(bb, np.inf)
+            blue_ally_crash = np.any(bb <= self.blue_collision_radius, axis=1)
+
+        self._last_obstacle_crashes = int(blue_obstacle_crash.sum())
+        self._last_blue_crashes     = int(blue_ally_crash.sum())
+
+        # 6c. Per-agent crash shaping: r_crash_i (applied as a negative).
+        r_crash = np.zeros(self.n_blue, dtype=np.float32)
+        if self.crash_obstacle_penalty > 0.0:
+            r_crash -= self.crash_obstacle_penalty * blue_obstacle_crash
+        if self.crash_blue_penalty > 0.0:
+            r_crash -= self.crash_blue_penalty * blue_ally_crash
 
         # 7. Termination check.
         self._t += 1
@@ -514,7 +556,7 @@ class PursuitEnv(ParallelEnv):
         truncated  = time_up and not all_caught
         if terminated or truncated:
             n_uncaught = int(self._red_active.sum())
-            r += -5.0 * n_uncaught                          # terminal penalty
+            r_team += -5.0 * n_uncaught                     # terminal penalty (team)
             self.agents = []                                # PettingZoo convention
 
         # Stage 4: update belief maps AFTER movement + capture so
@@ -524,9 +566,13 @@ class PursuitEnv(ParallelEnv):
         if self.use_belief_maps:
             self._update_belief_maps()
 
-        # 8. Pack the per-agent dicts.  Shared team reward — every
-        #    blue agent gets the same r.
-        rewards     = {a: float(r) for a in self.possible_agents}
+        # 8. Pack the per-agent dicts.  r_i = r_team (shared) + r_crash_i
+        #    (individual).  With both penalties off, r_crash_i = 0 and
+        #    every agent gets the identical shared reward as before.
+        rewards     = {
+            a: float(r_team + r_crash[i])
+            for i, a in enumerate(self.possible_agents)
+        }
         terminateds = {a: terminated for a in self.possible_agents}
         truncateds  = {a: truncated  for a in self.possible_agents}
         infos = {
@@ -534,6 +580,8 @@ class PursuitEnv(ParallelEnv):
                 "n_caught_this_step": n_caught_this_step,
                 "n_red_remaining":    int(self._red_active.sum()),
                 "t":                  self._t,
+                "obstacle_crashes":   self._last_obstacle_crashes,
+                "blue_crashes":       self._last_blue_crashes,
             }
             for a in self.possible_agents
         }
@@ -1102,12 +1150,15 @@ class PursuitEnv(ParallelEnv):
         new_pos:  np.ndarray,   # (K, 2) post-integration
         prev_pos: np.ndarray,   # (K, 2) pre-integration
         vel:      np.ndarray,   # (K, 2) post-integration velocity
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         For each entity whose new position lies inside any obstacle,
         roll the position back to its previous position and zero the
-        velocity.  Simple "hit an obstacle, stop" model.  Crash penalty
-        is a backlog item.
+        velocity ("hit an obstacle, stop" soft-crash model).
+
+        Returns (new_pos, vel, collided) -- the boolean (K,) collision
+        mask lets the caller apply a per-agent crash penalty (the
+        episode is NOT terminated, backlog §1 v1).
         """
         collided = self._positions_in_any_obstacle(new_pos)
         if bool(np.any(collided)):
@@ -1115,7 +1166,7 @@ class PursuitEnv(ParallelEnv):
             vel     = vel.copy()
             new_pos[collided] = prev_pos[collided]
             vel[collided]     = 0.0
-        return new_pos, vel
+        return new_pos, vel, collided
 
     def _true_occupancy(self) -> np.ndarray:
         """

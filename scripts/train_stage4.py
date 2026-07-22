@@ -104,6 +104,27 @@ def _parse_args() -> argparse.Namespace:
                    help="Path to a Stage 1/2 GNN checkpoint to warm-start "
                         "the critic (Stage 3's stabiliser).  'none' to "
                         "cold-start.")
+    p.add_argument("--warm-start-full",
+                   default=None,
+                   help="Path to a converged Stage 4 checkpoint (e.g. "
+                        "runs/stage4/obstacles_v1/best.pt) to warm-start "
+                        "BOTH actor and critic.  The crash-avoidance run "
+                        "starts here so the policy already flies + catches; "
+                        "training only has to LEARN to avoid crashes.  "
+                        "Overrides --warm-start-critic when set.")
+    # ----- Crash avoidance ------------------------------------------------
+    p.add_argument("--crash-obstacle-penalty", type=float,
+                   default=d["crash_obstacle_penalty"],
+                   help="Per-agent per-step penalty for crashing into an "
+                        "obstacle (soft-stop, no termination). 0 = off.")
+    p.add_argument("--crash-blue-penalty", type=float,
+                   default=d["crash_blue_penalty"],
+                   help="Per-agent per-step penalty for a blue-blue "
+                        "collision. 0 = off.")
+    p.add_argument("--blue-collision-radius", type=float,
+                   default=d["blue_collision_radius"],
+                   help="Distance (m) below which two blues count as "
+                        "collided.")
     # PPO
     p.add_argument("--n-envs",         type=int,   default=d["n_envs"])
     p.add_argument("--rollout-steps",  type=int,   default=d["rollout_steps"])
@@ -270,6 +291,9 @@ def main() -> None:
         enemy_belief_decay      = args.enemy_belief_decay,
         enemy_belief_diffusion  = args.enemy_belief_diffusion,
         sensor_pos_noise_std    = args.sensor_pos_noise_std,
+        crash_obstacle_penalty  = args.crash_obstacle_penalty,
+        crash_blue_penalty      = args.crash_blue_penalty,
+        blue_collision_radius   = args.blue_collision_radius,
     )
 
     # Red policy mix parsing.
@@ -339,15 +363,27 @@ def main() -> None:
         f"rounds={args.n_msg_rounds} n_obs={vec_env.n_obstacles} "
         f"params={n_params}")
 
-    # Warm-start the critic (Stage 3's stabiliser) unless disabled.
+    # Warm-start.  --warm-start-full (a converged Stage 4 ckpt) copies
+    # BOTH actor and critic and takes precedence; otherwise fall back to
+    # the critic-only Stage 1/2 warm-start (Stage 3's stabiliser).
+    wf = args.warm_start_full
     ws = args.warm_start_critic
-    if ws and str(ws).lower() != "none" and Path(ws).exists():
-        n_copied = policy.load_pretrained_critic(ws)
-        log(f"Critic WARM-STARTED from {ws} ({n_copied} tensors copied).")
-    else:
-        if ws and str(ws).lower() != "none":
-            log(f"WARN: warm-start ckpt not found ({ws}); cold-starting.")
-        log("Critic COLD-STARTED (typed GNN, no CNN).")
+    if wf and str(wf).lower() != "none" and Path(wf).exists():
+        n_copied = policy.load_full_stage4(wf)
+        log(f"Actor+Critic WARM-STARTED (full) from {wf} "
+            f"({n_copied} tensors copied).")
+    elif wf and str(wf).lower() != "none":
+        log(f"WARN: --warm-start-full ckpt not found ({wf}); "
+            f"falling back to critic-only warm-start.")
+        wf = None
+    if not (wf and str(wf).lower() != "none"):
+        if ws and str(ws).lower() != "none" and Path(ws).exists():
+            n_copied = policy.load_pretrained_critic(ws)
+            log(f"Critic WARM-STARTED from {ws} ({n_copied} tensors copied).")
+        else:
+            if ws and str(ws).lower() != "none":
+                log(f"WARN: warm-start ckpt not found ({ws}); cold-starting.")
+            log("Critic COLD-STARTED (typed GNN, no CNN).")
 
     # Build the optimizer AFTER warm-start so Adam's moment buffers are
     # fresh for the loaded weights.
@@ -461,6 +497,12 @@ def main() -> None:
                       if args.lr_schedule != "constant" else "")
             aux_str = (f"  aux={update_metrics['aux_hidden_loss']:.3f}"
                        if args.aux_hidden_coef > 0 else "")
+            crash_on = (args.crash_obstacle_penalty > 0
+                        or args.crash_blue_penalty > 0)
+            crash_str = (
+                f"  crash(o={ep_stats['mean_obstacle_crashes']:.2f}"
+                f"/a={ep_stats['mean_blue_crashes']:.2f})"
+                if crash_on else "")
             log(
                 f"[rollout {rollout+1:>4d}/{args.n_rollouts}]  "
                 f"steps={global_step:>9d}  sps={sps:>6.0f}  "
@@ -473,12 +515,16 @@ def main() -> None:
                 f"clip={update_metrics['clip_frac']:.3f}  "
                 f"eps={update_metrics['n_epochs_run']}  "
                 f"trk={track_err:5.1f}m"
-                f"{aux_str}{lr_str}"
+                f"{crash_str}{aux_str}{lr_str}"
             )
 
         writer.add_scalar("rollout/mean_return", ep_stats["mean_return"], global_step)
         writer.add_scalar("rollout/mean_caught", ep_stats["mean_caught"], global_step)
         writer.add_scalar("rollout/mean_length", ep_stats["mean_length"], global_step)
+        writer.add_scalar("crash/obstacle_rate",
+                          ep_stats["mean_obstacle_crashes"], global_step)
+        writer.add_scalar("crash/ally_rate",
+                          ep_stats["mean_blue_crashes"], global_step)
         writer.add_scalar("ppo/policy_loss",  update_metrics["policy_loss"],  global_step)
         writer.add_scalar("ppo/value_loss",   update_metrics["value_loss"],   global_step)
         writer.add_scalar("ppo/entropy",      update_metrics["entropy"],      global_step)

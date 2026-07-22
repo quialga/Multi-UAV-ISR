@@ -283,6 +283,10 @@ def main() -> None:
                 action_t, log_p_t, _, value_t = policy.get_action_and_value(obs_t)
             action_np = action_t.cpu().numpy().astype(np.float32)
             next_obs_np, reward_np, done_np, _ = vec_env.step(action_np)
+            # Vec env now returns per-agent rewards (n_envs, n_agents).
+            # Stage 1 uses shared team reward -> every agent is identical,
+            # so collapse to the per-env scalar the Stage 1 buffer expects.
+            reward_np = reward_np[:, 0]
             buffer.add(
                 obs       = obs_t,
                 actions   = action_t,

@@ -19,6 +19,12 @@ Shape notes for the GNN + CTDE setup:
   against them.
 - ``values`` are ``(mb,)`` — one centralised V per graph state.
 
+The shapes above describe ``ppo_update`` (the shared-reward Stage 1/2
+path).  ``ppo_update_stage4`` is now PER-AGENT: values / advantages /
+returns are ``(mb, A)`` (agent-conditioned ``V(s, i)`` +
+``r_i = r_team + r_crash_i``) and line up with ``new_log_probs``
+directly, no ``(mb,)``→``(mb, A)`` broadcast.  See that function.
+
 The MLP + flat-obs PPO update was removed in the July-2026 cleanup
 after the Stage 2 scaling experiment (see docs/stage2_results.md).
 """
@@ -190,11 +196,13 @@ def ppo_update_stage4(
                     partial_obs, full_state, hidden, action=old_actions,
                 )
 
-            adv_bcast = advantages.unsqueeze(-1)
+            # advantages / values / returns are now PER-AGENT (mb, A),
+            # matching new_log_probs / new_values (mb, A) directly -- no
+            # per-env -> per-agent broadcast needed anymore.
             log_ratio = new_log_probs - old_log_probs
             ratio     = log_ratio.exp()
-            surr1     = ratio * adv_bcast
-            surr2     = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * adv_bcast
+            surr1     = ratio * advantages
+            surr2     = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps) * advantages
             policy_loss = -torch.min(surr1, surr2).mean()
 
             if value_clip:

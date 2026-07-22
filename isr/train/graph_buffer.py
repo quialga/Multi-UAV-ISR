@@ -173,9 +173,13 @@ class Stage4RolloutBuffer:
     ``true_*`` critic keys).
 
     RL bookkeeping (actions / log_probs / values / rewards / dones /
-    hidden / GAE) matches the Stage 3 recurrent buffer: one centralised
-    value per env-timestep, per-agent actions/log_probs, per-agent
-    hidden state.
+    hidden / GAE) is PER-AGENT for the crash-avoidance extension:
+    individual rewards ``r_i = r_team + r_crash_i`` and an agent-
+    conditioned value ``V(s, i)`` make values / rewards / advantages /
+    returns all ``(T, E, A)``.  Only ``dones`` stay per-env ``(T, E)``
+    (a crash does NOT end the episode; it ends for all agents together
+    on timeout / all-caught) and broadcast over the agent dim in GAE.
+    Actions / log_probs / hidden are per-agent as before.
 
     Minibatch item = one env-timestep transition (stateless-at-update).
     """
@@ -206,11 +210,15 @@ class Stage4RolloutBuffer:
                                      dtype=torch.float32, device=device)
         self.hidden    = torch.zeros((self.T, self.E, self.A, self.d_hidden),
                                      dtype=torch.float32, device=device)
-        self.values     = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
-        self.rewards    = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
-        self.dones      = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
+        # PER-AGENT RL tensors: individual rewards r_i = r_team + r_crash_i,
+        # per-agent value V(s, i), so GAE/advantage/return are per (E, A).
+        self.values     = torch.zeros((self.T, self.E, self.A), dtype=torch.float32, device=device)
+        self.rewards    = torch.zeros((self.T, self.E, self.A), dtype=torch.float32, device=device)
         self.advantages = torch.zeros_like(self.rewards)
         self.returns    = torch.zeros_like(self.rewards)
+        # dones are per-ENV (episode ends for all agents together — we
+        # do NOT terminate on crash), broadcast over agents in GAE.
+        self.dones      = torch.zeros((self.T, self.E), dtype=torch.float32, device=device)
 
         self.ptr = 0
 
@@ -222,9 +230,9 @@ class Stage4RolloutBuffer:
         obs:       Dict[str, torch.Tensor],   # per-key (E, ...) tensors
         actions:   torch.Tensor,              # (E, A, action_dim)
         log_probs: torch.Tensor,              # (E, A)
-        values:    torch.Tensor,              # (E,)
-        rewards:   torch.Tensor,              # (E,)
-        dones:     torch.Tensor,              # (E,)
+        values:    torch.Tensor,              # (E, A)  per-agent V(s, i)
+        rewards:   torch.Tensor,              # (E, A)  per-agent r_i
+        dones:     torch.Tensor,              # (E,)    per-env
         hidden:    torch.Tensor,              # (E, A, d_hidden)
     ) -> None:
         assert self.ptr < self.T, "Buffer full — call reset() between rollouts."
@@ -246,15 +254,17 @@ class Stage4RolloutBuffer:
 
     def compute_gae(
         self,
-        last_value: torch.Tensor,   # (E,)
+        last_value: torch.Tensor,   # (E, A)  per-agent bootstrap
         gamma:      float,
         gae_lambda: float,
     ) -> None:
+        """Per-agent GAE.  ``dones`` are per-env and broadcast over the
+        agent dim (an episode ends for all agents at once)."""
         assert self.ptr == self.T
-        adv = torch.zeros(self.E, dtype=torch.float32, device=self.device)
+        adv = torch.zeros((self.E, self.A), dtype=torch.float32, device=self.device)
         for t in reversed(range(self.T)):
             next_value = last_value if t == self.T - 1 else self.values[t + 1]
-            not_done   = 1.0 - self.dones[t]
+            not_done   = (1.0 - self.dones[t]).unsqueeze(-1)   # (E, 1) -> broadcast
             delta = self.rewards[t] + gamma * next_value * not_done - self.values[t]
             adv   = delta + gamma * gae_lambda * not_done * adv
             self.advantages[t] = adv
@@ -275,9 +285,9 @@ class Stage4RolloutBuffer:
         }
         flat_act = self.actions.reshape(N, self.A, self.action_dim)
         flat_lp  = self.log_probs.reshape(N, self.A)
-        flat_val = self.values.reshape(N)
-        flat_adv = self.advantages.reshape(N)
-        flat_ret = self.returns.reshape(N)
+        flat_val = self.values.reshape(N, self.A)       # per-agent
+        flat_adv = self.advantages.reshape(N, self.A)   # per-agent
+        flat_ret = self.returns.reshape(N, self.A)      # per-agent
         flat_hid = self.hidden.reshape(N, self.A, self.d_hidden)
 
         perm = torch.randperm(N, device=self.device)

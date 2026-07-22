@@ -76,6 +76,17 @@ STAGE4_DEFAULTS = {
     "obstacle_radius_max":    15.0,
     "obstacle_spawn_clearance": 10.0,
 
+    # ----- Crash avoidance (per-agent penalties) -------------------------
+    # Individual (NOT shared) penalties added to each UAV's own reward:
+    #   r_i = r_team + r_crash_i
+    # A crash rolls the offender back + zeroes its velocity (soft-stop);
+    # the episode does NOT terminate.  Defaults 0.0 = feature off, which
+    # byte-preserves the pre-crash shared-reward behaviour.  The crash-
+    # avoidance run turns these on via CLI (obstacle ~2.0, ally ~1.0).
+    "crash_obstacle_penalty":  0.0,   # per-step penalty for hitting an obstacle
+    "crash_blue_penalty":      0.0,   # per-step penalty for a blue-blue collision
+    "blue_collision_radius":   2.0,   # m; < 3 m capture radius so it's a true crash
+
     # ----- Ally comms -----------------------------------------------------
     # bb_edge_visible IS present in the Stage 4 obs dict and is gated by
     # ``sensor_radius`` (bb_edge_visible[e] = 1 iff the two blues are

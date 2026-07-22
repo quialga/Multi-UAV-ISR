@@ -108,10 +108,15 @@ class VectorPursuitEnv:
         # Per-env episode-tracking state.
         self._ep_return = np.zeros(self.n_envs, dtype=np.float32)
         self._ep_length = np.zeros(self.n_envs, dtype=np.int32)
+        # Per-episode crash accumulators (summed over the episode).
+        self._ep_obs_crashes  = np.zeros(self.n_envs, dtype=np.int32)
+        self._ep_blue_crashes = np.zeros(self.n_envs, dtype=np.int32)
         # Completed episodes ring buffer.
         self.episode_returns: Deque[float] = deque(maxlen=episode_buffer_size)
         self.episode_lengths: Deque[int]   = deque(maxlen=episode_buffer_size)
         self.episode_caught:  Deque[int]   = deque(maxlen=episode_buffer_size)
+        self.episode_obs_crashes:  Deque[int] = deque(maxlen=episode_buffer_size)
+        self.episode_blue_crashes: Deque[int] = deque(maxlen=episode_buffer_size)
 
     # ------------------------------------------------------------------ #
     #  Red-policy mixing                                                   #
@@ -191,7 +196,10 @@ class VectorPursuitEnv:
         """
         Step every env.  Returns:
           obs:     dict of arrays for the GNN policy
-          rewards: (n_envs,) — team reward per env
+          rewards: (n_envs, n_agents) — PER-AGENT reward r_i.  With crash
+                   penalties off, every agent's reward equals the shared
+                   team reward (so a shared-reward consumer can just take
+                   ``rewards[:, 0]``).
           dones:   (n_envs,)
           infos:   list[dict]
         """
@@ -199,8 +207,9 @@ class VectorPursuitEnv:
             f"actions shape {actions.shape} != " \
             f"{(self.n_envs, self.n_agents, self.action_dim)}"
 
+        A = self.n_agents
         obs_batch = self._empty_batch()
-        reward_batch = np.zeros(self.n_envs, dtype=np.float32)
+        reward_batch = np.zeros((self.n_envs, A), dtype=np.float32)
         done_batch   = np.zeros(self.n_envs, dtype=np.float32)
         infos: List[Dict] = []
 
@@ -213,9 +222,14 @@ class VectorPursuitEnv:
 
             first = self.possible_agents[0]
             done = bool(term_d[first] or trunc_d[first])
+            r_vec = np.array([rew_d[name] for name in self.possible_agents],
+                             dtype=np.float32)                  # (A,)
 
-            self._ep_return[i] += float(rew_d[first])
+            # Logging return = mean per-agent return (== team when shared).
+            self._ep_return[i] += float(r_vec.mean())
             self._ep_length[i] += 1
+            self._ep_obs_crashes[i]  += int(info_d[first]["obstacle_crashes"])
+            self._ep_blue_crashes[i] += int(info_d[first]["blue_crashes"])
 
             if done:
                 snap = env.state_snapshot()
@@ -223,15 +237,19 @@ class VectorPursuitEnv:
                 self.episode_returns.append(float(self._ep_return[i]))
                 self.episode_lengths.append(int(self._ep_length[i]))
                 self.episode_caught.append(n_caught)
+                self.episode_obs_crashes.append(int(self._ep_obs_crashes[i]))
+                self.episode_blue_crashes.append(int(self._ep_blue_crashes[i]))
                 self._ep_return[i] = 0.0
                 self._ep_length[i] = 0
+                self._ep_obs_crashes[i]  = 0
+                self._ep_blue_crashes[i] = 0
 
                 # Auto-reset with fresh red policy.
                 self._resample_red_policy(env)
                 env.reset()
 
             self._fill_row(obs_batch, i, env)
-            reward_batch[i] = float(rew_d[first])
+            reward_batch[i] = r_vec
             done_batch[i]   = 1.0 if done else 0.0
             infos.append(info_d)
 
@@ -247,16 +265,23 @@ class VectorPursuitEnv:
             return {
                 "n_completed": 0, "mean_return": 0.0, "std_return": 0.0,
                 "mean_length": 0.0, "mean_caught": 0.0,
+                "mean_obstacle_crashes": 0.0, "mean_blue_crashes": 0.0,
             }
         rs = np.array(self.episode_returns, dtype=np.float32)
         ls = np.array(self.episode_lengths, dtype=np.float32)
         cs = np.array(self.episode_caught,  dtype=np.float32)
+        ocs = (np.array(self.episode_obs_crashes, dtype=np.float32)
+               if self.episode_obs_crashes else np.zeros(1, dtype=np.float32))
+        bcs = (np.array(self.episode_blue_crashes, dtype=np.float32)
+               if self.episode_blue_crashes else np.zeros(1, dtype=np.float32))
         return {
             "n_completed": int(len(rs)),
             "mean_return": float(rs.mean()),
             "std_return":  float(rs.std()),
             "mean_length": float(ls.mean()),
             "mean_caught": float(cs.mean()),
+            "mean_obstacle_crashes": float(ocs.mean()),
+            "mean_blue_crashes":     float(bcs.mean()),
         }
 
     def close(self) -> None:

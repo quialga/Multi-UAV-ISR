@@ -419,17 +419,34 @@ class GNNStage4Policy(nn.Module):
         self,
         full_state: Dict[str, torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Returns (V, h_blue).  The h_blue is the target for the aux
-        hidden loss."""
+        """
+        Agent-conditioned centralised value V(s, i), one per blue.
+        Returns (V, h_blue) where V is (B, N_blue) and h_blue is the
+        target for the aux hidden loss.
+
+        V(s, i) reads off agent i's OWN critic node embedding
+        ``h_blue[i]`` (which has already absorbed the whole graph via
+        2 rounds of message passing -- teammates, reds, obstacles) in
+        place of the pooled ``sum(h_blue)`` a shared-reward V(s) would
+        use.  The graph node IS the agent identity, so no one-hot id is
+        needed.  Same trunk input width as the old pooled V(s)
+        (``d_hidden + n_red*d_hidden + n_obs*d_hidden``), so a
+        shared-reward critic checkpoint warm-starts cleanly -- only the
+        semantics of the first ``d_hidden`` block change (per-agent
+        embedding vs pooled sum).
+        """
         h_blue, h_red, h_obs = self.critic_encode(full_state)
-        B = h_blue.shape[0]
-        blue_summary = h_blue.sum(dim=1)                  # (B, d)
-        red_summary  = h_red.reshape(B, -1)               # (B, N_red * d)
-        parts = [blue_summary, red_summary]
+        B, N, d = h_blue.shape
+        red_summary = h_red.reshape(B, -1)                # (B, N_red * d) global
+        global_parts = [red_summary]
         if h_obs is not None:
-            parts.append(h_obs.reshape(B, -1))            # (B, N_obs * d)
-        state_repr = torch.cat(parts, dim=-1)
-        value = self.critic_head(self.critic_trunk(state_repr)).squeeze(-1)
+            global_parts.append(h_obs.reshape(B, -1))     # (B, N_obs * d) global
+        global_ctx = torch.cat(global_parts, dim=-1)      # (B, (N_red+N_obs)*d)
+        # Broadcast the global (red/obstacle) context to every blue and
+        # concat with that blue's own embedding -> per-agent input.
+        global_exp = global_ctx.unsqueeze(1).expand(B, N, -1)
+        per_agent = torch.cat([h_blue, global_exp], dim=-1)   # (B, N, trunk_in)
+        value = self.critic_head(self.critic_trunk(per_agent)).squeeze(-1)  # (B, N)
         return value, h_blue
 
     # ------------------------------------------------------------------ #
@@ -518,6 +535,28 @@ class GNNStage4Policy(nn.Module):
                 continue
             if target in my_sd and my_sd[target].shape == v.shape:
                 my_sd[target].copy_(v)
+                n_copied += 1
+        self.load_state_dict(my_sd)
+        return n_copied
+
+    def load_full_stage4(self, path) -> int:
+        """
+        Soft-load ALL shape-matching tensors (actor AND critic) from
+        another GNNStage4Policy checkpoint.  Used to warm-start the
+        crash-avoidance run from a converged obstacle policy
+        (e.g. obstacles_v1): the architecture is identical, and the
+        per-agent V(s,i) critic keeps the same tensor SHAPES as the
+        old pooled V(s), so every actor + critic + head tensor copies
+        in.  Returns the count copied.
+        """
+        import torch as _torch
+        ckpt = _torch.load(path, map_location="cpu", weights_only=False)
+        src = ckpt["policy_state"] if "policy_state" in ckpt else ckpt
+        my_sd = self.state_dict()
+        n_copied = 0
+        for k, v in src.items():
+            if k in my_sd and my_sd[k].shape == v.shape:
+                my_sd[k].copy_(v)
                 n_copied += 1
         self.load_state_dict(my_sd)
         return n_copied

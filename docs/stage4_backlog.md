@@ -32,6 +32,29 @@ v6.x architecture.  Kept as short pointers so the reader can trace
   Phase A decay; the "age" channel would only add value if the
   policy needed to distinguish stale-high-confidence from
   fresh-medium-confidence, which decay already handles.  Not needed.
+- **§1 blue↔obstacle crash penalty + §2 blue↔blue crash penalty** —
+  landed together as the crash-avoidance extension (branch
+  `feature/crash-avoidance`).  Per-agent (INDIVIDUAL, not shared)
+  penalties: `r_i = r_team + r_crash_i`.  This required moving the
+  whole Stage 4 RL path from shared to per-agent: the critic now
+  estimates an agent-conditioned `V(s, i)` (reads blue `i`'s own
+  post-message-passing node embedding instead of the pooled
+  `sum(h_blue)` — same trunk width, so a shared-reward checkpoint
+  still warm-starts cleanly), GAE / advantages / returns are per
+  `(env, agent)`, and dones stay per-env (crashes do NOT terminate —
+  soft-stop rollback).  Warm-started BOTH actor and critic from the
+  converged obstacle policy via `--warm-start-full`
+  (`load_full_stage4`).  Penalties are 0.0 by default (byte-preserves
+  the pre-crash shared-reward path); the run enables them via
+  `--crash-obstacle-penalty` / `--crash-blue-penalty` /
+  `--blue-collision-radius`.  TB scalars `crash/obstacle_rate`,
+  `crash/ally_rate`.  See `isr/env/pursuit_env.py`,
+  `isr/agents/gnn_stage4_policy.py::critic_forward`,
+  `isr/train/graph_buffer.py::Stage4RolloutBuffer`,
+  `tests/test_crash_avoidance.py`.  Deferred to a v2/v3 escalation:
+  the `--terminate-on-crash` hard-termination variant (rejected for
+  v1 — an aborted episode discards the catches already earned and
+  injects a warm-start distribution shift).
 - **§13a doctrine reframe** — belief map is now consistently
   described as a mission-command layer environment latent (sibling
   of `true_occupancy`, not an emergent property of TDL messaging)
@@ -41,7 +64,13 @@ v6.x architecture.  Kept as short pointers so the reader can trace
   `bb_edge_visible`.  §13b (per-UAV command-link gating on the
   peaks) remains open — see below.
 
-## 1. Blue ↔ obstacle crash penalty
+## 1. Blue ↔ obstacle crash penalty  — ✅ LANDED (see LANDED section)
+
+> Shipped as the per-agent crash-avoidance extension.  The v1 sketch
+> below is kept for provenance, with two deltas from what landed:
+> (a) the penalty is INDIVIDUAL (`r_crash_i` on the offender), not
+> accumulated in the shared team reward; (b) the default magnitude is
+> 0.0 (off) with the run setting ~2.0 via CLI, not a hard-coded 5.0.
 
 **Motivation.** Currently, when a blue attempts to move into an
 obstacle, kinematics clip its position to the obstacle boundary
@@ -60,7 +89,13 @@ obstacles.  A real UAV crashes.
 
 **Blocking**: none.  ~15 lines in `PursuitEnv._step`.
 
-## 2. Blue ↔ blue crash penalty
+## 2. Blue ↔ blue crash penalty  — ✅ LANDED (see LANDED section)
+
+> Shipped alongside §1.  Landed as `blue_collision_radius` (default
+> 2.0 m) with a symmetric per-agent penalty (both blues in a colliding
+> pair eat it), matching the v1 recommendation below.  Positions are
+> NOT clipped apart (the "optionally clip" note was dropped — the
+> penalty alone teaches routing around allies).
 
 **Motivation.** Same argument — real UAVs collide.  Without this,
 the policy has no reason to route around allies.
