@@ -182,18 +182,21 @@ lose ally comms more aggressively than they should.
   the arena; matches the aspirational TDL doctrine).  When set,
   `bb_edge_visible[e] = 1 iff dist ≤ comms_radius` -- **independent
   of `sensor_radius`**.
-- Update every docstring / doc reference that currently says
-  "`bb_edge_visible ≡ 1`" or "allies always share GPS" to reflect
-  the actual sensor-range gating (until this change ships).
 - Optional: blue node features gain a `n_comms_lost` count (how many
   allies are out of comms this step) — helps the policy know when
   it's in a degraded-comms situation.
 
+(The doctrine-vs-code drift the docstrings previously showed --
+docstrings claiming "always-on TDL" while the code sensor-gated
+`bb_edge_visible` -- was cleaned up in commit `718b7bd`.  Every
+mention now describes the actual sensor-gated behaviour or is
+explicitly marked as "design predicted / never landed".)
+
 **Blocking**: none.  ~5 lines in `_compute_edge_visibility` to plumb
-the new knob, plus a docstring sweep.  Priority is low because
-`sensor_radius`-gated bb visibility already gives an interesting
-partial-comms behaviour; would matter for a scenario deliberately
-studying TDL loss (jamming, urban shadowing).
+the new knob.  Priority is low because `sensor_radius`-gated bb
+visibility already gives an interesting partial-comms behaviour;
+would matter for a scenario deliberately studying TDL loss (jamming,
+urban shadowing).
 
 ## 8. Per-channel sensor noise
 
