@@ -1,15 +1,42 @@
 # Stage 4 — Belief maps + sensor noise + obstacles + occlusion
 
 Design spec for the fourth stage of the Multi-UAV ISR curriculum.
-Extends the Stage 3 CTDE recurrent policy with a per-UAV occupancy-
-grid belief map maintained via classical Bayesian log-odds updates
-(Moravec & Elfes, 1985/1989), sensor noise, static circular obstacles,
-and ray-cast occlusion.
+Extends the Stage 3 CTDE recurrent policy with a Bayesian occupancy-
+grid belief map (Moravec & Elfes, 1985/1989), sensor noise, static
+circular obstacles, and analytic occlusion.
 
 See [`stage3_results.md`](stage3_results.md) for the Stage 3 baseline
-this stage extends, and [`stage4_backlog.md`](stage4_backlog.md) for
-deferred items (moving obstacles, cone sensor, crash penalties,
-learnable sensor models, etc.).
+this stage extends, [`stage4_results.md`](stage4_results.md) for the
+landed architecture and numbers, and [`stage4_backlog.md`](stage4_backlog.md)
+for deferred items.
+
+> **⚠️ Status — Stage 4 LANDED (v6.x). Design doc kept as historical
+> record.**
+>
+> This document was the *pre-implementation* spec (June-July 2026).
+> Several key predictions **turned out to be wrong** during the redesign
+> journey (v1 CNN → v6 typed GNN), and the sections below reflect the
+> original plan, not the final code. The authoritative descriptions
+> are in `stage4_results.md` and the module docstrings. In particular:
+>
+> | | Design predicted | What actually landed |
+> |---|---|---|
+> | Belief map | Per-UAV `(N_blue, 2, 26, 26)` | ONE global fused map `(2, 26, 26)` — team-shared common operational picture over TDL |
+> | Actor state extractor | Belief CNN → 64-dim embedding | **No CNN.** Belief-map peaks + detection-seeded live tracks → typed graph edges |
+> | Reds in the graph | Removed (belief-map only) | Kept as typed nodes with `rb_edges` — the Stage 3 GNN restored |
+> | Obstacles in the graph | Not in graph, only in belief map | Typed **obstacle nodes** with `ob_edges` (v6.x adds a third node type) |
+> | Warm-start critic | None (cold-start) | **Warm from Stage 1** `scaling_gnn/best.pt` — Stage 3's stabiliser restored |
+> | Aux hidden loss | Off (`0.0`), diagnostic BCE only | **On (`0.2`, live-critic target)** — Stage 3 opt-C ported |
+> | Ally overlay channel | Ally positions as deterministic belief channel | Removed — ally state flows via `bb_edges` (precise), not the belief map |
+> | Occlusion test | Sampled ray-march | **Exact analytic segment-disk intersection** |
+>
+> The v6 architecture converged; the v1 CNN design did not. See
+> `stage4_results.md` §"The redesign journey" for the full v1→v6 story
+> and the load-bearing insight (a config regression, three coupled
+> Stage 3 stabilisers dropped at once) that finally unblocked it.
+> The historical spec below is preserved for the design record.
+
+---
 
 ## 1. Motivation and hypothesis
 

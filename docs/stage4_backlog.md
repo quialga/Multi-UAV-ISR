@@ -7,6 +7,32 @@ ships or when specific weaknesses appear in the results.
 
 Ordered roughly by expected impact × implementation ease.
 
+## LANDED (during Stage 4 execution — no longer backlog)
+
+Items originally deferred here that ended up shipping as part of the
+v6.x architecture.  Kept as short pointers so the reader can trace
+"why is this in the code if it says backlog?":
+
+- **§6 aux hidden loss** — landed as `aux_hidden_coef=0.2` (Stage 3
+  opt-C ported: `MSE(actor_h_blue, critic_h_blue.detach())`, live-
+  critic target).  See `isr/train/ppo.py::ppo_update_stage4` and
+  `stage4_results.md` for why it was necessary (dropping it was one
+  of the three coupled Stage 3 stabilisers whose absence caused the
+  1.4/3 plateau).  The frozen-random-projection / EMA / contrastive
+  variants originally proposed here remain open, but only worth
+  revisiting if the live-critic version proves insufficient.
+- **§7 ally comms range** — implemented, but as a `sensor_radius`-
+  gated `bb_edge_visible` rather than a separate `comms_radius`
+  knob (see §7 note below).
+- **§11 belief-map decay** — landed as Phase A's `enemy_belief_decay`
+  (default `0.99`, `L ← γ·L` per step, enemy channel only).  See
+  `_predict_enemy_belief` and `stage4_results.md`.
+- **§12 time-since-last-update channel** — subsumed by §11.  A cell
+  not observed for many steps naturally loses confidence via the
+  Phase A decay; the "age" channel would only add value if the
+  policy needed to distinguish stale-high-confidence from
+  fresh-medium-confidence, which decay already handles.  Not needed.
+
 ## 1. Blue ↔ obstacle crash penalty
 
 **Motivation.** Currently, when a blue attempts to move into an
@@ -108,15 +134,17 @@ self-calibrate.
 Moving belief updates into the policy (as a first "layer" of the
 actor) is the cleanest solution.
 
-## 6. Contrastive / teacher-student aux loss
+## 6. Contrastive / teacher-student aux loss  **[SUPERSEDED — see LANDED §6]**
 
-**Motivation.** Stage 3 showed that a well-designed aux loss can help
-(the `freeze-critic + high-aux + Opt 1` combo).  Stage 4 baseline
-skips aux entirely (`aux_hidden_coef=0`) because we can't warm-start
-the critic.  A different aux formulation can re-introduce this
-regularisation without the warm-start dependency.
+The Stage-3-style live-critic aux (`MSE(actor_h_blue,
+critic_h_blue.detach())`, `aux_hidden_coef=0.2`) shipped in v6.x and
+was one of the recipe pieces that unblocked convergence.  The three
+alternative formulations sketched below (frozen random projection,
+EMA critic encoder, contrastive) remain OPEN as *upgrades* — worth
+trying only if the live-critic version turns out to be a limiter in
+some future stage.
 
-**Sketch — three variants:**
+**Original sketch — three variants:**
 1. Frozen random projection: `frozen_proj = Linear(true_occupancy.flatten()
    → 64)` init and never trained.  Aux: `MSE(belief_encoder(belief_maps),
    frozen_proj(true_occupancy).detach())`.
@@ -127,24 +155,45 @@ regularisation without the warm-start dependency.
    together, push away from far-timesteps.  No target network needed.
    Larger implementation cost.
 
-**Blocking**: only worth pursuing if the baseline shows the encoder
-is failing to preserve belief information (measured by the
-diagnostic BCE staying high).
+**Blocking**: only revisit if aux 0.2 (live critic) plateaus somewhere
+we care about.  Current runs (`belief_v3` 3.00/3, `obstacles_v1`
+2.95/3) do not motivate the extra cost.
 
-## 7. Decoupled `comms_radius` for ally GPS uplink
+## 7. Decoupled `comms_radius` for ally GPS uplink  **[PARTIALLY LANDED]**
 
-**Motivation.** In Stage 4 baseline, `bb_edge_visible ≡ 1` — allies
-always share GPS.  Realistic for LOS radio in an open arena; wrong
-for jamming, terrain shadowing, or urban environments.
+**Current state (v6.x — different from the sketch below).**
+`bb_edge_visible` is NOT identically 1 as originally planned — it is
+gated by `sensor_radius`:
 
-**Sketch.**
-- New env param `comms_radius`.  Default = `None` (unbounded, same
-  as v1).  When set, `bb_edge_visible[e] = 1 iff dist ≤ comms_radius`.
-- Blue node features gain a `n_comms_lost` count (how many allies
-  are out of comms this step) — helps the policy know when it's in
-  a degraded-comms situation.
+```
+bb_edge_visible[e]  =  1 iff  dist(blue_i, blue_j)  <=  sensor_radius
+```
 
-**Blocking**: none — trivial extension of the Stage 3 visibility mask.
+(See `PursuitEnv._compute_edge_visibility` and
+`structured_belief_observation`.)  This means the "always-on TDL"
+narrative in some docstrings is aspirational — the actual code
+gates ally comms at sensor range.  This is *close enough* to a
+realistic ISR system that we shipped with it, but the sensor range
+(40 m) is well below a realistic TDL range (kilometres), so blues
+lose ally comms more aggressively than they should.
+
+**Still-open upgrade — decouple the two ranges.**
+- New env param `comms_radius`.  Default: `None` (unbounded within
+  the arena; matches the aspirational TDL doctrine).  When set,
+  `bb_edge_visible[e] = 1 iff dist ≤ comms_radius` -- **independent
+  of `sensor_radius`**.
+- Update every docstring / doc reference that currently says
+  "`bb_edge_visible ≡ 1`" or "allies always share GPS" to reflect
+  the actual sensor-range gating (until this change ships).
+- Optional: blue node features gain a `n_comms_lost` count (how many
+  allies are out of comms this step) — helps the policy know when
+  it's in a degraded-comms situation.
+
+**Blocking**: none.  ~5 lines in `_compute_edge_visibility` to plumb
+the new knob, plus a docstring sweep.  Priority is low because
+`sensor_radius`-gated bb visibility already gives an interesting
+partial-comms behaviour; would matter for a scenario deliberately
+studying TDL loss (jamming, urban shadowing).
 
 ## 8. Per-channel sensor noise
 
@@ -195,36 +244,35 @@ completely ignores).
 **Blocking**: only worth the complexity if the Stage 4 baseline
 plateaus below acceptance and the fused BCE stays high.
 
-## 11. Belief-map decay / forgetting
+## 11. Belief-map decay / forgetting  **[LANDED as Phase A decay]**
 
-**Motivation.** Stage 4 baseline keeps log-odds indefinitely.  If a
-red was seen at cell X but has moved to cell Y in the intervening
-steps, the belief map still says P(enemy at X) is high — stale.
+Shipped as `enemy_belief_decay=0.99` (default) in
+`_predict_enemy_belief` — each step, before the sensor update, the
+enemy-channel log-odds are pulled toward 0 by `L ← γ·L`.  Obstacle
+channel untouched (static → prediction is identity), matching the
+"downside fix" the original sketch called for.
 
-**Sketch.**
-- Per-step decay `L *= exp(-dt / τ_forget)` where `τ_forget ~ 50`
-  steps.  Belief "half-life".
-- Simple, closed-form, no learning needed.
-- Downside: also forgets obstacle beliefs (which are stationary).  Fix
-  by applying decay only to the enemy channel.
+The paired diffusion step (`enemy_belief_diffusion=0.2`, isotropic
+random-walk motion model applied in probability space via a 3×3
+convolution) was added alongside as the second half of the Bayesian
+predict step; that was NOT in this backlog item, it emerged during
+Phase A design.  See `stage4_results.md` for both.
 
-**Blocking**: none.  Add if the policy shows "chasing ghost targets"
-behaviour.
+## 12. Time-since-last-update channel  **[SUBSUMED by §11]**
 
-## 12. Time-since-last-update channel
+The "age" channel is no longer needed: Phase A's decay already
+provides the same functional signal in compressed form — an
+unobserved cell's log-odds shrink geometrically toward 0
+("unknown"), so stale-high-confidence cells naturally become
+lower-confidence over time.
 
-**Motivation.** Related to §11.  If we don't want to decay the belief,
-we can still tell the policy how stale each cell is by adding an "age"
-channel.
-
-**Sketch.**
-- New third channel: `age[cell] = steps since last observation`.
-- Incremented at each step for un-observed cells; reset to 0 on
-  observation.
-- Policy learns to trust fresh observations more than stale ones.
-
-**Blocking**: none.  Adds one channel (bumps CNN input to 3
-channels).
+The one thing an explicit age channel would give that decay does not
+is *bi-directional* stale detection — distinguishing "stale +positive"
+from "stale -negative" (both decay to 0 in log-odds, so from the
+network's point of view they become indistinguishable from unknown).
+If a future stage needs to tell "cell was recently observed as empty"
+apart from "cell has never been observed," this item may reopen.
+Not motivated by the current results.
 
 ---
 

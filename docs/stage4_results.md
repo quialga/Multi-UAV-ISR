@@ -60,23 +60,44 @@ anywhere.
 
 ## Results
 
-Both runs use the Stage 3 winning recipe (see *Training arguments*),
-400 rollouts, `stationary:1,random:1,run:1` red mix.
+Two runs, both under the Stage 3 winning recipe (see *Training
+arguments*), 400 rollouts, `stationary:1,random:1,run:1` red mix.
+Numbers are the **deterministic** `[det eval]` metric (greedy actions,
+20 episodes per red type, seed base 30000) at rollout 400.
 
-| Actor input | Train caught (stochastic) | Reward | Convergence |
-|---|---|---|---|
-| **Oracle** (ground-truth graph) | 3/3 | ~22–23 | faster |
-| **Belief** (noisy, detection-seeded) | 3/3 | ~20–21 | slower |
+| Run | stationary | random | **run** (evader) | **mean** |
+|---|---|---|---|---|
+| `belief_v3` — no obstacles | **3.00/3** | **3.00/3** | **3.00/3** | **3.00/3** |
+| `obstacles_v1` — 4 obstacles + occlusion + collision-aware evader | 2.95/3 | 3.00/3 | 2.90/3 | **2.95/3** |
 
-- Oracle recovers Stage 3's level (Stage 3 was 2.94/3 stochastic),
-  confirming the CTDE setup is sound.
-- The **belief–oracle gap is small** (~1–2 reward, slightly slower
-  convergence) — the genuine, irreducible cost of acting on partial,
-  noisy perception rather than ground truth. A small gap means the
-  perception layer is doing its job.
+**Headline: −0.05 catches** for the full realistic difficulty stack
+(obstacles + line-of-sight occlusion + a collision-avoiding evader
+that steers around obstacles instead of pinning itself on them) —
+and this on top of an intentional handicap: `obstacles_v1` warm-started
+from the Stage 1 checkpoint with the **obstacle-branch critic cold**
+(29 tensors copy, 30 for the no-obstacle run). A tiny gap under stacked
+difficulty is a strong result for the perception layer.
 
-> Record the deterministic `[det eval]` mean (and the `run=` /
-> evader column) for both runs as the clean headline metric.
+**Convergence speed** (deterministic mean over rollouts):
+
+| Milestone | `belief_v3` | `obstacles_v1` |
+|---|---|---|
+| mean ≥ 2.5 | rollout 75 | rollout 150 (~2× slower) |
+| mean ≥ 2.9 | rollout 150 | rollout ~400 (only at the end) |
+| first mean = 3.00 | rollout **275**, held for 6 evals | never (peaks 2.95) |
+
+Two things worth noting in the trajectories:
+
+- **The `run` column becomes the hardest metric under obstacles**
+  (2.90) — reversing `belief_v3`'s ordering where all three red types
+  hit 3.00 equally. That's exactly the signature of the collision-
+  aware evader working as intended: the difficulty now shows up on
+  the harder adversary, not on the strawman.
+- `obstacles_v1` plateaus around 2.7-2.85 from rollout 175-375 and
+  only reaches 2.95 on the final eval — it *may* not be fully
+  converged. A longer run (600 rollouts) or the two-phase curriculum
+  (warm the obstacle-critic branch via a full-obs pretrain) are the
+  natural escalations if the last 0.05 matters.
 
 ---
 
@@ -102,11 +123,19 @@ enemy_belief_decay 0.99, enemy_belief_diffusion 0.2
 sensor_pos_noise_std 1.0
 ```
 
-Reproduce:
+Reproduce (both runs):
 ```
+# belief_v3 — no obstacles
 python scripts/train_stage4.py --n-rollouts 400 --n-obstacles 0 \
   --red-policy-mix stationary:1,random:1,run:1 \
   --eval-interval 25 --run-name belief_v3
+
+# obstacles_v1 — 4 obstacles + occlusion + collision-aware evader
+# (uses default n_obstacles=4; the run heuristic auto-avoids
+# obstacles when they are present)
+python scripts/train_stage4.py --n-rollouts 400 \
+  --red-policy-mix stationary:1,random:1,run:1 \
+  --eval-interval 25 --run-name obstacles_v1
 ```
 
 ---
@@ -183,9 +212,21 @@ actual logged args before concluding an architectural fault.
 
 ## What remains on the table
 
-- **Obstacles end-to-end.** The obstacle graph path (nodes + ob edges +
-  occlusion) is wired and unit-tested, but a full `--n-obstacles 4`
-  training run against the belief path is not yet reported.
+- **Close the last 0.05 on `obstacles_v1`.** `obstacles_v1` still hit
+  its peak (2.95) at the final eval and was warm-started with the
+  **obstacle-critic branch cold** (29/30 tensors). Two natural
+  escalations: (a) a longer single-phase run (400 → 600 rollouts,
+  same command) since the trajectory was still trending up; or (b)
+  the **two-phase curriculum** — Phase 1 pretrains with a
+  full-obs actor on obstacles to produce an obstacle-aware critic,
+  Phase 2 warms Stage-4-with-belief from that Phase 1 checkpoint.
+- **Crash penalty.** Blues currently hit obstacles for a soft stop
+  with no reward penalty (see `docs/stage4_backlog.md §1`). A
+  navigation-realistic run should add it.
+- **Occlusion-seeking evader.** The evader currently avoids obstacle
+  *collisions* but does not deliberately hide behind them to break
+  line-of-sight — the "boss" adversary that weaponizes occlusion,
+  held in reserve as a harder stress test.
 - **Phase B — per-target Bayesian filter.** Phase A is an isotropic
   approximation on the shared log-odds grid. Phase B (per-target
   normalised distributions, velocity-directed anisotropic prediction
@@ -198,12 +239,24 @@ actual logged args before concluding an architectural fault.
 
 ---
 
-## Stage 4 — closed (no-obstacle regime).
+## Stage 4 — closed.
 
-The belief-driven policy matches the fully-observable oracle at 3/3
-captures, at a small honest cost for acting under uncertainty. The
-perception front-end (global Bayesian belief map → prediction step →
-detection-seeded tracks → typed GNN) is validated; the model-based /
-learning-based split the design argued for holds up empirically. The
-remaining open items (full obstacle run, Phase B filter, noise sweep)
-are extensions, not blockers.
+Both regimes land above 2.9/3 captures under deterministic evaluation
+against a mixed red distribution (stationary + random + collision-
+avoiding evader):
+
+- **No-obstacle regime** (`belief_v3`): **3.00/3** — the belief-
+  driven policy matches the fully-observable oracle exactly.
+- **Full-difficulty regime** (`obstacles_v1`, 4 obstacles + occlusion
+  + collision-aware evader, obstacle-critic branch cold-started):
+  **2.95/3** — a 0.05-catch honest cost for the entire realistic
+  perception stack.
+
+The perception front-end (global Bayesian belief map → prediction
+step → detection-seeded tracks → typed GNN with obstacle nodes) is
+validated. The model-based / learning-based split the design argued
+for holds up empirically. The remaining open items (closing the last
+0.05 under obstacles via longer training or the two-phase critic
+curriculum, crash penalty, occlusion-seeking evader, Phase B
+per-target filter, noise sweep) are extensions and stress tests, not
+blockers on the core stage.
