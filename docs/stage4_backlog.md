@@ -32,6 +32,14 @@ v6.x architecture.  Kept as short pointers so the reader can trace
   Phase A decay; the "age" channel would only add value if the
   policy needed to distinguish stale-high-confidence from
   fresh-medium-confidence, which decay already handles.  Not needed.
+- **§13a doctrine reframe** — belief map is now consistently
+  described as a mission-command layer environment latent (sibling
+  of `true_occupancy`, not an emergent property of TDL messaging)
+  across every doctrine paragraph in `pursuit_env.py`,
+  `stage4_default.py`, `stage4_results.md`, and the relevant test.
+  Dissolved the residual tension with sensor-gated
+  `bb_edge_visible`.  §13b (per-UAV command-link gating on the
+  peaks) remains open — see below.
 
 ## 1. Blue ↔ obstacle crash penalty
 
@@ -279,17 +287,18 @@ Not motivated by the current results.
 
 ## 13. Reframe belief map as MISSION-COMMAND state (doctrine + code)
 
-**Motivation.**  The global fused belief map is currently justified in
-docstrings as an emergent property of the blue team's TDL messaging
-("Bayesian fusion of independent sensors is log-odds addition, and
-the always-on TDL comms assumption means sharing detections over the
-same link is realistic").  That reading is coherent but has a residual
-tension with the code: `bb_edge_visible` is sensor-radius-gated per
-step, so a UAV out of comms with its neighbours nonetheless keeps
-contributing fresh evidence to the "shared" map -- which shouldn't be
-possible on a strict per-UAV view.
+**Motivation.**  Earlier Stage 4 docstrings justified the global
+fused belief map as an emergent property of the blue team's TDL
+messaging ("Bayesian fusion of independent sensors is log-odds
+addition, and the always-on TDL comms assumption means sharing
+detections over the same link is realistic").  That reading was
+coherent but had a residual tension with the code: `bb_edge_visible`
+is sensor-radius-gated per step, so a UAV out of comms with its
+neighbours nonetheless kept contributing fresh evidence to the
+"shared" map -- which shouldn't be possible on a strict per-UAV view.
 
-The cleaner doctrinal position:
+The cleaner doctrinal position (now the one used throughout the code
+and docs):
 
 > The global belief map represents the shared operational picture
 > maintained by the mission command layer.  It is an environment-level
@@ -299,34 +308,39 @@ The cleaner doctrinal position:
 This matches real ISR C2 (CAOC / TOC / AWACS run a persistent fused
 track picture; UAVs receive updates via the C2 downlink), and it puts
 the belief map in the same category as `true_occupancy` -- both are
-environment-level latents, not per-UAV observations.
+environment-level latents (belief noisy; `true_occupancy` ground truth
+for the CTDE critic).
 
-**Sketch.**  Two increments, do them in order:
+### 13a — Docstring reframe  **[LANDED — commit `b0b7e6b`]**
 
-- **13a — Docstring reframe (cheap, do first).**  Rewrite the doctrine
-  paragraphs in `_update_belief_maps`, `_enemy_graph_from_tracks`, and
-  `structured_belief_observation` to describe the map as command-layer
-  fused state, not as "what the team sees over TDL".  Removes the
-  "always-on TDL assumption" hand-wave and the residual tension with
-  `bb_edge_visible`'s sensor gating.  No code change.  Also update
-  `stage4_results.md` §"Architecture" to lead with this framing.
+Rewrote the doctrine paragraphs in
+`PursuitEnv._update_belief_maps`,
+`_enemy_graph_from_tracks`,
+and `structured_belief_observation` (plus the constructor param,
+the attribute comment, the reset comment, `configs/stage4_default.py`,
+and `docs/stage4_results.md`'s architecture section) to describe the
+map as command-layer fused state instead of "what the team sees over
+TDL".  Dissolves the "always-on TDL assumption" hand-wave and the
+residual tension with `bb_edge_visible`'s sensor gating.  No code
+change; 52/52 tests unchanged.
 
-- **13b — Command-link gating on peaks (interesting, defer).**  Under
-  the strict reading, `belief_peaks_enemy` are also command-layer
-  outputs and should reach each UAV only if that UAV has a command
-  link.  New env param `command_link_visible[b]` (per-blue, could
-  default to always-on for backward compat; could become a function of
-  distance to a "base station" or of a jamming mask); when 0, that
-  UAV's rb edges fall back to the memory / no-info path (peak_conf 0,
-  zero velocity) regardless of what command has fused.  Enables a
-  clean study of degraded C2 -- a scenario that separates realistic
-  ISR sims from toy trackers.
+### 13b — Command-link gating on peaks  **[OPEN]**
 
-**Blocking.**  13a: none (~15 min of prose).  13b: needs the env knob
-plus a plumbing pass through `_build_enemy_tracks` / vec_env / obs
-schema; only worth building when we actually want to study C2 loss
-(so probably alongside the `comms_radius` decoupling in §7 --
-they're the "degraded network" pair).
+Under the strict reading, `belief_peaks_enemy` are also command-layer
+outputs and should reach each UAV only if that UAV has a command
+link.  New env param `command_link_visible[b]` (per-blue, could
+default to always-on for backward compat; could become a function of
+distance to a "base station" or of a jamming mask); when 0, that
+UAV's rb edges fall back to the memory / no-info path (peak_conf 0,
+zero velocity) regardless of what command has fused.  Enables a
+clean study of degraded C2 -- a scenario that separates realistic
+ISR sims from toy trackers.
+
+**Blocking.**  Needs the env knob plus a plumbing pass through
+`_build_enemy_tracks` / vec_env / obs schema; only worth building
+when we actually want to study C2 loss (so probably alongside the
+`comms_radius` decoupling in §7 -- they're the "degraded network"
+pair).
 
 ---
 
