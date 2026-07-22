@@ -1331,11 +1331,21 @@ class PursuitEnv(ParallelEnv):
 
         v6.1: ONE shared map for the whole blue team (common
         operational picture).  Every UAV's sensor evidence is added
-        into the same log-odds tensor — Bayesian fusion of independent
-        sensors is exactly log-odds addition, and the always-on TDL
-        comms assumption (allies already share GPS continuously) means
-        sharing detections over the same link is realistic (a Link-16
-        style fused surveillance picture).
+        into the same log-odds tensor -- Bayesian fusion of
+        independent sensors is exactly log-odds addition.
+
+        Doctrine caveat: the map is fused GLOBALLY here even though
+        the per-step ally-comms mask ``bb_edge_visible`` is gated by
+        ``sensor_radius``.  These model DIFFERENT things:
+          - the belief map is the persistent, network-backed common
+            operational picture -- once a detection is published on
+            the TDL, it lives in the map even if the reporting UAV
+            later drifts out of comms range;
+          - ``bb_edge_visible`` is the per-STEP GNN messaging mask,
+            i.e. "can I currently push my hidden state to that ally".
+        Backlog §7 tracks the decoupled ``comms_radius`` knob that
+        would make both use the same (unbounded, TDL-realistic)
+        range and remove any residual inconsistency.
 
         Channel layout (2 channels):
         - 0: P(enemy)    -- Bayesian log-odds from noisy sensors
@@ -1624,8 +1634,7 @@ class PursuitEnv(ParallelEnv):
         * The GLOBAL FUSED belief map -- one shared grid for the team,
           because they pool detections over the link (Bayesian fusion of
           independent sensors is log-odds addition).
-        * ``bb_edge_visible`` == 1 (allies always share GPS) and the
-          "out-of-range blue gets the fused track position, zero
+        * The "out-of-range blue gets the fused track position, zero
           velocity" branch above -- a UAV that cannot see a red itself
           still knows WHERE it is (position broadcast over TDL) but has
           no own-sensor Doppler for its VELOCITY, hence velocity = 0 for
@@ -1635,6 +1644,16 @@ class PursuitEnv(ParallelEnv):
         velocity unless you can see it yourself" -- the network shares
         POSITION (fused tracks), but VELOCITY is your own radar's Doppler
         measurement.
+
+        Doctrine caveat: the per-step GNN ally-comms mask
+        ``bb_edge_visible`` is currently GATED by ``sensor_radius``
+        (i.e. NOT identically 1) rather than by an independent
+        ``comms_radius`` matching a realistic TDL range.  The
+        belief-map fusion above still runs globally (that models the
+        NETWORK-BACKED persistent picture, not the per-step
+        messaging), so the two are consistent under the "map = TDL
+        history, bb_edge_visible = current messaging link" reading.
+        Backlog §7 tracks the decoupled ``comms_radius`` knob.
         """
         N = self.n_blue
         K = track_pos.shape[0]

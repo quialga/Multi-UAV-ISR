@@ -73,10 +73,15 @@ STAGE4_DEFAULTS = {
     "obstacle_radius_max":    15.0,
     "obstacle_spawn_clearance": 10.0,
 
-    # ----- Ally comms (choice B in design discussion) --------------------
-    # bb_edge_visible is not present in the Stage 4 obs dict (allies
-    # always share GPS in the baseline).  Kept as a config record only.
-    "bb_edge_visible_always_on": True,
+    # ----- Ally comms -----------------------------------------------------
+    # bb_edge_visible IS present in the Stage 4 obs dict and is gated by
+    # ``sensor_radius`` (bb_edge_visible[e] = 1 iff the two blues are
+    # within sensor_radius of each other, per _compute_edge_visibility).
+    # The "TDL always on, bb_edge_visible == 1" narrative in earlier
+    # design notes is aspirational: the code has no separate comms
+    # range knob.  See backlog §7 for the open item that would
+    # decouple comms_radius from sensor_radius (default None ==
+    # unbounded within the arena, matching the TDL doctrine).
 
     # ----- Warm start ----------------------------------------------------
     # v6.3: warm-start the CRITIC from the Stage 1 single-encoder GNN,

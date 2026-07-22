@@ -69,7 +69,7 @@ occupancy grid is insufficient and we need learned belief mechanisms
 | Obstacles | None | 4 (default) static circular obstacles, radii `[5, 15] m` |
 | Belief mechanism | Implicit via GRU hidden | Explicit 2-channel occupancy grid per UAV |
 | Sensor shape | Disk | Disk (cone deferred to backlog) |
-| Ally comms | Sensor-gated `bb_edge_visible` | Unconditional GPS (`bb_edge_visible ≡ 1`) |
+| Ally comms | Sensor-gated `bb_edge_visible` | Sensor-gated `bb_edge_visible` (design predicted `≡ 1` but the code kept the Stage 3 mask — see backlog §7) |
 | Warm-start critic | From Stage 2 `scaling_gnn/best.pt` | Cold-start (Stage 3 checkpoint incompatible with new obs dict + obstacle geometry) |
 | Aux loss | Belief-state distillation via critic encoder | Diagnostic-only BCE(belief, truth), no gradient |
 
@@ -183,7 +183,8 @@ the 26×26 grid keeps belief tensors under 40 KB per UAV.
 - `red_features`
 - `rb_edge_features`
 - `rb_edge_visible`
-- `bb_edge_visible`  (choice B — always 1 for GPS ally comms)
+- `bb_edge_visible`  (design predicted choice B: always 1 for GPS ally comms;
+  the code kept the sensor-gated Stage 3 mask — backlog §7)
 
 ### 4.2 Retained from Stage 3
 
@@ -335,6 +336,8 @@ STAGE4_DEFAULTS = {
     "obstacle_radius_max": 15.0,
 
     # ----- Ally comms ----------------------------------------------------
+    # NOTE: this flag was PROPOSED but never landed — the shipping
+    # config gates bb_edge_visible by sensor_radius.  See backlog §7.
     "bb_edge_visible_always_on": True,   # choice B — GPS uplink
 
     # ----- Policy --------------------------------------------------------
