@@ -203,9 +203,11 @@ class PursuitEnv(ParallelEnv):
         obstacle_spawn_clearance   Minimum distance blues and reds must
                                    spawn from any obstacle boundary.
         use_belief_maps            When True, allocate and update the
-                                   GLOBAL fused (team-shared) log-odds
-                                   belief map every step.  Costs some
-                                   compute; default False.
+                                   command-layer fused log-odds belief
+                                   map every step (env-level latent;
+                                   see doctrine note on
+                                   ``_update_belief_maps``).  Costs
+                                   some compute; default False.
         belief_grid_size           H = W for the belief tensor.  With
                                    arena_size = 130 and default 26,
                                    each cell is 5 m across.
@@ -356,9 +358,9 @@ class PursuitEnv(ParallelEnv):
         # ---- Stage 4 mutable state (obstacles + belief) ------------------
         # ``_obstacle_pos``  (n_obs, 2)   float32 -- centres
         # ``_obstacle_r``    (n_obs,)     float32 -- radii
-        # ``_belief_maps``   (C, H, W)    float32 -- GLOBAL fused log-odds
-        #   (v6.1: one shared map for the whole blue team — common
-        #   operational picture over TDL; Bayesian fusion = log-odds add)
+        # ``_belief_maps``   (C, H, W)    float32 -- command-layer fused
+        #   log-odds track picture (env-level latent; see doctrine note
+        #   on ``_update_belief_maps`` and docs/stage4_backlog.md §13)
         # All None when Stage 4 features are disabled.
         self._obstacle_pos: Optional[np.ndarray] = None
         self._obstacle_r:   Optional[np.ndarray] = None
@@ -402,7 +404,7 @@ class PursuitEnv(ParallelEnv):
         self._last_n_caught = 0
         self.agents = list(self.possible_agents)
 
-        # Stage 4: zero the GLOBAL fused belief map (C, H, W).
+        # Stage 4: zero the command-layer fused belief map (C, H, W).
         if self.use_belief_maps:
             self._belief_maps = np.zeros(
                 (self.belief_channels,
@@ -1326,26 +1328,36 @@ class PursuitEnv(ParallelEnv):
 
     def _update_belief_maps(self) -> None:
         """
-        Vectorised Bayesian log-odds update on the GLOBAL fused belief
-        map ``self._belief_maps`` of shape (C, H, W).
+        Vectorised Bayesian log-odds update on the belief map
+        ``self._belief_maps`` of shape (C, H, W).
 
-        v6.1: ONE shared map for the whole blue team (common
-        operational picture).  Every UAV's sensor evidence is added
-        into the same log-odds tensor -- Bayesian fusion of
-        independent sensors is exactly log-odds addition.
+        Doctrine (see docs/stage4_backlog.md §13).  The belief map is
+        NOT a per-UAV object; it is the shared operational picture
+        maintained by the MISSION COMMAND layer -- an environment-
+        level latent state used for target tracking and evaluation,
+        not the instantaneous knowledge available to any single UAV.
+        Every UAV's sensor evidence is added into the same log-odds
+        tensor because Bayesian fusion of independent sensors IS
+        log-odds addition, and command has (in the current model)
+        access to every UAV's raw returns for fusion regardless of
+        whether pairs of UAVs can currently talk to each other.
 
-        Doctrine caveat: the map is fused GLOBALLY here even though
-        the per-step ally-comms mask ``bb_edge_visible`` is gated by
-        ``sensor_radius``.  These model DIFFERENT things:
-          - the belief map is the persistent, network-backed common
-            operational picture -- once a detection is published on
-            the TDL, it lives in the map even if the reporting UAV
-            later drifts out of comms range;
-          - ``bb_edge_visible`` is the per-STEP GNN messaging mask,
-            i.e. "can I currently push my hidden state to that ally".
-        Backlog §7 tracks the decoupled ``comms_radius`` knob that
-        would make both use the same (unbounded, TDL-realistic)
-        range and remove any residual inconsistency.
+        This puts the belief map in the same category as
+        ``true_occupancy`` -- both are environment-level latents.
+        The difference is that ``true_occupancy`` is the ground-truth
+        state the CTDE critic sees, whereas the belief map is the
+        NOISY track picture command has fused from sensor returns
+        (what an operator staring at a track display would see).
+
+        Consequence: the per-step GNN ally-comms mask
+        ``bb_edge_visible`` (sensor-radius-gated) is a separate
+        thing entirely -- it models per-step UAV-to-UAV messaging,
+        not the command-layer fusion.  A UAV out of comms with
+        peers can still contribute evidence to the map because
+        command receives its raw sensor returns over the C2
+        downlink.  Backlog §13b (command-link gating on peaks)
+        and §7 (decoupled ``comms_radius``) together open the
+        door to studying degraded-network scenarios.
 
         Channel layout (2 channels):
         - 0: P(enemy)    -- Bayesian log-odds from noisy sensors
@@ -1616,44 +1628,36 @@ class PursuitEnv(ParallelEnv):
           range -> own-sensor Doppler velocity.
         - otherwise (out of range, or memory / padding) -> zero velocity.
 
-        TDL = Tactical Data Link.
-        The military term for the standardised radio networks that let
-        platforms (aircraft, ships, ground stations, UAVs) automatically
-        share a real-time tactical picture -- own positions, detected
-        tracks, targeting data -- without voice.  The best-known example
-        is Link 16 (used across NATO); others include Link 11, Link 22,
-        and SADL.
+        Doctrine — where these positions and velocities come from
+        (see docs/stage4_backlog.md §13).  The track positions are
+        drawn from the belief map, which lives at the MISSION COMMAND
+        layer -- not per-UAV.  What each UAV receives is command's
+        fused track output plus, when in sensor range, its OWN radar
+        Doppler measurement of the same target:
 
-        In this code, "heard over TDL" is shorthand for the shared
-        COMMON OPERATIONAL PICTURE: when one blue UAV sees a target, that
-        contact is broadcast to the whole team over the data link, so
-        every ally knows the track's position even if it is outside their
-        own sensor range.  This is the modelling assumption behind two
-        design choices:
+        * POSITION for every blue = the shared command-layer track
+          (measured+noise for a live track, belief-map cell centre for
+          a memory track).  We model the C2 downlink of track updates
+          as always-on for the actor; backlog §13b would gate this
+          per-UAV via ``command_link_visible`` for a degraded-C2
+          study.
+        * VELOCITY = your OWN radar's Doppler if you can see the
+          target now, else 0.  Doppler is a first-person measurement
+          that command cannot deliver to a UAV that lacks its own
+          sensor lock.
 
-        * The GLOBAL FUSED belief map -- one shared grid for the team,
-          because they pool detections over the link (Bayesian fusion of
-          independent sensors is log-odds addition).
-        * The "out-of-range blue gets the fused track position, zero
-          velocity" branch above -- a UAV that cannot see a red itself
-          still knows WHERE it is (position broadcast over TDL) but has
-          no own-sensor Doppler for its VELOCITY, hence velocity = 0 for
-          that edge.
+        So the realistic split is: "command shares POSITION with
+        everyone; VELOCITY is what your own radar tells you right now".
 
-        So the realistic split is: "precise position over TDL, but zero
-        velocity unless you can see it yourself" -- the network shares
-        POSITION (fused tracks), but VELOCITY is your own radar's Doppler
-        measurement.
-
-        Doctrine caveat: the per-step GNN ally-comms mask
-        ``bb_edge_visible`` is currently GATED by ``sensor_radius``
-        (i.e. NOT identically 1) rather than by an independent
-        ``comms_radius`` matching a realistic TDL range.  The
-        belief-map fusion above still runs globally (that models the
-        NETWORK-BACKED persistent picture, not the per-step
-        messaging), so the two are consistent under the "map = TDL
-        history, bb_edge_visible = current messaging link" reading.
-        Backlog §7 tracks the decoupled ``comms_radius`` knob.
+        Terminology aside -- TDL = Tactical Data Link (Link 16, Link
+        22, SADL, ...), the standardised military radio networks that
+        carry the common tactical picture.  Earlier docstrings said
+        "position broadcast over TDL"; strictly speaking, tracks
+        travel over the C2 downlink from command to each UAV; the
+        UAV-to-UAV TDL is a separate channel modelled here by
+        ``bb_edge_visible`` (per-step GNN messaging, sensor-radius-
+        gated).  Backlog §7 tracks decoupling the messaging range
+        into its own ``comms_radius`` knob.
         """
         N = self.n_blue
         K = track_pos.shape[0]
@@ -1780,11 +1784,12 @@ class PursuitEnv(ParallelEnv):
         tensor fed to the policy.
 
         The ACTOR consumes a belief-derived graph: enemy/obstacle
-        positions come from top-K PEAK detections on the GLOBAL fused
-        belief map (one shared track picture for the whole team, noisy);
-        enemy edge velocity from radar (precise when the nearest red is
-        in that blue's sensor range); obstacle velocity 0 (static).
-        Per-edge visibility = track confidence.
+        positions come from top-K PEAK detections on the shared
+        command-layer belief map (noisy, see doctrine note on
+        ``_update_belief_maps`` and backlog §13); enemy edge velocity
+        from radar (precise when the associated red is in that blue's
+        sensor range, else 0); obstacle velocity 0 (static).  Per-edge
+        visibility = track confidence.
 
         The CRITIC (CTDE) consumes the ground-truth graph: true red and
         obstacle node/edge features, no masks.

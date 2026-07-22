@@ -13,16 +13,19 @@ from isr.configs.stage3_default import STAGE3_DEFAULTS
 STAGE4_DEFAULTS = {
     **STAGE3_DEFAULTS,
 
-    # ----- Belief map (env-internal Bayesian tracker) --------------------
-    # v6.1: ONE global fused belief map shared by the whole blue team
-    # (common operational picture over TDL — Bayesian fusion of
-    # independent sensors is log-odds addition).  The POLICY never sees
-    # the raw grid: the env extracts top-K peaks per channel and
-    # reconstructs the typed GNN graph (rb_edges from channel 0 =
-    # P(enemy); ob_edges from channel 1 = P(obstacle)).  No CNN.
-    # Grid back at 26x26 (5 m cells): the earlier 2.5 m refinement was
-    # chasing a convergence problem that turned out to be architectural,
-    # not resolution.
+    # ----- Belief map (mission-command Bayesian tracker) -----------------
+    # ONE belief map maintained at the MISSION COMMAND layer -- an
+    # environment-level latent used for target tracking and evaluation,
+    # NOT the instantaneous per-UAV view (see doctrine note on
+    # PursuitEnv._update_belief_maps and docs/stage4_backlog.md §13).
+    # Bayesian fusion of independent sensor returns is log-odds
+    # addition, so command's picture accumulates all UAVs' observations.
+    # The POLICY never sees the raw grid: the env extracts top-K peaks
+    # per channel and reconstructs the typed GNN graph (rb_edges from
+    # channel 0 = P(enemy); ob_edges from channel 1 = P(obstacle)).
+    # No CNN.  Grid at 26x26 (5 m cells): the earlier 2.5 m refinement
+    # was chasing a convergence problem that turned out to be
+    # architectural, not resolution.
     "use_belief_maps":     True,
     "belief_grid_size":    26,     # H = W (arena_size / cell_size = 130 / 5)
     # 2 channels: {P(enemy) Bayesian, P(obstacle) Bayesian}.  Ally/self

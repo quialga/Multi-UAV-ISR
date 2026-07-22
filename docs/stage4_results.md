@@ -23,10 +23,19 @@ anywhere.
 
 ### Perception front-end (env-internal, model-based)
 
-- **Global fused belief map** `(2, 26, 26)` — ONE shared log-odds grid
-  for the whole blue team (common operational picture over TDL;
-  Bayesian fusion of independent sensors is log-odds addition).
-  Channel 0 = P(enemy), channel 1 = P(obstacle). 5 m cells.
+- **Mission-command belief map** `(2, 26, 26)` — a log-odds grid
+  maintained at the mission command layer, not by the UAVs
+  individually.  It is an **environment-level latent** used for
+  target tracking and evaluation, in the same category as
+  `true_occupancy`, with the crucial difference that the belief map
+  is *noisy* (command fuses raw sensor returns with the sensor
+  model's error) whereas `true_occupancy` is ground truth used only
+  by the CTDE critic.  Bayesian fusion of independent sensor returns
+  is log-odds addition, so all UAVs' observations accumulate into
+  the same grid.  Channel 0 = P(enemy), channel 1 = P(obstacle).
+  5 m cells.  See `docs/stage4_backlog.md §13` for the doctrine
+  discussion and the follow-on that would gate track delivery per
+  UAV via a command link.
 - **Bayesian update** each step: predict → update.
   - *Predict* (enemy channel only, Phase A): decay `L ← 0.99·L`
     (forgetting → stale tracks fade, cleared regions re-acquirable) +
