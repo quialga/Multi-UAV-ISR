@@ -1669,7 +1669,7 @@ class PursuitEnv(ParallelEnv):
         """
         Build the actor-side enemy node + edge features from the K
         detection-seeded tracks.  Same 7-D edge layout / ordering as
-        ``_obstacle_graph_from_peaks`` (for s in K, for b in N).
+        ``_obstacle_graph_from_tracks`` (for s in K, for b in N).
 
         Per (track s, blue b): POSITION is always ``track_pos[s]`` -- the
         single shared/fused track position (measured+noise for a live
@@ -1750,23 +1750,107 @@ class PursuitEnv(ParallelEnv):
         node_feat = track_conf.reshape(K, 1).astype(np.float32)
         return node_feat, edge_feat, edge_vis
 
-    def _obstacle_graph_from_peaks(
+    def _build_obstacle_tracks(self) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Actor-side obstacle "tracks", mirroring ``_build_enemy_tracks``:
+        for every obstacle a blue currently senses, use the precise
+        OWN-RADAR position (true centre + ``sensor_pos_noise_std``
+        noise); for the rest, fall back to the coarse belief-map peak
+        (command's memory of the surveyed obstacle field).
+
+        Why refine at all when obstacles are static?  Under the crash
+        penalty, a blue that wants to graze an obstacle to cut a corner
+        needs the boundary to sub-cell accuracy; the grid-quantised peak
+        (~half a belief cell of error) forces a conservative safety
+        margin it cannot otherwise resolve.  A live radar return removes
+        that quantisation exactly when the blue is close enough for it to
+        matter.  Velocity stays 0 (static), so only POSITION improves.
+
+        Doctrine (same as the enemy tracks, backlog §13): the refined
+        position is a shared command-layer track — if ANY blue senses
+        the obstacle it becomes a "live track" downlinked to every blue,
+        else it is command memory.  Range-gated only (no occlusion
+        test), matching ``_build_enemy_tracks``.
+
+        Returns ``(obs_pos (n_obstacles, 2), obs_conf (n_obstacles,))``
+        in the same slot convention ``_extract_belief_peaks`` uses:
+        real tracks first, unplaced slots padded with conf 0.
+        """
+        n_obs  = self.n_obstacles
+        obs_pos  = np.zeros((n_obs, 2), dtype=np.float32)
+        obs_conf = np.zeros((n_obs,),   dtype=np.float32)
+        placed = 0 if self._obstacle_pos is None else len(self._obstacle_pos)
+        if placed == 0:
+            return obs_pos, obs_conf
+
+        # Which placed obstacles does ANY blue currently see?  Distance-
+        # only gate, exactly as the enemy track builder does.
+        idx = np.arange(placed)
+        if self.sensor_radius is None:
+            seen_mask = np.ones(placed, dtype=bool)
+        else:
+            d = np.linalg.norm(
+                self._obstacle_pos[:placed][:, None, :]
+                - self._blue_pos[None, :, :], axis=-1,
+            )                                    # (placed, n_blue)
+            seen_mask = d.min(axis=1) <= self.sensor_radius
+        seen   = idx[seen_mask]
+        unseen = idx[~seen_mask]
+
+        cs = self.belief_cell_size
+        slot = 0
+
+        # 1. Live tracks: precise own-sensor position (true + noise).
+        for o in seen:
+            if slot >= n_obs:
+                break
+            pos = self._obstacle_pos[o].astype(np.float32)
+            if self.sensor_pos_noise_std > 0.0:
+                pos = pos + self._rng.normal(
+                    0.0, self.sensor_pos_noise_std, size=2,
+                ).astype(np.float32)
+            obs_pos[slot]  = pos
+            obs_conf[slot] = 1.0
+            slot += 1
+
+        # 2. Memory tracks: belief peaks for the unseen obstacles,
+        #    excluding cells already claimed by a live track.
+        n_mem = min(len(unseen), n_obs - slot)
+        if (n_mem > 0 and self._belief_maps is not None
+                and self.belief_channels >= 2):
+            exclude = [
+                (int(obs_pos[s, 0] / cs), int(obs_pos[s, 1] / cs))
+                for s in range(slot)
+            ]
+            peaks_pos, peaks_conf = self._extract_belief_peaks(
+                n_mem, channel_idx=1, k_extract=n_mem,
+                nms_radius_cells=3, exclude_cells=exclude,
+            )
+            for i in range(n_mem):
+                if peaks_conf[i] <= 0.0:
+                    continue
+                obs_pos[slot]  = peaks_pos[i]
+                obs_conf[slot] = peaks_conf[i]
+                slot += 1
+
+        return obs_pos, obs_conf
+
+    def _obstacle_graph_from_tracks(
         self,
-        peak_pos: np.ndarray,   # (K, 2) world coords (shared track picture)
-        conf:     np.ndarray,   # (K,)   peak confidences
+        track_pos: np.ndarray,   # (K, 2) world coords (shared track picture)
+        conf:      np.ndarray,   # (K,)   track confidences
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Actor-side OBSTACLE node + edge features from the global belief
-        peaks (channel 1).  Obstacles are static: object velocity 0, so
-        ``rel_vel`` is driven purely by the blue's own motion (an rb-
-        style edge with the sender velocity zeroed).  No live-sensor
-        refinement — a static obstacle's belief blob is stable, and its
-        exact position is not endgame-critical the way a moving target's
-        is.  Same 7-D layout / (s outer, b inner) ordering as the enemy
-        graph.
+        Actor-side OBSTACLE node + edge features from the obstacle tracks
+        (``_build_obstacle_tracks``): a live own-sensor position when a
+        blue senses the obstacle, else the belief-map peak.  Obstacles
+        are static: object velocity 0, so ``rel_vel`` is driven purely by
+        the blue's own motion (an rb-style edge with the sender velocity
+        zeroed).  Same 7-D layout / (s outer, b inner) ordering as the
+        enemy graph.
         """
         N = self.n_blue
-        K = peak_pos.shape[0]
+        K = track_pos.shape[0]
         n_edges = K * N
 
         src_pos = np.zeros((n_edges, 2), dtype=np.float32)
@@ -1778,7 +1862,7 @@ class PursuitEnv(ParallelEnv):
         for s in range(K):
             for b in range(N):
                 e = s * N + b
-                src_pos[e] = peak_pos[s]
+                src_pos[e] = track_pos[s]
                 dst_pos[e] = self._blue_pos[b]
                 dst_vel[e] = self._blue_vel[b]
                 edge_vis[e] = conf[s]
@@ -1892,20 +1976,11 @@ class PursuitEnv(ParallelEnv):
 
         # ---- Obstacle graph (only when obstacles are configured) ---------
         if self.n_obstacles > 0:
-            if self._belief_maps is not None and self.belief_channels >= 2:
-                # Obstacles: slots for the configured count, real peaks
-                # for the PLACED count; wider NMS (blobs are larger).
-                placed = (0 if self._obstacle_pos is None
-                          else len(self._obstacle_pos))
-                obs_pos, obs_conf = self._extract_belief_peaks(
-                    self.n_obstacles, channel_idx=1,
-                    k_extract=placed,
-                    nms_radius_cells=3,
-                )
-            else:
-                obs_pos  = np.zeros((self.n_obstacles, 2), dtype=np.float32)
-                obs_conf = np.zeros((self.n_obstacles,),   dtype=np.float32)
-            ob_node, ob_edge, ob_vis = self._obstacle_graph_from_peaks(
+            # Live own-sensor position when a blue senses the obstacle,
+            # else the belief-map peak (command memory).  See
+            # _build_obstacle_tracks for the doctrine.
+            obs_pos, obs_conf = self._build_obstacle_tracks()
+            ob_node, ob_edge, ob_vis = self._obstacle_graph_from_tracks(
                 obs_pos, obs_conf,
             )
             out["obstacle_features"] = ob_node
