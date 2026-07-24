@@ -55,7 +55,7 @@ def test_seen_obstacle_uses_precise_position_not_peak():
     env._blue_pos[1] = np.array([120.0, 120.0])
     env._blue_pos[2] = np.array([120.0, 5.0])
 
-    pos, conf = env._build_obstacle_tracks()
+    pos, _vel, conf = env._build_obstacle_tracks()
     i, err = _nearest_track(pos, o0)
 
     assert err < 1e-4, f"seen obstacle not refined to true centre (err={err})"
@@ -77,7 +77,7 @@ def test_unseen_obstacle_falls_back_to_coarse_peak():
     cs = env.belief_cell_size
 
     env._blue_pos[:] = np.array([120.0, 120.0])   # all blues far from o0
-    pos, conf = env._build_obstacle_tracks()
+    pos, _vel, conf = env._build_obstacle_tracks()
     _, err = _nearest_track(pos, o0)
 
     # A grid peak cannot be sub-cell accurate; the precise path (other
@@ -94,11 +94,11 @@ def test_seen_beats_unseen_precision():
     env._blue_pos[0] = o0 + np.array([env._obstacle_r[0] + 3.0, 0.0])
     env._blue_pos[1] = np.array([120.0, 120.0])
     env._blue_pos[2] = np.array([120.0, 5.0])
-    seen_pos, _ = env._build_obstacle_tracks()
+    seen_pos, _, _ = env._build_obstacle_tracks()
     _, seen_err = _nearest_track(seen_pos, o0)
 
     env._blue_pos[:] = np.array([120.0, 120.0])
-    unseen_pos, _ = env._build_obstacle_tracks()
+    unseen_pos, _, _ = env._build_obstacle_tracks()
     _, unseen_err = _nearest_track(unseen_pos, o0)
 
     assert seen_err < unseen_err
@@ -118,7 +118,7 @@ def test_sensor_noise_bounds_seen_position():
 
     errs = []
     for _ in range(50):
-        pos, conf = env._build_obstacle_tracks()
+        pos, _vel, conf = env._build_obstacle_tracks()
         i, err = _nearest_track(pos, o0)
         assert conf[i] == 1.0
         errs.append(err)
@@ -132,6 +132,6 @@ def test_no_obstacles_returns_empty_tracks():
                      sensor_radius=40.0, use_belief_maps=True,
                      red_policy=stationary_red)
     env.reset(seed=0)
-    pos, conf = env._build_obstacle_tracks()
+    pos, _vel, conf = env._build_obstacle_tracks()
     assert pos.shape == (0, 2)
     assert conf.shape == (0,)

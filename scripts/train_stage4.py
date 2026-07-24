@@ -78,6 +78,19 @@ def _parse_args() -> argparse.Namespace:
                    default=d.get("n_obstacles_min", None),
                    help="Lower bound for per-episode obstacle count "
                         "(capacity = --n-obstacles). Unset => fixed.")
+    p.add_argument("--moving-obstacle-fraction", type=float,
+                   default=d.get("moving_obstacle_fraction", 0.0),
+                   help="Fraction (0..1) of obstacles that patrol back-"
+                        "and-forth along one axis, bouncing off walls. "
+                        "0 = all static.")
+    p.add_argument("--obstacle-speed", type=float,
+                   default=d.get("obstacle_speed", 0.0),
+                   help="Patrol speed (m/step) for moving obstacles.")
+    p.add_argument("--obstacle-belief-decay", type=float,
+                   default=d.get("obstacle_belief_decay", 1.0),
+                   help="Forgetting on the obstacle belief channel "
+                        "(<1 fades a moving obstacle's stale trail; "
+                        "1.0 = off, static behaviour).")
     p.add_argument("--obstacle-radius-min",   type=float, default=d["obstacle_radius_min"])
     p.add_argument("--obstacle-radius-max",   type=float, default=d["obstacle_radius_max"])
     p.add_argument("--obstacle-spawn-clearance",
@@ -290,6 +303,9 @@ def main() -> None:
         n_obstacles             = args.n_obstacles,
         n_red_min               = args.n_red_min,
         n_obstacles_min         = args.n_obstacles_min,
+        moving_obstacle_fraction= args.moving_obstacle_fraction,
+        obstacle_speed          = args.obstacle_speed,
+        obstacle_belief_decay   = args.obstacle_belief_decay,
         obstacle_radius_min     = args.obstacle_radius_min,
         obstacle_radius_max     = args.obstacle_radius_max,
         obstacle_spawn_clearance= args.obstacle_spawn_clearance,

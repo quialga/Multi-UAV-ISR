@@ -195,6 +195,18 @@ class PursuitEnv(ParallelEnv):
         # None (default) => always at capacity, byte-preserving old runs.
         n_red_min:                Optional[int] = None,
         n_obstacles_min:          Optional[int] = None,
+        # ----- Moving obstacles (backlog §4, simplest kinematics) ---------
+        # A fraction of obstacles patrol back-and-forth along one axis,
+        # bouncing off the arena walls (deterministic, no response to
+        # blues).  Both default 0 => all obstacles static, byte-preserving
+        # the pre-motion behaviour.  Crashing into a moving obstacle uses
+        # the SAME per-agent crash penalty; blues are never destroyed.
+        moving_obstacle_fraction: float = 0.0,   # 0..1 of placed obstacles
+        obstacle_speed:           float = 0.0,   # m/step along the axis
+        # Optional forgetting on the OBSTACLE belief channel so a moving
+        # obstacle's stale "comet trail" fades (1.0 = off; enable when
+        # obstacles move).  Mirrors enemy_belief_decay on channel 0.
+        obstacle_belief_decay:    float = 1.0,
     ):
         """
         sensor_radius: Stage 3 partial-observability knob.  When None
@@ -292,6 +304,11 @@ class PursuitEnv(ParallelEnv):
                 f"n_obstacles_min ({self.n_obstacles_min}) must be in "
                 f"[0, n_obstacles={self.n_obstacles}]"
             )
+        self.moving_obstacle_fraction = float(moving_obstacle_fraction)
+        assert 0.0 <= self.moving_obstacle_fraction <= 1.0
+        self.obstacle_speed           = float(obstacle_speed)
+        assert self.obstacle_speed >= 0.0
+        self.obstacle_belief_decay    = float(obstacle_belief_decay)
         self.obstacle_radius_min      = float(obstacle_radius_min)
         self.obstacle_radius_max      = float(obstacle_radius_max)
         self.obstacle_spawn_clearance = float(obstacle_spawn_clearance)
@@ -405,6 +422,7 @@ class PursuitEnv(ParallelEnv):
         # All None when Stage 4 features are disabled.
         self._obstacle_pos: Optional[np.ndarray] = None
         self._obstacle_r:   Optional[np.ndarray] = None
+        self._obstacle_vel: Optional[np.ndarray] = None   # (n_obs, 2) patrol vel
         self._belief_maps:  Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ #
@@ -511,6 +529,12 @@ class PursuitEnv(ParallelEnv):
         )
         red_a = np.clip(red_a.astype(np.float32), -1.0, 1.0)
         red_a[~self._red_active] = 0.0  # defensive
+
+        # 2.5. Advance patrolling obstacles first (they respond to no one),
+        #    so blue/red collision checks below run against the updated
+        #    obstacle positions.  No-op unless moving obstacles are enabled.
+        if self.n_obstacles > 0:
+            self._move_obstacles()
 
         # 3. Integrate blue kinematics (double-integrator with axis-wise
         #    velocity cap and arena wall stop).
@@ -664,6 +688,8 @@ class PursuitEnv(ParallelEnv):
         if self._obstacle_pos is not None:
             snap["obstacle_pos"] = self._obstacle_pos.copy()
             snap["obstacle_r"]   = self._obstacle_r.copy()
+            if self._obstacle_vel is not None:
+                snap["obstacle_vel"] = self._obstacle_vel.copy()
         if self._belief_maps is not None:
             snap["belief_maps"] = self._belief_maps.copy()
         return snap
@@ -1130,6 +1156,21 @@ class PursuitEnv(ParallelEnv):
             self._obstacle_pos = np.zeros((0, 2), dtype=np.float32)
             self._obstacle_r   = np.zeros((0,),   dtype=np.float32)
 
+        # ---- Patrol velocities for moving obstacles -----------------------
+        # A random subset patrols back-and-forth along ONE axis (x or y),
+        # bouncing off the arena walls.  The rest stay static (vel 0).
+        n_placed = len(self._obstacle_pos)
+        self._obstacle_vel = np.zeros((n_placed, 2), dtype=np.float32)
+        if (n_placed > 0 and self.obstacle_speed > 0.0
+                and self.moving_obstacle_fraction > 0.0):
+            n_move = int(round(self.moving_obstacle_fraction * n_placed))
+            if n_move > 0:
+                movers = self._rng.choice(n_placed, size=n_move, replace=False)
+                for o in movers:
+                    axis = int(self._rng.integers(0, 2))          # 0 = x, 1 = y
+                    sign = float(self._rng.choice([-1.0, 1.0]))
+                    self._obstacle_vel[o, axis] = sign * self.obstacle_speed
+
         # ---- Precompute static caches for the belief update ---------------
         # Cell centres (W, H, 2), used every step for sensor-disk masks
         # and ray endpoints.  Computed once at reset since the grid is
@@ -1144,15 +1185,42 @@ class PursuitEnv(ParallelEnv):
         ).astype(np.float32)                                        # (W, H, 2)
         self._cell_centres_flat = self._cell_centres.reshape(-1, 2)  # (W*H, 2)
 
-        # Obstacle-cell mask (W, H) bool, cached because obstacles are
-        # static.  Used by _true_occupancy every step.
-        if len(self._obstacle_pos) > 0:
+        # Obstacle-cell mask (W, H) — cached at reset; recomputed each step
+        # only when obstacles move (see _recompute_obstacle_grid).
+        self._recompute_obstacle_grid()
+
+    def _recompute_obstacle_grid(self) -> None:
+        """(Re)build the (W, H) obstacle occupancy mask from the current
+        obstacle positions.  Called once at reset (static case) and once
+        per step when obstacles move so the belief-truth channel + the
+        occlusion truth track the moving disks."""
+        H = W = self.belief_grid_size
+        if self._obstacle_pos is not None and len(self._obstacle_pos) > 0:
             diffs = self._cell_centres_flat[:, None, :] - self._obstacle_pos[None, :, :]
             dists = np.linalg.norm(diffs, axis=-1)                  # (W*H, n_obs)
             inside = np.any(dists <= self._obstacle_r[None, :], axis=1)
             self._obstacle_grid = inside.reshape(W, H).astype(np.float32)
         else:
             self._obstacle_grid = np.zeros((W, H), dtype=np.float32)
+
+    def _move_obstacles(self) -> None:
+        """Advance patrolling obstacles one step: reciprocating motion
+        along their axis, bouncing when the disk edge reaches an arena
+        wall.  No-op when nothing moves.  Refreshes the obstacle grid."""
+        if (self._obstacle_vel is None
+                or not np.any(self._obstacle_vel)):
+            return
+        L = self.arena_size
+        self._obstacle_pos = self._obstacle_pos + self._obstacle_vel * self.dt
+        # Bounce: keep each disk fully inside [r, L - r]; flip the velocity
+        # component that hit a wall.
+        lo = self._obstacle_r[:, None]                 # (n_obs, 1)
+        hi = L - self._obstacle_r[:, None]
+        below = self._obstacle_pos < lo
+        above = self._obstacle_pos > hi
+        self._obstacle_pos = np.clip(self._obstacle_pos, lo, hi)
+        self._obstacle_vel[below | above] *= -1.0
+        self._recompute_obstacle_grid()
 
     def _positions_in_any_obstacle(self, positions: np.ndarray) -> np.ndarray:
         """
@@ -1319,8 +1387,10 @@ class PursuitEnv(ParallelEnv):
         0) of the global belief map.  Runs before the sensor update so
         each step is a proper predict -> update cycle.
 
-        Two components, both enemy-channel-only (obstacles are static:
-        their prediction is identity, so channel 1 is never touched):
+        Two enemy-channel components below; the obstacle channel (1) is
+        touched only when ``obstacle_belief_decay < 1`` (moving obstacles,
+        handled first, decay-only) — for STATIC obstacles its prediction
+        is identity and channel 1 is left alone:
 
         1. DECAY (temporal forgetting):  L <- gamma * L.
            Pulls all log-odds toward 0 (= P 0.5 = "unknown").  Stale
@@ -1349,6 +1419,19 @@ class PursuitEnv(ParallelEnv):
             return
         gamma  = self.enemy_belief_decay
         p_move = self.enemy_belief_diffusion
+
+        # Obstacle-channel forgetting: when obstacles MOVE, their stale
+        # detections leave a "comet trail" of high-confidence cells behind
+        # the disk.  A geometric decay toward 0 fades the trail so the peak
+        # extractor (memory-track fallback) doesn't lock onto ghosts.  No
+        # diffusion (reciprocating motion isn't a random walk); the live-
+        # sensor refinement handles near-field accuracy.  Off by default
+        # (obstacle_belief_decay = 1.0 -> obstacles treated as static).
+        if self.obstacle_belief_decay < 1.0 and self.belief_channels >= 2:
+            Lo = self._belief_maps[1]
+            Lo *= self.obstacle_belief_decay
+            np.clip(Lo, -self.belief_clip, self.belief_clip, out=Lo)
+
         if gamma >= 1.0 and p_move <= 0.0:
             return
 
@@ -1822,16 +1905,20 @@ class PursuitEnv(ParallelEnv):
         else it is command memory.  Range-gated only (no occlusion
         test), matching ``_build_enemy_tracks``.
 
-        Returns ``(obs_pos (n_obstacles, 2), obs_conf (n_obstacles,))``
-        in the same slot convention ``_extract_belief_peaks`` uses:
-        real tracks first, unplaced slots padded with conf 0.
+        Returns ``(obs_pos (n_obstacles, 2), obs_vel (n_obstacles, 2),
+        obs_conf (n_obstacles,))`` in the same slot convention
+        ``_extract_belief_peaks`` uses: real tracks first, unplaced slots
+        padded with conf 0.  ``obs_vel`` is the obstacle's own-radar
+        velocity when it is a live (seen) track, else 0 (a memory track
+        carries no Doppler) — static obstacles are simply always 0.
         """
         n_obs  = self.n_obstacles
         obs_pos  = np.zeros((n_obs, 2), dtype=np.float32)
+        obs_vel  = np.zeros((n_obs, 2), dtype=np.float32)
         obs_conf = np.zeros((n_obs,),   dtype=np.float32)
         placed = 0 if self._obstacle_pos is None else len(self._obstacle_pos)
         if placed == 0:
-            return obs_pos, obs_conf
+            return obs_pos, obs_vel, obs_conf
 
         # Which placed obstacles does ANY blue currently see?  Distance-
         # only gate, exactly as the enemy track builder does.
@@ -1860,6 +1947,8 @@ class PursuitEnv(ParallelEnv):
                     0.0, self.sensor_pos_noise_std, size=2,
                 ).astype(np.float32)
             obs_pos[slot]  = pos
+            if self._obstacle_vel is not None:
+                obs_vel[slot] = self._obstacle_vel[o]   # own-radar Doppler
             obs_conf[slot] = 1.0
             slot += 1
 
@@ -1880,31 +1969,32 @@ class PursuitEnv(ParallelEnv):
                 if peaks_conf[i] <= 0.0:
                     continue
                 obs_pos[slot]  = peaks_pos[i]
-                obs_conf[slot] = peaks_conf[i]
+                obs_conf[slot] = peaks_conf[i]     # memory track: vel stays 0
                 slot += 1
 
-        return obs_pos, obs_conf
+        return obs_pos, obs_vel, obs_conf
 
     def _obstacle_graph_from_tracks(
         self,
         track_pos: np.ndarray,   # (K, 2) world coords (shared track picture)
+        track_vel: np.ndarray,   # (K, 2) obstacle velocity (0 unless moving+seen)
         conf:      np.ndarray,   # (K,)   track confidences
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Actor-side OBSTACLE node + edge features from the obstacle tracks
         (``_build_obstacle_tracks``): a live own-sensor position when a
-        blue senses the obstacle, else the belief-map peak.  Obstacles
-        are static: object velocity 0, so ``rel_vel`` is driven purely by
-        the blue's own motion (an rb-style edge with the sender velocity
-        zeroed).  Same 7-D layout / (s outer, b inner) ordering as the
-        enemy graph.
+        blue senses the obstacle, else the belief-map peak.  For a MOVING
+        obstacle the live track also carries its own-radar velocity so the
+        ``rel_vel`` edge feature lets blues anticipate the sweep; static
+        (or memory-track) obstacles keep velocity 0.  Same 7-D layout /
+        (s outer, b inner) ordering as the enemy graph.
         """
         N = self.n_blue
         K = track_pos.shape[0]
         n_edges = K * N
 
         src_pos = np.zeros((n_edges, 2), dtype=np.float32)
-        src_vel = np.zeros((n_edges, 2), dtype=np.float32)   # static
+        src_vel = np.zeros((n_edges, 2), dtype=np.float32)
         dst_pos = np.zeros((n_edges, 2), dtype=np.float32)
         dst_vel = np.zeros((n_edges, 2), dtype=np.float32)
         edge_vis = np.zeros((n_edges,), dtype=np.float32)
@@ -1913,6 +2003,7 @@ class PursuitEnv(ParallelEnv):
             for b in range(N):
                 e = s * N + b
                 src_pos[e] = track_pos[s]
+                src_vel[e] = track_vel[s]
                 dst_pos[e] = self._blue_pos[b]
                 dst_vel[e] = self._blue_vel[b]
                 edge_vis[e] = conf[s]
@@ -1939,7 +2030,7 @@ class PursuitEnv(ParallelEnv):
         node_feat = np.zeros((n_obs, 1), dtype=np.float32)
         n_edges = n_obs * N
         src_pos = np.zeros((n_edges, 2), dtype=np.float32)
-        src_vel = np.zeros((n_edges, 2), dtype=np.float32)   # static
+        src_vel = np.zeros((n_edges, 2), dtype=np.float32)   # true obstacle vel
         dst_pos = np.zeros((n_edges, 2), dtype=np.float32)
         dst_vel = np.zeros((n_edges, 2), dtype=np.float32)
 
@@ -1954,6 +2045,10 @@ class PursuitEnv(ParallelEnv):
                 # src_pos = obstacle centre if placed; else = blue pos
                 # (rel_pos 0) so the padded edge is neutral before zeroing.
                 src_pos[e] = self._obstacle_pos[o] if has else self._blue_pos[b]
+                # True obstacle velocity (0 for static; the critic gets it
+                # exactly, no Doppler gating).
+                if has and self._obstacle_vel is not None:
+                    src_vel[e] = self._obstacle_vel[o]
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
         # Zero the edges of padded (unplaced) obstacle slots.
@@ -1973,8 +2068,9 @@ class PursuitEnv(ParallelEnv):
         command-layer belief map (noisy, see doctrine note on
         ``_update_belief_maps`` and backlog §13); enemy edge velocity
         from radar (precise when the associated red is in that blue's
-        sensor range, else 0); obstacle velocity 0 (static).  Per-edge
-        visibility = track confidence.
+        sensor range, else 0); obstacle velocity is the own-radar Doppler
+        when a moving obstacle is seen, else 0 (static / memory track).
+        Per-edge visibility = track confidence.
 
         The CRITIC (CTDE) consumes the ground-truth graph: true red and
         obstacle node/edge features, no masks.
@@ -2029,9 +2125,9 @@ class PursuitEnv(ParallelEnv):
             # Live own-sensor position when a blue senses the obstacle,
             # else the belief-map peak (command memory).  See
             # _build_obstacle_tracks for the doctrine.
-            obs_pos, obs_conf = self._build_obstacle_tracks()
+            obs_pos, obs_vel, obs_conf = self._build_obstacle_tracks()
             ob_node, ob_edge, ob_vis = self._obstacle_graph_from_tracks(
-                obs_pos, obs_conf,
+                obs_pos, obs_vel, obs_conf,
             )
             out["obstacle_features"] = ob_node
             out["ob_edge_features"]  = ob_edge

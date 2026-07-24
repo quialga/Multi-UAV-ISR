@@ -85,6 +85,17 @@ STAGE4_DEFAULTS = {
     "n_red_min":              None,
     "n_obstacles_min":        None,
 
+    # ----- Moving obstacles (backlog §4, simplest kinematics) -----------
+    # A fraction of obstacles patrol back-and-forth along one axis,
+    # bouncing off the arena walls (deterministic, no response to blues).
+    # Crashing into one uses the same per-agent crash penalty; blues are
+    # never destroyed.  Defaults OFF (all static).  obstacle_belief_decay
+    # (<1) fades the stale "comet trail" a moving obstacle leaves on the
+    # belief map; enable it (e.g. 0.9) when obstacles move.
+    "moving_obstacle_fraction": 0.0,   # 0..1 of placed obstacles that move
+    "obstacle_speed":           0.0,   # m/step along the patrol axis
+    "obstacle_belief_decay":    1.0,   # 1.0 = off (static-obstacle behaviour)
+
     # ----- Crash avoidance (per-agent penalties) -------------------------
     # Individual (NOT shared) penalties added to each UAV's own reward:
     #   r_i = r_team + r_crash_i
