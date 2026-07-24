@@ -233,7 +233,10 @@ class VectorPursuitEnv:
 
             if done:
                 snap = env.state_snapshot()
-                n_caught = int((~snap["red_active"]).sum())
+                # caught = active-at-start - active-now (padded reds under
+                # variable-count never counted; snap default = full n_red).
+                n_caught = int(snap.get("n_red_start", len(snap["red_active"]))
+                               - int(snap["red_active"].sum()))
                 self.episode_returns.append(float(self._ep_return[i]))
                 self.episode_lengths.append(int(self._ep_length[i]))
                 self.episode_caught.append(n_caught)

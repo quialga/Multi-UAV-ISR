@@ -339,8 +339,18 @@ class GNNStage4Policy(nn.Module):
             d_hidden      = d_hidden,
             n_msg_rounds  = n_msg_rounds,
         )
-        # sum_blue + concat_red + concat_obstacle.
-        critic_in = d_hidden + n_red * d_hidden + n_obs * d_hidden
+        # Per-agent value V(s, i) input:
+        #   own blue embedding (d)
+        # + masked-MEAN-pooled red context (d) + active-red count (1)
+        # + masked-MEAN-pooled obstacle context (d) + count (1)  [if n_obs>0]
+        # Mean pooling (not the old concat/flatten) makes the width
+        # INDEPENDENT of the red/obstacle counts, so a single critic
+        # handles a variable number of entities and generalises to
+        # counts unseen in training.  The count scalar restores the
+        # "how many threats remain" signal that the mean discards.
+        critic_in = d_hidden + (d_hidden + 1)
+        if n_obs > 0:
+            critic_in += (d_hidden + 1)
         self.critic_trunk = _mlp(critic_in, [d_hidden], d_hidden)
         self.critic_head  = _layer_init(nn.Linear(d_hidden, 1), std=1.0)
 
@@ -429,25 +439,52 @@ class GNNStage4Policy(nn.Module):
         2 rounds of message passing -- teammates, reds, obstacles) in
         place of the pooled ``sum(h_blue)`` a shared-reward V(s) would
         use.  The graph node IS the agent identity, so no one-hot id is
-        needed.  Same trunk input width as the old pooled V(s)
-        (``d_hidden + n_red*d_hidden + n_obs*d_hidden``), so a
-        shared-reward critic checkpoint warm-starts cleanly -- only the
-        semantics of the first ``d_hidden`` block change (per-agent
-        embedding vs pooled sum).
+        needed.
+
+        The red / obstacle global context is a masked MEAN pool over the
+        ACTIVE nodes (plus a normalised active-count scalar), NOT the old
+        concat-flatten.  Mean pooling is permutation-invariant AND
+        count-independent, so the same critic handles a variable number
+        of reds / obstacles and generalises to counts unseen in training.
+        The active mask comes straight from the ground-truth node
+        features the critic already receives: ``red_features[..., 0]`` is
+        the active flag (1/0, i.e. ``_red_active``) and
+        ``obstacle_features[..., 0]`` is placed (1) / padded (0).
         """
         h_blue, h_red, h_obs = self.critic_encode(full_state)
         B, N, d = h_blue.shape
-        red_summary = h_red.reshape(B, -1)                # (B, N_red * d) global
-        global_parts = [red_summary]
+
+        red_mask = (full_state["red_features"][..., 0] > 0.5).float()  # (B, N_red)
+        red_ctx, red_cnt = self._masked_pool(h_red, red_mask)
+        global_parts = [red_ctx, red_cnt]
+
         if h_obs is not None:
-            global_parts.append(h_obs.reshape(B, -1))     # (B, N_obs * d) global
-        global_ctx = torch.cat(global_parts, dim=-1)      # (B, (N_red+N_obs)*d)
+            obs_mask = (full_state["obstacle_features"][..., 0] > 0.5).float()
+            obs_ctx, obs_cnt = self._masked_pool(h_obs, obs_mask)
+            global_parts += [obs_ctx, obs_cnt]
+
+        global_ctx = torch.cat(global_parts, dim=-1)      # (B, d(+1)[+d+1])
         # Broadcast the global (red/obstacle) context to every blue and
         # concat with that blue's own embedding -> per-agent input.
         global_exp = global_ctx.unsqueeze(1).expand(B, N, -1)
         per_agent = torch.cat([h_blue, global_exp], dim=-1)   # (B, N, trunk_in)
         value = self.critic_head(self.critic_trunk(per_agent)).squeeze(-1)  # (B, N)
         return value, h_blue
+
+    @staticmethod
+    def _masked_pool(
+        h:    torch.Tensor,   # (B, K, d) node embeddings
+        mask: torch.Tensor,   # (B, K) in {0, 1}: active nodes
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Masked MEAN pool over active nodes + a normalised active-count
+        scalar.  Returns ``(mean (B, d), frac (B, 1))``.  Mean is 0 when
+        no node is active (denominator clamped); ``frac`` is the active
+        fraction of the padded capacity ``K`` (0..1)."""
+        m    = mask.unsqueeze(-1)                       # (B, K, 1)
+        cnt  = mask.sum(dim=1, keepdim=True)            # (B, 1) active count
+        mean = (h * m).sum(dim=1) / cnt.clamp(min=1.0)  # (B, d)
+        frac = cnt / float(h.shape[1])                  # (B, 1) count / capacity
+        return mean, frac
 
     # ------------------------------------------------------------------ #
     #  Public API                                                          #

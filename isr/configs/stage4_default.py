@@ -76,6 +76,15 @@ STAGE4_DEFAULTS = {
     "obstacle_radius_max":    15.0,
     "obstacle_spawn_clearance": 10.0,
 
+    # ----- Variable entity counts (generalisation) ----------------------
+    # n_red / n_obstacles above are the PADDED CAPACITY.  Setting a *_min
+    # makes each episode sample the active count in [min, capacity]; the
+    # masked-mean critic pool makes the value head count-agnostic so a
+    # single policy generalises across (and beyond) the trained counts.
+    # None = fixed at capacity (byte-preserves fixed-count runs).
+    "n_red_min":              None,
+    "n_obstacles_min":        None,
+
     # ----- Crash avoidance (per-agent penalties) -------------------------
     # Individual (NOT shared) penalties added to each UAV's own reward:
     #   r_i = r_team + r_crash_i

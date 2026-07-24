@@ -70,6 +70,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--sensor-radius",  type=float, default=d["sensor_radius"])
     # Stage 4 obstacle + belief knobs
     p.add_argument("--n-obstacles",           type=int,   default=d["n_obstacles"])
+    p.add_argument("--n-red-min", type=int, default=d.get("n_red_min", None),
+                   help="Lower bound for per-episode active red count "
+                        "(capacity = --n-red). Unset => fixed at capacity. "
+                        "Enables variable-count training + generalisation.")
+    p.add_argument("--n-obstacles-min", type=int,
+                   default=d.get("n_obstacles_min", None),
+                   help="Lower bound for per-episode obstacle count "
+                        "(capacity = --n-obstacles). Unset => fixed.")
     p.add_argument("--obstacle-radius-min",   type=float, default=d["obstacle_radius_min"])
     p.add_argument("--obstacle-radius-max",   type=float, default=d["obstacle_radius_max"])
     p.add_argument("--obstacle-spawn-clearance",
@@ -193,7 +201,8 @@ def evaluate_heuristic_baseline(
             total += rew_d[env.possible_agents[0]]
         snap = env.state_snapshot()
         returns.append(total)
-        caught.append(int((~snap["red_active"]).sum()))
+        caught.append(int(snap.get("n_red_start", len(snap["red_active"]))
+                          - int(snap["red_active"].sum())))
         steps.append(int(snap["t"]))
     return {
         "mean_return": float(np.mean(returns)),
@@ -237,7 +246,8 @@ def evaluate_policy_deterministic(
             total += rew_d[agents[0]]
         snap = env.state_snapshot()
         returns.append(total)
-        caught.append(int((~snap["red_active"]).sum()))
+        caught.append(int(snap.get("n_red_start", len(snap["red_active"]))
+                          - int(snap["red_active"].sum())))
         steps.append(int(snap["t"]))
     return {
         "mean_return": float(np.mean(returns)),
@@ -278,6 +288,8 @@ def main() -> None:
         capture_radius          = args.capture_radius,
         sensor_radius           = args.sensor_radius,
         n_obstacles             = args.n_obstacles,
+        n_red_min               = args.n_red_min,
+        n_obstacles_min         = args.n_obstacles_min,
         obstacle_radius_min     = args.obstacle_radius_min,
         obstacle_radius_max     = args.obstacle_radius_max,
         obstacle_spawn_clearance= args.obstacle_spawn_clearance,

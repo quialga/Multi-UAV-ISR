@@ -187,6 +187,14 @@ class PursuitEnv(ParallelEnv):
         crash_obstacle_penalty:   float = 0.0,   # magnitude; applied as -x
         crash_blue_penalty:       float = 0.0,   # magnitude; applied as -x
         blue_collision_radius:    float = 2.0,   # m; < capture_radius (3)
+        # ----- Variable entity counts (generalisation) --------------------
+        # ``n_red`` / ``n_obstacles`` are the PADDED CAPACITY (fixed tensor
+        # shapes).  When a *_min is set, each reset samples the actual
+        # active count uniformly in [min, capacity]; the unused slots are
+        # padded inactive (reds: _red_active=False; obstacles: unplaced).
+        # None (default) => always at capacity, byte-preserving old runs.
+        n_red_min:                Optional[int] = None,
+        n_obstacles_min:          Optional[int] = None,
     ):
         """
         sensor_radius: Stage 3 partial-observability knob.  When None
@@ -259,6 +267,12 @@ class PursuitEnv(ParallelEnv):
         super().__init__()
         self.n_blue         = int(n_blue)
         self.n_red          = int(n_red)
+        # Variable-count lower bounds (None => fixed at capacity).
+        self.n_red_min = None if n_red_min is None else int(n_red_min)
+        if self.n_red_min is not None:
+            assert 0 <= self.n_red_min <= self.n_red, (
+                f"n_red_min ({self.n_red_min}) must be in [0, n_red={self.n_red}]"
+            )
         self.arena_size     = float(arena_size)
         self.max_steps      = int(max_steps)
         self.capture_radius = float(capture_radius)
@@ -270,6 +284,14 @@ class PursuitEnv(ParallelEnv):
 
         # ---- Stage 4 knobs ------------------------------------------------
         self.n_obstacles              = int(n_obstacles)
+        self.n_obstacles_min = (
+            None if n_obstacles_min is None else int(n_obstacles_min)
+        )
+        if self.n_obstacles_min is not None:
+            assert 0 <= self.n_obstacles_min <= self.n_obstacles, (
+                f"n_obstacles_min ({self.n_obstacles_min}) must be in "
+                f"[0, n_obstacles={self.n_obstacles}]"
+            )
         self.obstacle_radius_min      = float(obstacle_radius_min)
         self.obstacle_radius_max      = float(obstacle_radius_max)
         self.obstacle_spawn_clearance = float(obstacle_spawn_clearance)
@@ -369,6 +391,7 @@ class PursuitEnv(ParallelEnv):
         self._red_pos:    Optional[np.ndarray] = None
         self._red_vel:    Optional[np.ndarray] = None
         self._red_active: Optional[np.ndarray] = None
+        self._n_red_start: int                 = self.n_red
         self._t:          int                  = 0
         # Diagnostic captured from the last step (rendering / logging).
         self._last_n_caught: int = 0
@@ -404,9 +427,26 @@ class PursuitEnv(ParallelEnv):
 
         L = self.arena_size
 
+        # Variable-count: sample how many obstacles / reds are ACTIVE this
+        # episode (capacity stays fixed for tensor shapes; the rest are
+        # padded inactive).  With *_min = None the count is fixed = cap.
+        if self.n_obstacles_min is None:
+            n_obs_target = self.n_obstacles
+        else:
+            n_obs_target = int(
+                self._rng.integers(self.n_obstacles_min, self.n_obstacles + 1)
+            )
+        if self.n_red_min is None:
+            n_red_active = self.n_red
+        else:
+            n_red_active = int(
+                self._rng.integers(self.n_red_min, self.n_red + 1)
+            )
+        self._n_red_start = n_red_active   # for the caught metric under padding
+
         # Stage 4: place obstacles BEFORE sampling entity positions so
         # spawn clearance can reject bad draws.
-        self._place_obstacles()
+        self._place_obstacles(n_obs_target)
 
         # Uniform random initial positions with obstacle clearance.
         # No minimum-separation constraint between blue and red in
@@ -417,7 +457,10 @@ class PursuitEnv(ParallelEnv):
         self._blue_vel = np.zeros((self.n_blue, 2), dtype=np.float32)
         self._red_pos  = self._sample_free_positions(self.n_red)
         self._red_vel  = np.zeros((self.n_red, 2), dtype=np.float32)
-        self._red_active = np.ones(self.n_red, dtype=bool)
+        # First n_red_active reds are live; the rest are padding (inactive
+        # from step 0, treated exactly like caught reds everywhere).
+        self._red_active = np.zeros(self.n_red, dtype=bool)
+        self._red_active[:n_red_active] = True
         self._t = 0
         self._last_n_caught = 0
         self.agents = list(self.possible_agents)
@@ -612,6 +655,10 @@ class PursuitEnv(ParallelEnv):
             "red_vel":     self._red_vel.copy(),
             "red_active":  self._red_active.copy(),
             "n_caught_last_step": self._last_n_caught,
+            # Active reds at episode START (== capacity unless n_red_min set).
+            # caught this episode = n_red_start - red_active.sum(); using
+            # (~red_active).sum() would miscount padded reds as caught.
+            "n_red_start": int(getattr(self, "_n_red_start", self.n_red)),
         }
         # Stage 4: obstacles + belief maps (only when populated).
         if self._obstacle_pos is not None:
@@ -1028,10 +1075,11 @@ class PursuitEnv(ParallelEnv):
     #  Stage 4: obstacles + belief maps                                    #
     # ------------------------------------------------------------------ #
 
-    def _place_obstacles(self) -> None:
+    def _place_obstacles(self, n_target: Optional[int] = None) -> None:
         """
-        Rejection-sample ``n_obstacles`` non-overlapping circular
-        obstacles inside the arena.  Called from ``reset()``.
+        Rejection-sample ``n_target`` non-overlapping circular
+        obstacles inside the arena (``n_target`` defaults to the full
+        ``n_obstacles`` capacity).  Called from ``reset()``.
 
         Placement rules:
         - Radius drawn uniformly from
@@ -1043,6 +1091,8 @@ class PursuitEnv(ParallelEnv):
         - Up to 200 attempts per obstacle; if placement fails, fewer
           obstacles land -- exposed via ``len(self._obstacle_pos)``.
         """
+        if n_target is None:
+            n_target = self.n_obstacles
         if self.n_obstacles > 0:
             L = self.arena_size
             max_r = self.obstacle_radius_max
@@ -1050,7 +1100,7 @@ class PursuitEnv(ParallelEnv):
             placed_r:   list = []
 
             max_attempts = 200
-            for _ in range(self.n_obstacles):
+            for _ in range(n_target):
                 for _attempt in range(max_attempts):
                     r = float(self._rng.uniform(
                         self.obstacle_radius_min, self.obstacle_radius_max,
