@@ -229,9 +229,9 @@ actual logged args before concluding an architectural fault.
   the **two-phase curriculum** — Phase 1 pretrains with a
   full-obs actor on obstacles to produce an obstacle-aware critic,
   Phase 2 warms Stage-4-with-belief from that Phase 1 checkpoint.
-- **Crash penalty.** Blues currently hit obstacles for a soft stop
-  with no reward penalty (see `docs/stage4_backlog.md §1`). A
-  navigation-realistic run should add it.
+- **Crash penalty.** ✅ LANDED post-close — per-agent obstacle + ally
+  crash penalties (see "Post-close extensions" below and
+  `docs/stage4_backlog.md §1/§2`).
 - **Occlusion-seeking evader.** The evader currently avoids obstacle
   *collisions* but does not deliberately hide behind them to break
   line-of-sight — the "boss" adversary that weaponizes occlusion,
@@ -266,6 +266,104 @@ step → detection-seeded tracks → typed GNN with obstacle nodes) is
 validated. The model-based / learning-based split the design argued
 for holds up empirically. The remaining open items (closing the last
 0.05 under obstacles via longer training or the two-phase critic
-curriculum, crash penalty, occlusion-seeking evader, Phase B
-per-target filter, noise sweep) are extensions and stress tests, not
-blockers on the core stage.
+curriculum, occlusion-seeking evader, Phase B per-target filter, noise
+sweep) are extensions and stress tests, not blockers on the core stage.
+
+---
+
+## Post-close extensions (2026-07)
+
+Four capability extensions landed on top of the closed Stage 4 baseline,
+each on its own branch, each fully unit-tested (**84 tests green**), and
+each **byte-preserving the v6.x behaviour when its knobs are at their
+off defaults**. Two are trained + measured; two are implemented and
+awaiting a training run.
+
+### 1. Crash avoidance — per-agent penalties (MEASURED) · `feature/crash-avoidance`
+
+Real UAVs crash; the v6.x policy learned to *graze* obstacles because
+hitting one was a free soft-stop. Added an **individual** (not shared)
+crash penalty so each UAV owns its own mistakes:
+
+- Reward decomposition **`r_i = r_team + r_crash_i`** — the catch/step
+  reward stays team-shared; the crash penalty is charged only to the
+  offending blue. Covers both blue↔obstacle and blue↔blue collisions
+  (symmetric; `blue_collision_radius = 2 m < 3 m` capture radius). A
+  crash is a soft-stop (rollback + zeroed velocity); the episode is
+  **not** terminated.
+- This required moving the whole Stage 4 RL path from shared to
+  **per-agent**: the critic now estimates an **agent-conditioned
+  `V(s, i)`** (it reads blue *i*'s own post-message-passing node
+  embedding instead of the pooled `sum(h_blue)` — same trunk width, so
+  a shared-reward checkpoint still warm-starts), GAE / advantages /
+  returns are per `(env, agent)`, and dones stay per-env.
+- **Warm-start both actor and critic** from the converged obstacle
+  policy (`--warm-start-full`, `load_full_stage4`): the run starts
+  already flying + catching and only has to learn to avoid crashes.
+
+**Result (observed, warm-started run + longer run in progress):**
+capture held at **~2.95/3** while obstacle+ally crashes per episode fell
+roughly an order of magnitude — from **~40** (unpenalised baseline) to
+**~3–5**. A 1000-epoch run is underway to push the residual lower; the
+trend suggests more epochs help (the crash objective is a small
+correction on an already-good policy).
+
+### 2. Obstacle live-sensor refinement (MEASURED) · `feature/crash-avoidance`
+
+The actor's obstacle node position was always the belief-map **peak**
+(grid-quantised to ~half a cell). Under the crash penalty that forced a
+conservative safety margin the policy couldn't resolve. Mirroring the
+enemy-track treatment, an obstacle a blue currently senses now supplies
+its **precise own-radar position** (true centre + `sensor_pos_noise_std`
+noise) — the belief peak is used only for out-of-sensor obstacles. This
+lets blues hug boundaries tightly and safely, and contributed to the
+crash reduction above (seen-obstacle position error → ~0 vs ~half a cell
+for the peak).
+
+### 3. Variable entity counts + count-agnostic critic (implemented + tested; training pending) · `feature/variable-entities`
+
+One policy that trains on — and generalises across — a **variable number
+of reds and obstacles**. The actor was already count-native (per-node
+GNN); the change was in the **critic's global context**, swapping the
+old flatten (`h_red.reshape` → width `d + N_red·d + N_obs·d`, which
+hard-coded the counts) for a **masked-MEAN pool over active nodes + a
+normalised count scalar** (width `d + (d+1)[+(d+1)]`, count-independent).
+`n_red`/`n_obstacles` become a padded **capacity**; `n_red_min` /
+`n_obstacles_min` make each reset sample the active count in
+`[min, capacity]`, with unused slots padded inactive (reusing the
+caught-red machinery, so they're invisible to detection/capture/edges).
+Buffer + vec_env are unchanged (shapes stay at capacity). Enables the
+"train on 2–4, evaluate zero-shot on 6" result once trained.
+
+*Architecture note:* this pool change narrows `critic_trunk.0.weight`
+(512 → 194 for `n_red=3,n_obs=4`), the **only** tensor that can't warm-
+start from a pre-pool checkpoint. `load_full_stage4` transfers the other
+**76/77** tensors (whole actor + both GNN encoders + value head) and now
+**names** any tensor it leaves at fresh init.
+
+### 4. Moving obstacles — reciprocating patrol (implemented + tested; training pending) · `feature/moving-obstacles`
+
+Backlog §4 with the simplest kinematics: a fraction of obstacles patrol
+back-and-forth along one axis, bouncing off the arena walls
+(`moving_obstacle_fraction`, `obstacle_speed`). Chosen deliberately over
+missiles-that-destroy-blues — it reuses the per-agent crash penalty (no
+attrition ⇒ no variable *active-blue* count, no new termination/reward
+machinery) while still adding the real new content: **time-varying
+belief truth** the policy must track and anticipate.
+
+- Obstacle **velocity** now flows into the graph (true for the CTDE
+  critic; own-radar Doppler for the actor when a moving obstacle is a
+  live/seen track) so blues can anticipate the sweep.
+- The obstacle occupancy grid, previously cached-once (static
+  assumption), is recomputed each step when obstacles move so
+  belief-truth + occlusion track them.
+- `obstacle_belief_decay` (default `1.0` = off) fades the stale "comet
+  trail" a moving obstacle leaves on belief channel 1 (decay-only — no
+  diffusion; reciprocating motion isn't a random walk). It is
+  knob-gated, not auto-linked to motion, so enable it together with
+  `obstacle_speed`.
+
+**Recommended next run:** warm-start moving-obstacles from the crash-
+avoidance policy (`--warm-start-full`), ramping `obstacle_speed` up from
+a low value (curriculum knob), optionally combined with `--n-red-min` /
+`--n-obstacles-min` for variable counts in the same run.

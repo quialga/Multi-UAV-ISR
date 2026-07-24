@@ -54,7 +54,35 @@ v6.x architecture.  Kept as short pointers so the reader can trace
   `tests/test_crash_avoidance.py`.  Deferred to a v2/v3 escalation:
   the `--terminate-on-crash` hard-termination variant (rejected for
   v1 — an aborted episode discards the catches already earned and
-  injects a warm-start distribution shift).
+  injects a warm-start distribution shift).  *Measured:* capture held
+  ~2.95/3 while obstacle+ally crashes fell ~40 → ~3–5 per episode
+  (1000-epoch run in progress to push lower).
+- **Obstacle live-sensor refinement** (not a numbered item; shipped
+  with crash avoidance) — the actor's obstacle node position was always
+  the belief-map peak (grid-quantised ~½ cell).  Now a sensed obstacle
+  supplies its precise own-radar position (true centre + noise), the
+  peak used only when out of sensor range — mirrors the enemy-track
+  treatment so blues hug boundaries safely under the crash penalty.
+  See `_build_obstacle_tracks` / `_obstacle_graph_from_tracks`,
+  `tests/test_obstacle_tracks.py`.
+- **Variable entity counts** (not a numbered item; branch
+  `feature/variable-entities`) — `n_red` / `n_obstacles` are now a
+  padded CAPACITY; `n_red_min` / `n_obstacles_min` sample the active
+  count per episode (unused slots padded inactive, reusing the
+  caught-red machinery).  The critic's global context switched from a
+  count-hard-coded FLATTEN (`d + N_red·d + N_obs·d`) to a masked-MEAN
+  pool + count scalar (`d + (d+1)[+(d+1)]`), making `V(s, i)`
+  count-agnostic → one policy generalises across (and beyond) trained
+  counts.  Actor was already count-native; buffer/vec_env unchanged.
+  See `gnn_stage4_policy.py::critic_forward` / `_masked_pool`,
+  `tests/test_variable_entities.py`.  *Implemented + tested; training
+  pending.*  (The pool narrows `critic_trunk.0.weight`, the only tensor
+  a pre-pool checkpoint can't warm-start; `load_full_stage4` transfers
+  the other 76/77 and now NAMES what it leaves at init.)
+- **§4 moving obstacles** — LANDED as reciprocating patrol (simplest
+  kinematics; branch `feature/moving-obstacles`).  See the annotated §4
+  below for what shipped vs the original sketch.  *Implemented + tested;
+  training pending.*
 - **§13a doctrine reframe** — belief map is now consistently
   described as a mission-command layer environment latent (sibling
   of `true_occupancy`, not an emergent property of TDL messaging)
@@ -134,7 +162,34 @@ constructor signatures.  Handled by making `sensor_fov = 360°` the
 default (equivalent to Stage 4's disk) and gating cone behaviour on
 `sensor_fov < 360`.
 
-## 4. Moving obstacles
+## 4. Moving obstacles  — ✅ LANDED (see LANDED section)
+
+> Shipped as **reciprocating patrol** (branch `feature/moving-obstacles`)
+> — the simplest kinematics, chosen deliberately over the missiles-that-
+> destroy-blues idea (which would force a variable *active-blue* count
+> mid-episode + new termination/reward machinery).  Deltas from the v1
+> sketch below:
+> - **Kinematics:** a random subset (`moving_obstacle_fraction`) patrols
+>   back-and-forth along ONE axis at `obstacle_speed`, bouncing off the
+>   arena walls (disk clamped to `[r, L-r]`, velocity component flips).
+>   No response to blues, as sketched.
+> - **Time-varying truth:** the obstacle occupancy grid (cached-once for
+>   static obstacles) is recomputed each step when obstacles move, so the
+>   belief-truth channel + occlusion track them.
+> - **Belief forgetting:** took option 1 (explicit decay) as
+>   `obstacle_belief_decay` (default 1.0 = off; enable ~0.9 with motion)
+>   — decay-only, NO diffusion (reciprocating motion isn't a random
+>   walk).  Did **not** add the "age of last update" third channel (§12
+>   reasoning: decay already fades stale cells; the live-sensor
+>   refinement handles near-field accuracy).
+> - **Velocity in the graph:** obstacle velocity now feeds the edge
+>   features — true for the CTDE critic, own-radar Doppler for the actor
+>   when a moving obstacle is a live (seen) track — so blues anticipate
+>   the sweep.  Crashing a moving obstacle uses the SAME per-agent crash
+>   penalty (§1); blues are never destroyed.
+>
+> See `_move_obstacles` / `_recompute_obstacle_grid`,
+> `tests/test_moving_obstacles.py`.
 
 **Motivation.** Real ISR environments have moving vehicles, other
 UAVs (non-hostile), etc.  Static obstacles are a simplification.

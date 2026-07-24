@@ -38,6 +38,44 @@ for deferred items.
 
 ---
 
+## Post-Stage-4 extensions (2026-07)
+
+Four capability extensions were added on top of the landed v6.x
+baseline, each on its own branch and **off by default** (byte-preserving
+v6.x). Authoritative writeups live in `stage4_results.md`
+§"Post-close extensions" and `stage4_backlog.md` (items §1, §2, §4 now
+marked LANDED); summarised here for the design record:
+
+1. **Crash avoidance** (`feature/crash-avoidance`) — per-agent crash
+   penalties `r_i = r_team + r_crash_i` for blue↔obstacle and blue↔blue
+   collisions (soft-stop, no termination). Moved the RL path from shared
+   to per-agent: **agent-conditioned critic `V(s, i)`** (reads blue *i*'s
+   own node embedding, same trunk width), per-agent GAE, warm-start of
+   BOTH actor and critic (`--warm-start-full`). *Measured:* capture held
+   ~2.95/3, crashes ~40 → ~3–5 per episode.
+2. **Obstacle live-sensor refinement** (`feature/crash-avoidance`) — a
+   sensed obstacle supplies its precise own-radar position instead of the
+   grid-quantised belief peak (mirrors the enemy-track treatment), so
+   blues hug boundaries safely under the crash penalty.
+3. **Variable entity counts** (`feature/variable-entities`) — `n_red` /
+   `n_obstacles` become a padded capacity with per-episode active-count
+   sampling; the critic's global context switches from count-hard-coded
+   **flatten** to a **masked-mean pool + count scalar**, making `V(s, i)`
+   count-agnostic (one policy across, and beyond, the trained counts).
+   *Implemented + tested; training pending.*
+4. **Moving obstacles** (`feature/moving-obstacles`) — a fraction of
+   obstacles patrol back-and-forth (bounce off walls); obstacle velocity
+   now flows into the graph; `obstacle_belief_decay` fades the moving
+   obstacle's stale belief trail. Chosen over destroy-the-blue missiles
+   (reuses the crash penalty, avoids attrition complexity, still adds
+   time-varying belief truth). *Implemented + tested; training pending.*
+
+This revises two rows of the "Design predicted vs landed" table above:
+the sensor is no longer static-obstacle-only (§4), and the reward is no
+longer a pure shared team reward (§1's per-agent decomposition).
+
+---
+
 ## 1. Motivation and hypothesis
 
 Stage 3 established that a recurrent CTDE actor with cross-blue hidden
