@@ -576,24 +576,62 @@ class GNNStage4Policy(nn.Module):
         self.load_state_dict(my_sd)
         return n_copied
 
-    def load_full_stage4(self, path) -> int:
+    def load_full_stage4(self, path, log=None) -> int:
         """
         Soft-load ALL shape-matching tensors (actor AND critic) from
-        another GNNStage4Policy checkpoint.  Used to warm-start the
-        crash-avoidance run from a converged obstacle policy
-        (e.g. obstacles_v1): the architecture is identical, and the
-        per-agent V(s,i) critic keeps the same tensor SHAPES as the
-        old pooled V(s), so every actor + critic + head tensor copies
-        in.  Returns the count copied.
+        another GNNStage4Policy checkpoint.  Used to warm-start one Stage
+        4 run from a converged earlier one (e.g. moving obstacles from
+        the crash-avoidance policy).
+
+        Tensors are copied only where the name AND shape match, so this
+        is safe ACROSS architecture changes: e.g. the flatten->masked-
+        mean-pool critic change only alters ``critic_trunk.0.weight``
+        (the global-context projection widens/narrows), so that single
+        tensor re-initialises and everything else -- the whole actor,
+        both GNN encoders, the value head -- transfers.
+
+        Any target tensor that did NOT get filled (shape mismatch, or
+        absent from the checkpoint) is reported by name so a warm-start
+        across an architecture change tells you exactly what re-learns.
+        Pass ``log`` (a ``print``-like callable) to route those lines;
+        without it, mismatches fall back to ``warnings.warn``.  Returns
+        the count copied.
         """
         import torch as _torch
         ckpt = _torch.load(path, map_location="cpu", weights_only=False)
         src = ckpt["policy_state"] if "policy_state" in ckpt else ckpt
         my_sd = self.state_dict()
+
+        skipped_shape = []   # (name, src_shape, tgt_shape) -- present but mismatched
+        missing_src   = []   # target tensors absent from the checkpoint
+        for k, v in my_sd.items():
+            if k not in src:
+                missing_src.append(k)
+            elif tuple(src[k].shape) != tuple(v.shape):
+                skipped_shape.append(
+                    (k, tuple(src[k].shape), tuple(v.shape)))
+
         n_copied = 0
         for k, v in src.items():
             if k in my_sd and my_sd[k].shape == v.shape:
                 my_sd[k].copy_(v)
                 n_copied += 1
         self.load_state_dict(my_sd)
+
+        # Report what did NOT transfer (stays at fresh init).
+        lines = []
+        for k, so, ne in skipped_shape:
+            lines.append(f"  reinitialised (shape {so} -> {ne}): {k}")
+        for k in missing_src:
+            lines.append(f"  reinitialised (absent from checkpoint): {k}")
+        if lines:
+            header = (f"load_full_stage4: copied {n_copied}/{len(my_sd)} "
+                      f"tensors from {path}; {len(lines)} left at init:")
+            if callable(log):
+                log(header)
+                for ln in lines:
+                    log(ln)
+            else:
+                import warnings
+                warnings.warn(header + "\n" + "\n".join(lines))
         return n_copied

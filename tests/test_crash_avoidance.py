@@ -187,10 +187,36 @@ def test_load_full_stage4_copies_all_tensors(tmp_path):
     torch.save({"policy_state": src.state_dict()}, ckpt)
 
     dst = GNNStage4Policy(n_blue=3, n_red=2, n_obs=4)
-    n_copied = dst.load_full_stage4(str(ckpt))
+    logs = []
+    n_copied = dst.load_full_stage4(str(ckpt), log=logs.append)
     assert n_copied == len(dst.state_dict())
     for k, v in src.state_dict().items():
         assert torch.allclose(dst.state_dict()[k], v), k
+    # Identical architecture -> nothing left at init -> nothing logged.
+    assert logs == []
+
+
+def test_load_full_stage4_reports_reinitialised_tensors(tmp_path):
+    """Warm-start across an architecture change must copy everything
+    shape-matching and NAME the tensors it leaves at init.
+
+    Dropping obstacles entirely (n_obs 4 -> 0) removes the obstacle term
+    from the masked-pool global context, so the critic-trunk input
+    projection narrows and cannot transfer.  (Note 4 -> 2 would NOT skip
+    anything -- the pool is count-invariant -- which is exactly the
+    variable-entities property.)"""
+    src = GNNStage4Policy(n_blue=3, n_red=2, n_obs=4)
+    ckpt = tmp_path / "src.pt"
+    torch.save({"policy_state": src.state_dict()}, ckpt)
+
+    dst = GNNStage4Policy(n_blue=3, n_red=2, n_obs=0)
+    logs = []
+    n_copied = dst.load_full_stage4(str(ckpt), log=logs.append)
+
+    assert n_copied < len(dst.state_dict())        # something skipped
+    joined = "\n".join(logs)
+    assert "critic_trunk.0.weight" in joined       # named explicitly
+    assert "reinitialised" in joined
 
 
 # ---------------------------------------------------------------------------

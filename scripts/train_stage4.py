@@ -397,7 +397,7 @@ def main() -> None:
     wf = args.warm_start_full
     ws = args.warm_start_critic
     if wf and str(wf).lower() != "none" and Path(wf).exists():
-        n_copied = policy.load_full_stage4(wf)
+        n_copied = policy.load_full_stage4(wf, log=log)
         log(f"Actor+Critic WARM-STARTED (full) from {wf} "
             f"({n_copied} tensors copied).")
     elif wf and str(wf).lower() != "none":
