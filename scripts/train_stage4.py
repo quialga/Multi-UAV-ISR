@@ -146,6 +146,17 @@ def _parse_args() -> argparse.Namespace:
                    default=d["blue_collision_radius"],
                    help="Distance (m) below which two blues count as "
                         "collided.")
+    # Parallelism
+    p.add_argument("--n-workers", type=int, default=0,
+                   help="Env-stepping worker processes (0 = in-process, "
+                        "the previous behaviour).  Shards --n-envs across "
+                        "subprocesses; combine with a larger --n-envs to "
+                        "use all CPU cores.")
+    p.add_argument("--torch-threads", type=int, default=0,
+                   help="torch.set_num_threads for the trainer process "
+                        "(0 = torch default).  With --n-workers > 0, "
+                        "capping this (e.g. cores - n_workers) avoids "
+                        "thread oversubscription during rollouts.")
     # PPO
     p.add_argument("--n-envs",         type=int,   default=d["n_envs"])
     p.add_argument("--rollout-steps",  type=int,   default=d["rollout_steps"])
@@ -277,6 +288,8 @@ def main() -> None:
     args = _parse_args()
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
+    if args.torch_threads > 0:
+        torch.set_num_threads(args.torch_threads)
     device = torch.device(args.device)
 
     run_name = args.run_name or time.strftime("%Y%m%d_%H%M%S")
@@ -360,14 +373,28 @@ def main() -> None:
             writer.add_scalar(f"baselines/{name.replace(' ', '_')}",
                               r["mean_return"], 0)
 
-    # Vec env.
-    vec_env = Stage4VectorPursuitEnv(
-        n_envs             = args.n_envs,
-        env_kwargs         = env_kwargs,
-        base_seed          = args.seed,
-        episode_buffer_size = 256,
-        red_policy_mix     = red_policy_mix,
-    )
+    # Vec env — in-process by default; --n-workers > 0 shards the env
+    # pool across subprocesses (same semantics, parallel stepping).
+    if args.n_workers > 0:
+        from isr.train.subproc_vec_env import SubprocStage4VecEnv
+        vec_env = SubprocStage4VecEnv(
+            n_envs              = args.n_envs,
+            env_kwargs          = env_kwargs,
+            base_seed           = args.seed,
+            episode_buffer_size = 256,
+            red_policy_mix      = red_policy_mix,
+            n_workers           = args.n_workers,
+        )
+        log(f"Vec env: {args.n_envs} envs across {vec_env.n_workers} "
+            f"worker processes.")
+    else:
+        vec_env = Stage4VectorPursuitEnv(
+            n_envs             = args.n_envs,
+            env_kwargs         = env_kwargs,
+            base_seed          = args.seed,
+            episode_buffer_size = 256,
+            red_policy_mix     = red_policy_mix,
+        )
     n_agents   = vec_env.n_agents
     action_dim = vec_env.action_dim
 
@@ -514,7 +541,7 @@ def main() -> None:
         # Belief tracking diagnostic: mean peak-to-true-red distance (m)
         # across envs.  Directly measures whether the belief map is
         # tracking or lagging the targets.
-        _errs = [e.belief_track_error() for e in vec_env.envs]
+        _errs = vec_env.belief_track_errors()
         _errs = [t for t in _errs if not np.isnan(t)]
         track_err = float(np.mean(_errs)) if _errs else float("nan")
 
@@ -627,6 +654,7 @@ def main() -> None:
     elapsed = time.time() - t_start
     log(f"\nStage 4 training done.  Elapsed: {elapsed/60:.1f} min")
     log(f"Final checkpoints under {run_dir}")
+    vec_env.close()
     log_file.close()
     writer.close()
 
