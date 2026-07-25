@@ -333,7 +333,10 @@ normalised count scalar** (width `d + (d+1)[+(d+1)]`, count-independent).
 `[min, capacity]`, with unused slots padded inactive (reusing the
 caught-red machinery, so they're invisible to detection/capture/edges).
 Buffer + vec_env are unchanged (shapes stay at capacity). Enables the
-"train on 2–4, evaluate zero-shot on 6" result once trained.
+"train on 2–4, evaluate zero-shot on 6" result once trained — measured
+with the count-sweep harness `scripts/eval_stage4_counts.py` (blue / red
+/ obstacle axes), documented in
+[`stage4_generalization_eval.md`](stage4_generalization_eval.md).
 
 *Architecture note:* this pool change narrows `critic_trunk.0.weight`
 (512 → 194 for `n_red=3,n_obs=4`), the **only** tensor that can't warm-
