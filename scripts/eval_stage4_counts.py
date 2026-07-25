@@ -23,6 +23,10 @@ Run:
     # also vary obstacle count, more episodes
     python scripts/eval_stage4_counts.py --checkpoint <ckpt> \
         --n-red 3 6 --n-obstacles 4 8 --n-episodes 40
+
+    # team-size (n_blue) generalisation — count-agnostic too
+    python scripts/eval_stage4_counts.py --checkpoint <ckpt> \
+        --n-blue 3 5 8 --n-red 4
 """
 from __future__ import annotations
 
@@ -45,16 +49,19 @@ from isr.configs.stage4_default import STAGE4_DEFAULTS
 from train_stage4 import evaluate_policy_deterministic
 
 
-def _env_kwargs_from_train_args(ta: Dict, n_red: int, n_obstacles: int) -> Dict:
+def _env_kwargs_from_train_args(
+    ta: Dict, n_blue: int, n_red: int, n_obstacles: int,
+) -> Dict:
     """Rebuild the Stage 4 env config from a checkpoint's saved args,
-    with the entity COUNTS overridden.  Perception knobs (sensor,
-    belief, crash penalties, moving obstacles) are carried over so the
-    eval matches the training regime; `.get` defaults keep older
-    checkpoints (missing newer knobs) working.  Counts are FIXED at the
-    override value (no *_min) so every episode has exactly that many."""
+    with the entity COUNTS (blues / reds / obstacles) overridden.
+    Perception knobs (sensor, belief, crash penalties, moving obstacles)
+    are carried over so the eval matches the training regime; `.get`
+    defaults keep older checkpoints (missing newer knobs) working.
+    Counts are FIXED at the override value (no *_min) so every episode
+    has exactly that many."""
     g = ta.get
     return dict(
-        n_blue                  = ta["n_blue"],
+        n_blue                  = n_blue,
         n_red                   = n_red,
         arena_size              = ta["arena_size"],
         max_steps               = ta["max_steps"],
@@ -83,13 +90,16 @@ def _env_kwargs_from_train_args(ta: Dict, n_red: int, n_obstacles: int) -> Dict:
     )
 
 
-def _build_policy_at(ta: Dict, n_red: int, n_obs: int, device) -> GNNStage4Policy:
-    """Instantiate the policy at the EVAL capacity and soft-load the
-    checkpoint weights (all count-agnostic -> the actor transfers in
-    full; any non-matching critic tensor is named and left at init but
-    is unused by the deterministic actor eval)."""
+def _build_policy_at(
+    ta: Dict, n_blue: int, n_red: int, n_obs: int, device,
+) -> GNNStage4Policy:
+    """Instantiate the policy at the EVAL capacity (blues / reds /
+    obstacles) and soft-load the checkpoint weights (all count-agnostic
+    -> the actor transfers in full; any non-matching critic tensor is
+    named and left at init but is unused by the deterministic actor
+    eval)."""
     pol = GNNStage4Policy(
-        n_blue            = ta["n_blue"],
+        n_blue            = n_blue,
         n_red             = n_red,
         n_obs             = n_obs,
         d_hidden          = ta.get("d_hidden", 64),
@@ -106,6 +116,10 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--checkpoint", required=True, type=Path,
                    help="Stage 4 checkpoint .pt (best.pt / final.pt)")
+    p.add_argument("--n-blue", type=int, nargs="+", default=None,
+                   help="blue team sizes to sweep (default: the trained "
+                        "n_blue). The team size is count-agnostic too, so "
+                        "the same weights evaluate on more/fewer UAVs.")
     p.add_argument("--n-red", type=int, nargs="+", default=None,
                    help="red counts to sweep (default: the trained n_red)")
     p.add_argument("--n-obstacles", type=int, nargs="+", default=None,
@@ -123,8 +137,9 @@ def main() -> None:
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     ta = ckpt["args"]
 
-    red_counts = args.n_red        or [ta["n_red"]]
-    obs_counts = args.n_obstacles  or [ta.get("n_obstacles", 0)]
+    blue_counts = args.n_blue      or [ta["n_blue"]]
+    red_counts  = args.n_red       or [ta["n_red"]]
+    obs_counts  = args.n_obstacles or [ta.get("n_obstacles", 0)]
     red_policies = [
         ("stationary", stationary_red),
         ("random",     random_red(seed=12_345)),
@@ -132,24 +147,26 @@ def main() -> None:
     ]
 
     print(f"Checkpoint: {ckpt_path}")
-    print(f"  trained at n_red={ta['n_red']} n_obstacles={ta.get('n_obstacles', 0)}"
-          f"  (n_red_min={ta.get('n_red_min')}, "
+    print(f"  trained at n_blue={ta['n_blue']} n_red={ta['n_red']} "
+          f"n_obstacles={ta.get('n_obstacles', 0)}  "
+          f"(n_red_min={ta.get('n_red_min')}, "
           f"n_obstacles_min={ta.get('n_obstacles_min')})")
-    print(f"  sweeping n_red={red_counts}  n_obstacles={obs_counts}  "
+    print(f"  sweeping n_blue={blue_counts}  n_red={red_counts}  "
+          f"n_obstacles={obs_counts}  "
           f"({args.n_episodes} episodes/cell, deterministic)\n")
 
     # Header: one column per red policy + a mean, reporting caught/N.
     col = "{:>22}"
-    hdr = f"{'n_red':>6} {'n_obs':>6} | " + " ".join(
+    hdr = f"{'n_blue':>6} {'n_red':>6} {'n_obs':>6} | " + " ".join(
         col.format(f"caught/N vs {name}") for name, _ in red_policies
     ) + col.format("mean frac")
     # Pre-flight: report the weight transfer ONCE (it's identical for
-    # every count -- the pooled critic trunk is count-invariant), then
-    # silence it in the sweep.  Deterministic eval runs only the actor,
-    # so any skipped critic tensor is harmless.
+    # every count -- the actor + pooled critic trunk are count-invariant),
+    # then silence it in the sweep.  Deterministic eval runs only the
+    # actor, so any skipped critic tensor is harmless.
     _notes: list = []
-    _build_policy_at(ta, red_counts[0], obs_counts[0], device).load_full_stage4(
-        str(ckpt_path), log=_notes.append)
+    _build_policy_at(ta, blue_counts[0], red_counts[0], obs_counts[0],
+                     device).load_full_stage4(str(ckpt_path), log=_notes.append)
     if _notes:
         print("Weight transfer (deterministic eval uses the ACTOR only; "
               "critic tensors are unused):")
@@ -161,27 +178,28 @@ def main() -> None:
     print(hdr)
     print("-" * len(hdr))
 
-    for n_obs in obs_counts:
-        for n_red in red_counts:
-            pol = _build_policy_at(ta, n_red, n_obs, device)
-            pol.load_full_stage4(str(ckpt_path), log=_silent)
-            pol.eval()
-            ek = _env_kwargs_from_train_args(ta, n_red, n_obs)
+    for n_blue in blue_counts:
+        for n_obs in obs_counts:
+            for n_red in red_counts:
+                pol = _build_policy_at(ta, n_blue, n_red, n_obs, device)
+                pol.load_full_stage4(str(ckpt_path), log=_silent)
+                pol.eval()
+                ek = _env_kwargs_from_train_args(ta, n_blue, n_red, n_obs)
 
-            fracs = []
-            cells = []
-            for name, rp in red_policies:
-                m = evaluate_policy_deterministic(
-                    pol, ek, rp, args.n_episodes, device,
-                    seed_base=args.seed_base,
-                )
-                frac = m["mean_caught"] / max(n_red, 1)
-                fracs.append(frac)
-                cells.append(col.format(
-                    f"{m['mean_caught']:.2f}/{n_red} ({frac:.2f})"))
-            mean_frac = float(np.mean(fracs))
-            print(f"{n_red:>6} {n_obs:>6} | " + " ".join(cells)
-                  + col.format(f"{mean_frac:.2f}"))
+                fracs = []
+                cells = []
+                for name, rp in red_policies:
+                    m = evaluate_policy_deterministic(
+                        pol, ek, rp, args.n_episodes, device,
+                        seed_base=args.seed_base,
+                    )
+                    frac = m["mean_caught"] / max(n_red, 1)
+                    fracs.append(frac)
+                    cells.append(col.format(
+                        f"{m['mean_caught']:.2f}/{n_red} ({frac:.2f})"))
+                mean_frac = float(np.mean(fracs))
+                print(f"{n_blue:>6} {n_red:>6} {n_obs:>6} | "
+                      + " ".join(cells) + col.format(f"{mean_frac:.2f}"))
 
     print("\nfrac = mean reds caught / n_red (comparable across counts).")
 
