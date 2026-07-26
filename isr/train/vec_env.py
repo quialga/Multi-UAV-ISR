@@ -287,6 +287,12 @@ class VectorPursuitEnv:
             "mean_blue_crashes":     float(bcs.mean()),
         }
 
+    def belief_track_errors(self) -> List[float]:
+        """Per-env belief peak-to-true-red distances (m).  Method (not a
+        direct ``.envs`` walk) so the subprocess wrapper can serve the
+        same diagnostic remotely."""
+        return [env.belief_track_error() for env in self.envs]
+
     def close(self) -> None:
         for env in self.envs:
             env.close()

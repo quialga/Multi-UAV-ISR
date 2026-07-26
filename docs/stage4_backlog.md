@@ -139,12 +139,22 @@ the policy has no reason to route around allies.
 question: is the penalty symmetric?  For v1 recommend yes — both
 blues are equally responsible.
 
-## 3. Cone-shaped sensor with heading
+## 3. Cone-shaped sensor with heading  — ❌ DROPPED (not worth it)
 
-**Motivation.** Radar / gimbal-camera sensors are physically directional.
-A cone-of-view + heading models this correctly.  Also opens up
-interesting emergent behaviours (blues learn to point their cones at
-predicted target locations).
+> **Decision (2026-07): won't do.**  Modern combat/ISR UAV radar is
+> AESA — effectively wide-FOV / electronically steered / ~360°
+> coverage — so the circular sensor disk is a *defensible physical
+> abstraction*, not a shortcut.  A directional cone + heading would add
+> an action-dimension change that breaks the buffer/policy constructor
+> signatures (see "Blocking") for modest research novelty.  Only worth
+> reopening for a deliberate **sensor-management** study (directional
+> EO/IR gimbal, "point your camera at the predicted intercept"), which
+> is not on the roadmap.  Sketch kept for the design record.
+
+**Motivation (original).** Radar / gimbal-camera sensors are physically
+directional.  A cone-of-view + heading models this correctly.  Also
+opens up interesting emergent behaviours (blues learn to point their
+cones at predicted target locations).
 
 **Sketch.**
 - New blue node feature: `heading ∈ (cos θ, sin θ)` (2-dim, avoids
@@ -234,13 +244,27 @@ actor) is the cleanest solution.
 
 ## 6. Contrastive / teacher-student aux loss  **[SUPERSEDED — see LANDED §6]**
 
-The Stage-3-style live-critic aux (`MSE(actor_h_blue,
-critic_h_blue.detach())`, `aux_hidden_coef=0.2`) shipped in v6.x and
-was one of the recipe pieces that unblocked convergence.  The three
-alternative formulations sketched below (frozen random projection,
-EMA critic encoder, contrastive) remain OPEN as *upgrades* — worth
-trying only if the live-critic version turns out to be a limiter in
-some future stage.
+**In plain terms (what this item is).**  The actor acts on *noisy*
+belief-derived positions; the critic (CTDE) sees *ground truth*.  A
+"teacher–student" auxiliary loss nudges the actor's internal per-blue
+representation to match the critic's ground-truth one — i.e. it teaches
+the actor to squeeze out of noisy inputs the same useful features the
+critic gets for free from perfect information.  ("Teacher–student" =
+one network produces a target the other learns to copy; the critic is
+the teacher, the actor the student.  "Contrastive" is a related
+self-supervised idea that instead pulls together representations that
+*should* be alike and pushes apart ones that shouldn't, with no explicit
+teacher target.)
+
+**Why it's marked SUPERSEDED.**  The *simplest* version of this idea
+already shipped in v6.x and was one of the pieces that unblocked
+convergence: `aux_hidden_coef=0.2` adds
+`MSE(actor_h_blue, critic_h_blue.detach())` — the actor's per-blue
+embedding is pulled toward the *live* critic's (Stage-3 opt-C, see the
+LANDED §6 note at the top of this file).  So the core idea is DONE.
+What stays OPEN here are three *fancier variants* of the same
+teacher–student trick (below) — worth trying ONLY if the simple
+live-critic version turns out to be a limiter in some future stage.
 
 **Original sketch — three variants:**
 1. Frozen random projection: `frozen_proj = Linear(true_occupancy.flatten()
@@ -345,13 +369,16 @@ completely ignores).
 **Blocking**: only worth the complexity if the Stage 4 baseline
 plateaus below acceptance and the fused BCE stays high.
 
-## 11. Belief-map decay / forgetting  **[LANDED as Phase A decay]**
+## 11. Belief-map decay / forgetting  — ✅ **[LANDED as Phase A decay]**
 
 Shipped as `enemy_belief_decay=0.99` (default) in
 `_predict_enemy_belief` — each step, before the sensor update, the
 enemy-channel log-odds are pulled toward 0 by `L ← γ·L`.  Obstacle
-channel untouched (static → prediction is identity), matching the
-"downside fix" the original sketch called for.
+channel untouched *for static obstacles* (prediction is identity),
+matching the "downside fix" the original sketch called for.  (Later, the
+moving-obstacles work — §4 — added an OPTIONAL decay on the obstacle
+channel too, `obstacle_belief_decay` (default 1.0 = off), to fade a
+moving obstacle's stale trail; it's decay-only, no diffusion.)
 
 The paired diffusion step (`enemy_belief_diffusion=0.2`, isotropic
 random-walk motion model applied in probability space via a 3×3
@@ -431,6 +458,102 @@ ISR sims from toy trackers.
 when we actually want to study C2 loss (so probably alongside the
 `comms_radius` decoupling in §7 -- they're the "degraded network"
 pair).
+
+## 14. 3D environment
+
+**Motivation.**  The current arena is a 2D plane — UAVs move in
+`(x, y)` with no altitude.  Real ISR operations are fundamentally 3D:
+altitude affects sensor footprint (higher ⇒ wider coverage but weaker
+signal), obstacle avoidance geometry (fly over vs fly around), and
+inter-UAV separation (vertical stacking).  A 3D extension brings the
+sim closer to real mission planning.
+
+**Sketch.**
+- Arena becomes a 3D box `[0, L] × [0, L] × [0, H]` with a
+  configurable ceiling `H` (e.g. 50 m).
+- Blue actions grow from 2D `(vx, vy)` to 3D `(vx, vy, vz)` — bumps
+  `action_dim` from 2 to 3.  Buffer, PPO ratio, log-prob shapes follow.
+- Node features gain altitude: blue `(x, y)` → `(x, y, z)`; red /
+  obstacle positions likewise.  Edge features (`dx, dy, dist`) become
+  `(dx, dy, dz, dist)`.
+- Sensor model: disk → sphere (or altitude-dependent cone — higher
+  altitude = wider ground footprint but reduced detection probability,
+  modelling real SAR/EO trade-offs).
+- Obstacles: 3D cylinders or spheres; a UAV above/below can overfly.
+  This changes the crash-avoidance geometry (2D disk intersection →
+  3D sphere/cylinder intersection).
+- Belief maps: remain 2D ground-plane grids (the "operational picture"
+  is projected to the ground, matching real C2 track displays).  Altitude
+  of the observing UAV affects `p_TP` / `p_FP` if altitude-dependent
+  sensors are modelled.
+- Red policies: `run_from_nearest_uav` stays 2D (ground targets); or
+  generalise to 3D if modelling aerial adversaries.
+
+**Blocking**: action-dim change propagates through buffer, policy
+constructor, PPO update (same pattern as §3's heading, but this time
+worth doing).  Recommend starting with a `z_enabled=False` default
+that collapses to the current 2D arena, so existing checkpoints and
+tests stay valid.
+
+## 15. Learned trajectory prediction (belief-kernel / aux head)
+
+**Motivation.**  The current belief-map diffusion uses a fixed
+isotropic 3×3 kernel (`enemy_belief_diffusion=0.2`) — effectively
+a random-walk motion model.  This is a poor fit for enemies that
+flee deterministically ("run" policy: belief should shift in the
+escape direction, not smear symmetrically) or for moving obstacles
+on a predictable patrol.  A learned prediction step would let the
+policy anticipate enemy / obstacle positions K steps ahead, enabling
+intercept courses rather than pure pursuit.
+
+**Two implementation paths (from lighter to heavier):**
+
+### 15a — Trajectory prediction auxiliary head (recommended first)
+
+Add a small MLP that reads the GNN per-node embeddings (which
+already encode belief + temporal info via the GRU hidden state) and
+predicts enemy/obstacle positions K steps ahead.  Trained with a
+supervised MSE loss against ground-truth future positions (available
+in the CTDE critic path).
+
+- Stays entirely inside PyTorch — NO changes to the env-side NumPy
+  belief update.
+- The actor benefits because the shared encoder backbone is forced
+  to learn motion-predictive features (the grad flows back through
+  the shared GNN layers).
+- Adds ~one small MLP + one aux loss term; same pattern as the
+  existing `aux_hidden_coef`.
+- K = 3–5 steps is a natural starting point (one capture-radius
+  worth of horizon at typical speeds).
+
+### 15b — Learned belief-map kernel (heavier; see also §10)
+
+Replace the fixed 3×3 isotropic convolution in
+`_predict_enemy_belief` with a learnable kernel (potentially larger,
+directional, conditioned on local velocity estimates).  This is a
+subset of §10 (full ConvGRU) but scoped to just the predict step,
+not the full update rule.
+
+- **Fundamental obstacle:** the belief update runs in NumPy on the
+  env side, outside the differentiable graph.  To get gradients you
+  must either (a) move the predict step into PyTorch inside the
+  policy forward pass, or (b) train the kernel with a separate
+  supervised phase (predict next-step belief from current belief +
+  observations, compare against ground truth).
+- Path (b) is feasible but decouples the kernel from policy
+  performance — the kernel optimises reconstruction, not task reward.
+- Path (a) merges with §10 and is the right long-term answer if
+  belief-map quality becomes the bottleneck.
+
+**Recommendation:** start with 15a (aux head).  The GRU hidden state
+already tracks temporal patterns implicitly; the aux head makes that
+explicit and measures how much the encoder actually learns about
+motion.  If the aux head's prediction error stays high (the encoder
+doesn't learn motion), that motivates 15b / §10 to give it a better
+input signal.
+
+**Blocking**: 15a — none (same pattern as `aux_hidden_coef`).
+15b — the NumPy↔PyTorch boundary (same blocker as §5 and §10).
 
 ---
 
