@@ -56,10 +56,17 @@ concept on top of the last, with measurable acceptance criteria.  See
 | 2 | **Structured architecture — GNN over entities + CTDE critic** (same env, MLP → GNN as sole variable) | **PASS** (GNN 15.7% faster than Greedy on `mean_steps` vs Run; MLP at scale collapses; see [`docs/stage2_results.md`](docs/stage2_results.md)) |
 | 3 | **Partial observability** — sensor radius + GRU on top of the Stage 2 GNN | **PASS** (+18.16 vs Run; bar +16.47; margin +1.69 — see [`docs/stage3_results.md`](docs/stage3_results.md)) |
 | 4 | **Sensor noise + occlusion** — Bayesian belief map (log-odds occupancy), obstacles, line-of-sight occlusion, typed-GNN perception front-end | **landed** (belief-driven policy matches the fully-observable oracle at 3/3 catches — see [`docs/stage4_results.md`](docs/stage4_results.md)) |
-| 5 | Self-play — red team becomes learned; fictitious self-play, league training | **next (roadmap capstone)** |
-| 6 | Communication — range-gated message passing between teammates | |
-| 7 | Dynamic objectives — moving / appearing / re-prioritised targets | |
-| 8 | Adversarial robustness evaluation — exploitability metrics, held-out opponents | |
+| 5 | Self-play — red team becomes learned; fictitious self-play, league training | **planned (later capstone)** |
+| 6 | **Communication** — range-gated message passing between teammates | **implemented** (blue↔blue GNN messages masked by a sensor-range visibility gate, `bb_edge_visible`; decoupled `comms_radius` is an open refinement) |
+| 7 | Dynamic objectives — moving / appearing / re-prioritised targets | **in progress** (moving obstacles implemented + tested; training pending) |
+| 8 | Adversarial robustness evaluation — exploitability metrics, held-out opponents | planned |
+
+The stages are being tackled **somewhat out of order**: range-gated
+communication (Stage 6) is already in the architecture, and dynamic
+elements (Stage 7, moving obstacles) are implemented and awaiting a
+training run, while self-play (Stage 5) is deliberately deferred to a
+**later capstone** rather than the immediate next step. All work so far
+is in a **2D** arena; a move to **3D** is planned (see Roadmap below).
 
 Curriculum resequenced from 7 stages to 8 in July 2026 to isolate
 architecture as a standalone Stage 2 variable *before* introducing
@@ -73,24 +80,29 @@ artifact.
 
 ### Stage 4 post-close extensions
 
-Four capabilities shipped on top of the Stage 4 baseline, each on its own
-branch, each with tests.  See [`docs/stage4_backlog.md`](docs/stage4_backlog.md)
-for the full annotated record.
+Several capabilities shipped on top of the Stage 4 baseline, each with tests.
+See [`docs/stage4_backlog.md`](docs/stage4_backlog.md) for the full annotated
+record.
 
 - **Crash avoidance** — per-agent reward decomposition `r_i = r_team + r_crash_i`
   for blue↔obstacle and blue↔blue collisions, an agent-conditioned critic
-  `V(s, i)`, and per-agent GAE. *Measured:* capture held ~2.95/3 while crashes
-  fell ~40 → ~3–5 per episode.
-- **Variable entity counts** — `n_red` / `n_obstacles` become a padded
-  **capacity** with a per-episode active count sampled from `[*_min, capacity]`.
-  The critic's global context switched from a count-hard-coded flatten to a
-  **masked-mean pool + count scalar**, making every learned tensor
-  count-agnostic → one policy generalises across (and beyond) trained counts.
-  *Implemented + tested; training in progress.*
+  `V(s, i)`, and per-agent GAE. **Current training runs enable both crash
+  penalties** (obstacles *and* allies). *Measured:* capture held ~2.95/3 while
+  crashes fell ~40 → ~3–5 per episode.
+- **Variable entity counts** — `n_blue` / `n_red` / `n_obstacles` become a
+  padded **capacity** with a per-episode active count sampled from
+  `[*_min, capacity]`. The critic's global context switched from a
+  count-hard-coded flatten to a **masked-mean pool + count scalar**, making
+  every learned tensor count-agnostic → one policy generalises across (and
+  beyond) trained counts. *Implemented + tested; **not yet trained** (active
+  work).*
 - **Moving obstacles** — reciprocating patrol (wall-to-wall bounce) with
   obstacle velocity flowing into the GNN edge features and an optional
   `obstacle_belief_decay` to fade a moving obstacle's stale belief trail.
-  *Implemented + tested; training in progress.*
+  *Implemented + tested; **not yet trained**.*
+- **Parallel / GPU training** — the env pool can be sharded across worker
+  subprocesses (`SubprocStage4VecEnv`, `--n-workers`) for parallel stepping,
+  and training runs on a single GPU (`--device cuda`).
 - **Count-generalisation eval** — `scripts/eval_stage4_counts.py` sweeps
   `n_blue` / `n_red` / `n_obstacles` on a single checkpoint to measure
   zero-shot generalisation. See
@@ -234,6 +246,14 @@ pip install -r requirements.txt
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
+For throughput, shard the env pool across worker subprocesses (parallel
+stepping, identical semantics) and pair it with a larger `--n-envs`:
+
+```bash
+python scripts/train_stage4.py --device cuda --n-rollouts 1000 \
+    --n-workers 8 --n-envs 64 --run-name stage4_gpu
+```
+
 TensorBoard scalars stream to `runs/stage{N}/<run>/tb/` — one directory
 per run.
 
@@ -254,15 +274,37 @@ per run.
   (log-odds occupancy, obstacles, line-of-sight occlusion, sensor noise) feeds
   the unchanged Stage 3 typed-GNN CTDE policy. The belief-driven policy reaches
   the same 3/3 capture performance as the fully-observable oracle, paying only a
-  small honest cost in convergence for acting under uncertainty. Four extensions
-  (crash avoidance, variable entity counts, moving obstacles, count-generalisation
-  eval) have shipped on top. See [`docs/stage4_results.md`](docs/stage4_results.md)
-  and [`docs/stage4_backlog.md`](docs/stage4_backlog.md).
-- **Stage 5 — next**: self-play (the red team becomes a learned evader) is the
-  remaining roadmap capstone.
+  small honest cost in convergence for acting under uncertainty. Extensions on
+  top (crash avoidance — **enabled in current training for both obstacles and
+  allies**; variable entity counts; moving obstacles; count-generalisation eval;
+  parallel/GPU training) have shipped. See
+  [`docs/stage4_results.md`](docs/stage4_results.md) and
+  [`docs/stage4_backlog.md`](docs/stage4_backlog.md).
+- **Stage 6 — implemented**: range-gated blue↔blue communication is already in
+  the GNN (messages masked by a sensor-range visibility gate).
+- **Stage 7 — in progress**: dynamic elements (moving obstacles) implemented and
+  tested; a training run is pending.
+- **Active work**: training with variable numbers of allies / enemies /
+  obstacles (implemented, not yet trained) and the moving-obstacle run.
+- **Stage 5 — later**: self-play (the red team becomes a learned evader) is
+  deferred to a **later capstone**, not the immediate next step.
 
 Per-stage result writeups land in `docs/stage{N}_results.md` as each stage
 completes; broader analysis notes accumulate in `docs/` alongside them.
+
+## Roadmap / future work
+
+- **3D environment** — the arena is currently **2D**; extending to 3D (altitude,
+  `(vx, vy, vz)` actions, altitude-dependent sensing, 3D obstacle geometry) is a
+  planned direction. See [`docs/stage4_backlog.md §14`](docs/stage4_backlog.md).
+- **Learned trajectory prediction** — anticipate enemy / moving-obstacle
+  positions a few steps ahead (aux head on the GNN embeddings, or a learned
+  belief-map kernel). See [`docs/stage4_backlog.md §15`](docs/stage4_backlog.md).
+- **Self-play** — a learned red team (fictitious self-play / league training) as
+  a later capstone.
+- **Gazebo integration** — bridge the trained policies to a Gazebo simulation
+  for higher-fidelity, physics-based validation toward eventual real-robot
+  transfer.
 
 ## License
 
