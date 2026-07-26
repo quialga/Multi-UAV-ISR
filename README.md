@@ -36,7 +36,7 @@ real autonomous-systems work:
 - **Adversarial robustness** — evaluated against held-out opponents, not
   just the policies seen during training.
 
-## The seven-stage curriculum
+## The eight-stage curriculum
 
 The project is structured as a **learning curriculum**: each stage adds one
 concept on top of the last, with measurable acceptance criteria.  See
@@ -44,11 +44,11 @@ concept on top of the last, with measurable acceptance criteria.  See
 
 | Stage | Concept added | Status |
 |------:|---|---|
-| 1 | Pursuit-evasion baseline (continuous 2D, fully observable, fixed red, MLP shared policy) | **soft pass** (v2: +15.37 vs Run, Greedy = +16.15; strict bar +19.38 not cleared but 2.00/2 caught on every red — see [`docs/stage1_analysis.md`](docs/stage1_analysis.md)) |
-| 2 | **Structured architecture — GNN over entities + CTDE critic** (same env, MLP → GNN as sole variable; scaling experiment at N=5 vs M=3 confirms the coordination hypothesis) | **PASS** (GNN 15.7% faster than Greedy on `mean_steps` vs Run — right in the +15-25% predicted band; MLP at scale collapses; see [`docs/stage2_results.md`](docs/stage2_results.md)) |
-| 3 | Partial observability — sensor radius, GRU on top of the Stage 2 GNN | **next** |
-| 4 | Sensor noise + occlusion — explicit belief-state predictor (aux loss) | |
-| 5 | Self-play — red team becomes learned; fictitious self-play, league training | |
+| 1 | Pursuit-evasion baseline (continuous 2D, fully observable, fixed red, MLP shared policy) | **soft pass** (v2: +15.37 vs Run, Greedy = +16.15; 2.00/2 caught on every red — see [`docs/stage1_analysis.md`](docs/stage1_analysis.md)) |
+| 2 | **Structured architecture — GNN over entities + CTDE critic** (same env, MLP → GNN as sole variable) | **PASS** (GNN 15.7% faster than Greedy on `mean_steps` vs Run; MLP at scale collapses; see [`docs/stage2_results.md`](docs/stage2_results.md)) |
+| 3 | **Partial observability** — sensor radius + GRU on top of the Stage 2 GNN | **PASS** (+18.16 vs Run; bar +16.47; margin +1.69 — see [`docs/stage3_results.md`](docs/stage3_results.md)) |
+| 4 | **Sensor noise + occlusion** — Bayesian belief map (log-odds occupancy), obstacles, line-of-sight occlusion, typed-GNN perception front-end | **landed** (belief-driven policy matches the fully-observable oracle at 3/3 catches — see [`docs/stage4_results.md`](docs/stage4_results.md)) |
+| 5 | Self-play — red team becomes learned; fictitious self-play, league training | **next (roadmap capstone)** |
 | 6 | Communication — range-gated message passing between teammates | |
 | 7 | Dynamic objectives — moving / appearing / re-prioritised targets | |
 | 8 | Adversarial robustness evaluation — exploitability metrics, held-out opponents | |
@@ -63,34 +63,71 @@ rationale.
 Each stage produces a self-contained mini-result and a reusable training
 artifact.
 
+### Stage 4 post-close extensions
+
+Four capabilities shipped on top of the Stage 4 baseline, each on its own
+branch, each with tests.  See [`docs/stage4_backlog.md`](docs/stage4_backlog.md)
+for the full annotated record.
+
+- **Crash avoidance** — per-agent reward decomposition `r_i = r_team + r_crash_i`
+  for blue↔obstacle and blue↔blue collisions, an agent-conditioned critic
+  `V(s, i)`, and per-agent GAE. *Measured:* capture held ~2.95/3 while crashes
+  fell ~40 → ~3–5 per episode.
+- **Variable entity counts** — `n_red` / `n_obstacles` become a padded
+  **capacity** with a per-episode active count sampled from `[*_min, capacity]`.
+  The critic's global context switched from a count-hard-coded flatten to a
+  **masked-mean pool + count scalar**, making every learned tensor
+  count-agnostic → one policy generalises across (and beyond) trained counts.
+  *Implemented + tested; training in progress.*
+- **Moving obstacles** — reciprocating patrol (wall-to-wall bounce) with
+  obstacle velocity flowing into the GNN edge features and an optional
+  `obstacle_belief_decay` to fade a moving obstacle's stale belief trail.
+  *Implemented + tested; training in progress.*
+- **Count-generalisation eval** — `scripts/eval_stage4_counts.py` sweeps
+  `n_blue` / `n_red` / `n_obstacles` on a single checkpoint to measure
+  zero-shot generalisation. See
+  [`docs/stage4_generalization_eval.md`](docs/stage4_generalization_eval.md).
+
 ## Architecture
 
 ```
 Multi-UAV-ISR/
-├── isr/                        # main Python package
+├── isr/                            # main Python package
 │   ├── env/
-│   │   ├── entities.py         # UAV, Target dataclasses + kinematics
-│   │   ├── pursuit_env.py      # PettingZoo ParallelEnv (Stage 1)
-│   │   └── spaces.py           # observation / action space builders
+│   │   ├── entities.py             # UAV / Target dataclasses + kinematics
+│   │   └── pursuit_env.py          # PettingZoo ParallelEnv (Stages 1–4:
+│   │                               #   sensors, belief maps, obstacles,
+│   │                               #   occlusion, crash model, moving obstacles)
 │   ├── agents/
-│   │   ├── heuristics.py       # random / greedy / scripted baselines
-│   │   └── ppo_policy.py       # neural policy (MLP, later GRU)
+│   │   ├── heuristics.py           # random / greedy / scripted red & blue baselines
+│   │   ├── gnn_policy.py           # Stage 2–3 typed-GNN policy (+ GRU)
+│   │   ├── gnn_stage4_policy.py    # Stage 4 typed-GNN + CTDE critic + belief front-end
+│   │   └── policy_loader.py        # checkpoint → policy dispatch
 │   ├── train/
-│   │   ├── ppo.py              # PPO clip implementation
-│   │   ├── buffer.py           # rollout buffer
-│   │   └── normalizer.py       # running obs normalizer
+│   │   ├── ppo.py                  # PPO-clip (shared + per-agent updates)
+│   │   ├── graph_buffer.py         # graph rollout buffer (per-agent GAE)
+│   │   ├── vec_env.py              # vectorised env wrapper
+│   │   └── subproc_vec_env.py      # subprocess parallel envs
 │   ├── utils/
-│   │   └── render.py           # matplotlib episode renderer
+│   │   └── render.py               # matplotlib episode renderer
 │   └── configs/
-│       └── stage1_default.py   # Stage 1 hyperparameters
+│       ├── stage1_default.py       # Stage 1 hyperparameters
+│       ├── stage3_default.py       # Stage 3 (partial observability)
+│       └── stage4_default.py       # Stage 4 (belief / obstacles / crash / moving)
 ├── scripts/
-│   ├── train_stage1.py         # main training entry point
-│   └── render_demo.py          # render one episode (random or trained)
-├── tests/
-│   └── test_env_smoke.py       # env API contract test
+│   ├── train_stage1.py             # Stage 1 (MLP) / Stage 2 (GNN) training entry
+│   ├── train_stage4.py             # Stage 3–4 training entry (belief GNN)
+│   ├── eval_stage4_counts.py       # entity-count generalisation sweep
+│   ├── evaluate_trained.py         # evaluate a checkpoint → docs/stageN_results.md
+│   ├── render_demo.py              # render one episode (random or trained)
+│   └── diag_scripted_pursuit.py    # scripted-baseline diagnostics
+├── tests/                          # env contract + per-extension test suites
 └── docs/
-    ├── design.md               # full curriculum + stage-by-stage spec
-    └── stageN_results.md       # per-stage acceptance results (added as stages land)
+    ├── design.md                   # full curriculum + stage-by-stage spec
+    ├── stageN_design.md            # per-stage design specs
+    ├── stageN_results.md           # per-stage acceptance results
+    ├── stage4_backlog.md           # deferred items + annotated extension record
+    └── stage4_generalization_eval.md
 ```
 
 ## Setup
@@ -114,113 +151,107 @@ Render Greedy heuristic blue vs Run-from-nearest red:
 python scripts/render_demo.py --blue greedy --red run --save out/demo.gif
 ```
 
-Train Stage 1 on CPU:
+Run the test suite:
 ```bash
-python scripts/train_stage1.py
+pytest -q
 ```
 
-Evaluate a trained checkpoint (writes `docs/stage1_results.md`):
+## Training
+
+### Stage 1 (MLP) / Stage 2 (GNN)
+
+Both live in `scripts/train_stage1.py`, selected by `--policy-type`
+(everything else — env config, red-policy mix, PPO hyperparameters —
+is shared so the head-to-head stays fair):
+
 ```bash
-python scripts/evaluate_trained.py --checkpoint runs/stage1/<run>/best.pt
+# Stage 1 MLP baseline
+python scripts/train_stage1.py --device cuda --n-rollouts 1000
+
+# Stage 2 GNN (same script, one flag)
+python scripts/train_stage1.py --device cuda --policy-type gnn --n-rollouts 1000
 ```
+
+### Stage 3–4 (belief-map GNN)
+
+`scripts/train_stage4.py` trains the typed-GNN + CTDE policy on the
+partial-observability / belief-map task. A bare run reproduces the
+proven recipe (2 message rounds, Stage-1 critic-encoder warm-start,
+`aux_hidden_coef=0.2`):
+
+```bash
+python scripts/train_stage4.py --run-name stage4_baseline --n-rollouts 1000
+```
+
+Post-Stage-4 knobs (all off by default, so a bare run byte-preserves the
+baseline):
+
+```bash
+# crash avoidance (per-agent penalties)
+--crash-obstacle-penalty 2.0 --crash-blue-penalty 1.0 --blue-collision-radius 2.0
+
+# variable entity counts (sample active count in [min, capacity] each episode)
+--n-red-min 2 --n-obstacles-min 0
+
+# moving obstacles (fraction that patrol + belief decay to fade stale trails)
+--moving-obstacle-fraction 0.5 --obstacle-speed 1.0 --obstacle-belief-decay 0.9
+
+# warm-start BOTH actor + critic from a converged Stage 4 checkpoint
+--warm-start-full runs/stage4/<run>/best.pt
+```
+
+### Evaluate
+
+```bash
+# per-stage acceptance eval → writes docs/stageN_results.md
+python scripts/evaluate_trained.py --checkpoint runs/stage1/<run>/best.pt --device cuda --n-episodes 50
+
+# entity-count generalisation sweep (Stage 4)
+python scripts/eval_stage4_counts.py --checkpoint runs/stage4/<run>/best.pt --n-red 2 4 6 8
+```
+
+Acceptance criteria per stage are documented in the corresponding
+`docs/stageN_design.md` / `docs/stageN_results.md`.
 
 ## Training on GPU (RunPod or similar)
 
-Stage 1 trains on CPU in ~2.5h but is faster on a single small GPU
-(RTX 3060 / T4 class) at ~30-45 min.
-
-### Setup on a fresh pod
+The belief-map GNN trains on a single small GPU (RTX 3060 / T4 class) in
+well under an hour for 1000 rollouts; CPU works but is markedly slower.
 
 ```bash
 git clone https://github.com/quialga/Multi-UAV-ISR.git
 cd Multi-UAV-ISR
-python -m venv .venv
-source .venv/bin/activate
+python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-# Verify CUDA is visible
 python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 ```
 
-### Train — Stage 1 (MLP)
-
-```bash
-python scripts/train_stage1.py --device cuda --n-rollouts 1000
-```
-
-Default `--policy-type mlp`.  Reproduces the Stage 1 v2 soft-pass
-baseline.
-
-### Train — Stage 2 (GNN)
-
-Same script, `--policy-type gnn` flag:
-
-```bash
-python scripts/train_stage1.py \
-    --device cuda \
-    --policy-type gnn \
-    --n-rollouts 1000
-```
-
-Optional knobs (all shown at default values): `--d-hidden 64`,
-`--n-msg-rounds 2`.  Everything else (env config, red-policy mix,
-PPO hyperparameters, `n_envs`, `rollout_steps`) is shared with the
-MLP path so the head-to-head comparison stays fair.
-
-Live stdout shows the same fields for both policies:
-per-rollout reward, catch rate, `pol / val / ent / kl / clip`
-diagnostics.  TensorBoard scalars stream to
-`runs/stage1/<timestamp>/tb/` — one directory per run,
-policy-type-agnostic.
-
-**Expected timing (Stage 2 GNN, single T4-class GPU, 1000
-rollouts):** ≈ 30-60 min.  GNN forward is heavier per step than MLP
-(2 rounds × ~50 vector ops each vs one MLP forward) but the
-message-passing tensors are small and parallelise well on GPU.
-CPU is much slower (~200 sps observed on a laptop) — GPU is
-strongly recommended.
-
-### Evaluate + sync results back
-
-```bash
-python scripts/evaluate_trained.py \
-    --checkpoint runs/stage1/<timestamp>/best.pt \
-    --device cuda \
-    --n-episodes 50
-```
-
-Auto-dispatches based on the checkpoint's `policy_type`:
-- **MLP checkpoint** → writes `docs/stage1_results.md`
-- **GNN checkpoint** → writes `docs/stage2_results.md`
-- **Both** → produce `runs/stage1/<timestamp>/eval_results.json` +
-  4 GIFs under `runs/stage1/<timestamp>/eval_gifs/`
-
-Acceptance criteria per stage are documented in
-[`docs/stage1_analysis.md §6b`](docs/stage1_analysis.md) and
-[`docs/stage2_gnn_design.md §6`](docs/stage2_gnn_design.md).
-
-Pack everything for download:
-```bash
-tar czf stage1_artifacts.tar.gz runs/stage1/<timestamp>/ docs/stage1_results.md
-```
+TensorBoard scalars stream to `runs/stage{N}/<run>/tb/` — one directory
+per run.
 
 ## Status
 
-Stage 1 landed as a **soft pass** (July 2026) — v2 MLP matches
-GreedyPursuer across the red distribution, catches 2.00/2 on every red
-type, misses the strict 1.20× bar by 4.01 points.  See
-[`docs/stage1_analysis.md`](docs/stage1_analysis.md) for the full
-analysis; [`docs/red_policy_mixing.md`](docs/red_policy_mixing.md)
-covers the red-policy mixing that closed v1's OOD failure.
+- **Stage 1 — soft pass** (July 2026): v2 MLP matches GreedyPursuer across the
+  red distribution, catches 2.00/2 on every red type, misses the strict 1.20×
+  bar by 4.01 points. See [`docs/stage1_analysis.md`](docs/stage1_analysis.md).
+- **Stage 2 — PASS** (July 2026): at N=5 vs M=3 scaling, the GNN + CTDE-critic
+  architecture catches all 3 reds every episode and runs 15.7% faster than
+  GreedyPursuer on episode length vs `run_from_nearest_uav`. The MLP baseline
+  structurally fails at the same scale. See
+  [`docs/stage2_results.md`](docs/stage2_results.md).
+- **Stage 3 — PASS** (July 2026): sensor-range partial observability + a GRU on
+  the Stage 2 GNN clears the return bar (+18.16 vs Run, margin +1.69). See
+  [`docs/stage3_results.md`](docs/stage3_results.md).
+- **Stage 4 — landed** (July 2026): a Bayesian belief-map perception front-end
+  (log-odds occupancy, obstacles, line-of-sight occlusion, sensor noise) feeds
+  the unchanged Stage 3 typed-GNN CTDE policy. The belief-driven policy reaches
+  the same 3/3 capture performance as the fully-observable oracle, paying only a
+  small honest cost in convergence for acting under uncertainty. Four extensions
+  (crash avoidance, variable entity counts, moving obstacles, count-generalisation
+  eval) have shipped on top. See [`docs/stage4_results.md`](docs/stage4_results.md)
+  and [`docs/stage4_backlog.md`](docs/stage4_backlog.md).
+- **Stage 5 — next**: self-play (the red team becomes a learned evader) is the
+  remaining roadmap capstone.
 
-Stage 2 landed as a **PASS** (July 2026) — at N=5 vs M=3 scaling, the
-GNN + CTDE-critic architecture catches all 3 reds every episode and
-runs 15.7% faster than GreedyPursuer on episode length vs the
-`run_from_nearest_uav` red, right in the +15-25% predicted band.  At
-the same scale the MLP baseline structurally fails (2.12/3 caught;
-policy collapse visible in the training log).  Full analysis:
-[`docs/stage2_results.md`](docs/stage2_results.md).  Stage 3 (partial
-observability + recurrent policy on top of the Stage 2 GNN) is next.
-
-Per-stage result writeups land in `docs/stage{N}_results.md` as each
-stage completes; broader analysis notes accumulate in `docs/` alongside
-them.
+Per-stage result writeups land in `docs/stage{N}_results.md` as each stage
+completes; broader analysis notes accumulate in `docs/` alongside them.
