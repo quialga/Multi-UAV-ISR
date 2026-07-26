@@ -9,7 +9,8 @@ Controller: each blue flies toward the source of its highest-visibility
 rb edge (rel_pos = blue - src, so accelerate along -rel_pos).
 """
 import sys
-sys.path.insert(0, r"C:\Users\quial\sources\Multi-UAV-ISR")
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))   # repo root -> isr
 import numpy as np
 from isr.env.pursuit_env import PursuitEnv
 from isr.agents.heuristics import stationary_red

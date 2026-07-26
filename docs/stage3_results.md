@@ -5,7 +5,7 @@
 bar = GreedyPursuer + 5 (Stage 3 §9 return criterion) = **+16.47**; margin = **+1.69**)
 
 Generated: 2026-07-10 16:45:05
-Checkpoint: `C:\Users\quial\sources\Multi-UAV-ISR\runs\stage3\gpu_opt1_critic_frozen\best.pt`
+Checkpoint: `runs/stage3/gpu_opt1_critic_frozen/best.pt`
 Training: rollout 385, global_step 1576960
 Eval episodes per cell: 50 (deterministic, fixed seeds shared across blue policies)
 

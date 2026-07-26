@@ -1,5 +1,13 @@
 # Multi-UAV ISR — Adversarial Multi-Agent RL in POMDPs
 
+> **🔬 Research project — under active development.**
+> This repository contains an **ongoing personal research project** exploring
+> multi-agent reinforcement learning for cooperative UAV search and tracking in
+> partially observable environments. It is an **experimental platform** for
+> evaluating different perception, communication, and coordination
+> architectures — APIs, results, and structure may change as the work
+> progresses.
+
 A research-oriented Multi-Agent Reinforcement Learning project focused on the
 **core problem of autonomous-systems engineering**: a team of agents (UAVs)
 performing **Intelligence, Surveillance, and Reconnaissance** in an
@@ -255,3 +263,11 @@ per run.
 
 Per-stage result writeups land in `docs/stage{N}_results.md` as each stage
 completes; broader analysis notes accumulate in `docs/` alongside them.
+
+## License
+
+Licensed under the **Apache License 2.0** — see the [`LICENSE`](LICENSE) file
+for the full text. Apache 2.0 is permissive (use, modify, and redistribute
+freely, including commercially) while adding an explicit patent grant and
+requiring attribution and a statement of changes. If you build on this work, a
+citation or link back is appreciated.
