@@ -320,7 +320,7 @@ lets blues hug boundaries tightly and safely, and contributed to the
 crash reduction above (seen-obstacle position error → ~0 vs ~half a cell
 for the peak).
 
-### 3. Variable entity counts + count-agnostic critic (implemented + tested; training pending) · `feature/variable-entities`
+### 3. Variable entity counts + count-agnostic critic (fixed-count baseline validated; variable-N training pending) · `feature/variable-entities`
 
 One policy that trains on — and generalises across — a **variable number
 of reds and obstacles**. The actor was already count-native (per-node
@@ -343,6 +343,55 @@ with the count-sweep harness `scripts/eval_stage4_counts.py` (blue / red
 start from a pre-pool checkpoint. `load_full_stage4` transfers the other
 **76/77** tensors (whole actor + both GNN encoders + value head) and now
 **names** any tensor it leaves at fresh init.
+
+*Fixed-count baseline — the pool costs nothing* (`pool_fixed_v1`, GPU
+run, 2026-07-27). To rule out that the masked-mean pool degrades the
+critic at a fixed count, we retrained the **fixed** task from scratch
+with the pool — `n_blue=5, n_red=3, n_obstacles=4` static, crash
+penalties `2.0 / 1.0`, no warm start (`warm_start_full=None`), default
+recipe (`lr 1e-4`, `ent 0.008`, 1000 rollouts, 128 envs):
+
+```
+python scripts/train_stage4.py --device cuda --n-envs 128 --mb-size 2048 \
+    --n-workers 8 --n-epochs 4 --n-rollouts 1000 \
+    --crash-obstacle-penalty 2.0 --crash-blue-penalty 1.0 \
+    --eval-interval 25 --run-name pool_fixed_v1
+```
+
+Final deterministic eval **`stat=3.00  rand=3.00  run=2.90  mean=2.97/3`**.
+This **matches / slightly beats** the pre-pool flatten baseline
+(`obstacles_v1` ≈ 2.95/3), confirming the flatten→pool swap is
+capture-neutral at fixed count. The slight dip seen in an earlier pool
+run was a **warm-start confound** — a `--warm-start-full` from a *flatten*
+checkpoint silently dropped the 512-wide trunk into the 194-wide pool
+slot, compounded by throttled fine-tune `lr/ent`; a clean from-scratch
+run (Stage-1 encoder warm-start + normal cold trunk, identical to how the
+flatten baselines started) closes the gap. `pool_fixed_v1/best.pt` is now
+the correct **pool** warm-start base for the variable-N / moving-obstacle
+curriculum (pool→pool ⇒ the critic trunk transfers cleanly).
+
+*Crash accounting is now in the deterministic eval too* (TB
+`eval_det/{obstacle,ally}_crashes`, appended to the `[det eval]` log line
+when penalties are on). It counts **distinct crash EVENTS** — rising
+edges per blue, so a UAV that lingers inside an obstacle for many steps
+counts **once** (until it leaves and re-enters) — *not* the per-step
+occupancy the training-loop `crash(o/a)` stat sums. Measured on
+`pool_fixed_v1/best.pt` (20 eps/red, `max_steps=200`): **≈0.9–1.1
+obstacle events and ≈1.1–2.0 ally events per episode** (lowest vs
+stationary reds, highest vs `run`) — a reassuring deployment number,
+distinct crashes are rare. Two things to keep straight when reading it
+against the training stat:
+
+- **They measure different things and are not directly comparable.** The
+  training `crash(o/a)` stat is per-step *occupancy* — a blue camped on a
+  boundary counts every step (≈3.1/2.8) — whereas the event count is
+  *incidents* (≈1). The deployed policy genuinely **hugs** boundaries
+  (high occupancy) but rarely enters them *anew*, so by incident count it
+  is safe; a hard "any-contact-destroys" model would judge it more
+  harshly than this soft-stop one does.
+- **It is not post-capture camping.** The post-capture crash bucket is
+  ~0; the events occur on-mission while cornering the last surviving red
+  (episodes run to `max_steps` because ≈1 red typically escapes).
 
 ### 4. Moving obstacles — reciprocating patrol (implemented + tested; training pending) · `feature/moving-obstacles`
 

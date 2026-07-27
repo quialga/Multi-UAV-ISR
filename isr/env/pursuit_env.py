@@ -337,6 +337,10 @@ class PursuitEnv(ParallelEnv):
         # Diagnostic: crash counts for the LAST step (rendering/logging).
         self._last_obstacle_crashes: int = 0
         self._last_blue_crashes:     int = 0
+        # Per-blue crash occupancy masks for the LAST step (for rising-edge
+        # event counting; see _step).  All-False before the first step.
+        self._last_obstacle_crash_mask = np.zeros(n_blue, dtype=bool)
+        self._last_blue_crash_mask      = np.zeros(n_blue, dtype=bool)
         # Derived quantities.
         self.belief_cell_size = self.arena_size / max(1, self.belief_grid_size)
         # Log-odds evidence constants — same for both channels in v1.
@@ -607,6 +611,12 @@ class PursuitEnv(ParallelEnv):
 
         self._last_obstacle_crashes = int(blue_obstacle_crash.sum())
         self._last_blue_crashes     = int(blue_ally_crash.sum())
+        # Per-blue boolean masks for this step (occupancy, not events).
+        # A rising edge across steps = one DISTINCT crash event; callers
+        # that want an event count (vs the per-step-summed counts above)
+        # diff these against the previous step's masks.
+        self._last_obstacle_crash_mask = blue_obstacle_crash
+        self._last_blue_crash_mask      = blue_ally_crash
 
         # 6c. Per-agent crash shaping: r_crash_i (applied as a negative).
         r_crash = np.zeros(self.n_blue, dtype=np.float32)

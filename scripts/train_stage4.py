@@ -251,12 +251,20 @@ def evaluate_policy_deterministic(
     lower; this is the number to judge convergence by.
     """
     returns, caught, steps = [], [], []
+    obs_crashes, ally_crashes = [], []
     for ep in range(n_episodes):
         env = PursuitEnv(**env_kwargs, red_policy=red_policy,
                          seed=seed_base + ep)
         env.reset(seed=seed_base + ep)
         hidden = policy.initial_hidden(1, device)
         total = 0.0
+        # DISTINCT crash EVENTS (rising edges), not crash-steps: a blue
+        # that sits inside an obstacle for many steps counts ONCE, until
+        # it leaves and re-enters.  Counted per blue via mask diffs.
+        ep_obs_crash = 0
+        ep_ally_crash = 0
+        prev_obs_mask = np.zeros(len(env.possible_agents), dtype=bool)
+        prev_ally_mask = np.zeros(len(env.possible_agents), dtype=bool)
         agents = env.possible_agents
         while env.agents:
             obs = env.structured_belief_observation()
@@ -268,15 +276,24 @@ def evaluate_policy_deterministic(
             actions = {agents[i]: a_np[i] for i in range(len(agents))}
             _, rew_d, _, _, _ = env.step(actions)
             total += rew_d[agents[0]]
+            o_mask = env._last_obstacle_crash_mask
+            a_mask = env._last_blue_crash_mask
+            ep_obs_crash += int(np.count_nonzero(o_mask & ~prev_obs_mask))
+            ep_ally_crash += int(np.count_nonzero(a_mask & ~prev_ally_mask))
+            prev_obs_mask, prev_ally_mask = o_mask, a_mask
         snap = env.state_snapshot()
         returns.append(total)
         caught.append(int(snap.get("n_red_start", len(snap["red_active"]))
                           - int(snap["red_active"].sum())))
         steps.append(int(snap["t"]))
+        obs_crashes.append(ep_obs_crash)
+        ally_crashes.append(ep_ally_crash)
     return {
-        "mean_return": float(np.mean(returns)),
-        "mean_caught": float(np.mean(caught)),
-        "mean_steps":  float(np.mean(steps)),
+        "mean_return":           float(np.mean(returns)),
+        "mean_caught":           float(np.mean(caught)),
+        "mean_steps":            float(np.mean(steps)),
+        "mean_obstacle_crashes": float(np.mean(obs_crashes)),
+        "mean_blue_crashes":     float(np.mean(ally_crashes)),
     }
 
 
@@ -598,6 +615,7 @@ def main() -> None:
         # stochastic and always lower).
         if args.eval_interval > 0 and (rollout + 1) % args.eval_interval == 0:
             det = {}
+            det_ocrash, det_acrash = [], []
             for name, red in (("stationary", stationary_red),
                               ("random", random_red(seed=12345)),
                               ("run", run_from_nearest_uav)):
@@ -605,15 +623,32 @@ def main() -> None:
                     policy, env_kwargs, red, args.eval_episodes, device,
                 )
                 det[name] = r["mean_caught"]
+                det_ocrash.append(r["mean_obstacle_crashes"])
+                det_acrash.append(r["mean_blue_crashes"])
                 writer.add_scalar(f"eval_det/caught_{name}",
                                   r["mean_caught"], global_step)
             det_mean = float(np.mean(list(det.values())))
             writer.add_scalar("eval_det/caught_mean", det_mean, global_step)
+            # Distinct crash EVENTS (deterministic, per episode, averaged
+            # over the three red policies) — a blue camping in an obstacle
+            # counts ONCE, unlike the per-step-summed training-loop stat.
+            # The clean crash metric the stochastic training stat can't
+            # give.  Only surfaced when crash penalties are on.
+            crash_on = (args.crash_obstacle_penalty > 0
+                        or args.crash_blue_penalty > 0)
+            det_ocrash_m = float(np.mean(det_ocrash))
+            det_acrash_m = float(np.mean(det_acrash))
+            writer.add_scalar("eval_det/obstacle_crashes", det_ocrash_m,
+                              global_step)
+            writer.add_scalar("eval_det/ally_crashes", det_acrash_m,
+                              global_step)
+            crash_str = (f"  crash(o={det_ocrash_m:.2f}/a={det_acrash_m:.2f})"
+                         if crash_on else "")
             log(
                 f"    [det eval @ {rollout+1}]  "
                 f"caught  stat={det['stationary']:.2f}  "
                 f"rand={det['random']:.2f}  run={det['run']:.2f}  "
-                f"mean={det_mean:.2f}/{args.n_red}"
+                f"mean={det_mean:.2f}/{args.n_red}{crash_str}"
             )
 
         # Best-ckpt tracking.
