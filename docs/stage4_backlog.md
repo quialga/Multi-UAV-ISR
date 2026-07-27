@@ -75,10 +75,13 @@ v6.x architecture.  Kept as short pointers so the reader can trace
   count-agnostic → one policy generalises across (and beyond) trained
   counts.  Actor was already count-native; buffer/vec_env unchanged.
   See `gnn_stage4_policy.py::critic_forward` / `_masked_pool`,
-  `tests/test_variable_entities.py`.  *Implemented + tested; training
-  pending.*  (The pool narrows `critic_trunk.0.weight`, the only tensor
-  a pre-pool checkpoint can't warm-start; `load_full_stage4` transfers
-  the other 76/77 and now NAMES what it leaves at init.)
+  `tests/test_variable_entities.py`.  *Fixed-count baseline VALIDATED
+  (`pool_fixed_v1`, 2.97/3 det eval — matches the pre-pool flatten
+  ~2.95/3, so the pool is capture-neutral at fixed count; see
+  `stage4_results.md`); variable-N training still pending.*  (The pool
+  narrows `critic_trunk.0.weight`, the only tensor a pre-pool checkpoint
+  can't warm-start; `load_full_stage4` transfers the other 76/77 and now
+  NAMES what it leaves at init.)
 - **§4 moving obstacles** — LANDED as reciprocating patrol (simplest
   kinematics; branch `feature/moving-obstacles`).  See the annotated §4
   below for what shipped vs the original sketch.  *Implemented + tested;
