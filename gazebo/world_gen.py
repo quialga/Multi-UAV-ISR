@@ -70,6 +70,116 @@ OBSTACLE_H = 12.0  # m — obstacle cylinder height (taller than ALT_BLUE)
 WALL_H     = 12.0
 WALL_T     = 0.5
 
+# Drone COLLISION stays a 0.6 m box (the env treats agents as points;
+# keeping the physical footprint small minimises contact-geometry
+# mismatch against the env's point-vs-disk crash model).  The VISUAL
+# is drawn much larger + emissive so a 130 m arena view still shows
+# the drones clearly — renderer-only, physics never sees it.
+DRONE_COL_XY = 0.6
+DRONE_COL_Z  = 0.2
+DRONE_VIS_XY = 3.0
+DRONE_VIS_Z  = 0.8
+
+def _gui_config(arena: float) -> str:
+    """GUI layout with a start camera that FRAMES THE ARENA.
+
+    Without this, gz-sim's default camera sits near the world origin —
+    which is the arena's (0, 0) CORNER — and 130 m of scene is out of
+    frame.  Declaring any <gui> plugin replaces the default layout, so
+    the full standard set must be listed: MinimalScene (the 3D
+    viewport; carries <camera_pose> = x y z roll pitch yaw),
+    GzSceneManager (syncs world -> viewport), InteractiveViewControl
+    (mouse orbit/zoom), CameraTracking (right-click "Move To"/"Follow"),
+    WorldControl (play/pause/step bar), WorldStats (sim-time readout),
+    EntityTree (model list panel).
+
+    Camera: above the south edge at ~0.65*arena altitude, pitched down
+    0.65 rad, yawed +90 deg (facing +y) -> the whole arena in view.
+    """
+    cx = arena / 2.0
+    cy = -0.45 * arena
+    cz = 0.65 * arena
+    return f"""\
+    <gui fullscreen="0">
+      <plugin filename="MinimalScene" name="3D View">
+        <gz-gui>
+          <title>3D View</title>
+          <property type="bool" key="showTitleBar">false</property>
+          <property type="string" key="state">docked</property>
+        </gz-gui>
+        <engine>ogre2</engine>
+        <scene>scene</scene>
+        <ambient_light>0.4 0.4 0.4</ambient_light>
+        <background_color>0.8 0.85 0.95</background_color>
+        <camera_pose>{cx:.1f} {cy:.1f} {cz:.1f} 0 0.65 1.5708</camera_pose>
+      </plugin>
+      <plugin filename="GzSceneManager" name="Scene Manager">
+        <gz-gui>
+          <property key="state" type="string">floating</property>
+          <property key="width" type="double">5</property>
+          <property key="height" type="double">5</property>
+          <property key="showTitleBar" type="bool">false</property>
+        </gz-gui>
+      </plugin>
+      <plugin filename="InteractiveViewControl" name="Interactive view control">
+        <gz-gui>
+          <property key="state" type="string">floating</property>
+          <property key="width" type="double">5</property>
+          <property key="height" type="double">5</property>
+          <property key="showTitleBar" type="bool">false</property>
+        </gz-gui>
+      </plugin>
+      <plugin filename="CameraTracking" name="Camera tracking">
+        <gz-gui>
+          <property key="state" type="string">floating</property>
+          <property key="width" type="double">5</property>
+          <property key="height" type="double">5</property>
+          <property key="showTitleBar" type="bool">false</property>
+        </gz-gui>
+      </plugin>
+      <plugin filename="WorldControl" name="World control">
+        <gz-gui>
+          <title>World control</title>
+          <property type="bool" key="showTitleBar">false</property>
+          <property type="bool" key="resizable">false</property>
+          <property type="double" key="height">72</property>
+          <property type="double" key="width">121</property>
+          <property type="double" key="z">1</property>
+          <property type="string" key="state">floating</property>
+          <anchors target="3D View">
+            <line own="left" target="left"/>
+            <line own="bottom" target="bottom"/>
+          </anchors>
+        </gz-gui>
+        <play_pause>true</play_pause>
+        <step>true</step>
+        <start_paused>true</start_paused>
+        <use_event>true</use_event>
+      </plugin>
+      <plugin filename="WorldStats" name="World stats">
+        <gz-gui>
+          <title>World stats</title>
+          <property type="bool" key="showTitleBar">false</property>
+          <property type="bool" key="resizable">false</property>
+          <property type="double" key="height">110</property>
+          <property type="double" key="width">290</property>
+          <property type="double" key="z">1</property>
+          <property type="string" key="state">floating</property>
+          <anchors target="3D View">
+            <line own="right" target="right"/>
+            <line own="bottom" target="bottom"/>
+          </anchors>
+        </gz-gui>
+        <sim_time>true</sim_time>
+        <real_time>true</real_time>
+        <real_time_factor>true</real_time_factor>
+        <iterations>true</iterations>
+      </plugin>
+      <plugin filename="EntityTree" name="Entity tree"/>
+    </gui>
+"""
+
+
 # World-level boilerplate systems every gz-sim world needs:
 # Physics steps the engine, UserCommands accepts runtime service calls
 # (spawn/set-pose), SceneBroadcaster publishes the scene graph + poses.
@@ -118,11 +228,14 @@ def _drone_model(name: str, x: float, y: float, z: float,
                    <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz></inertia>
         </inertial>
         <collision name="collision">
-          <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
+          <geometry><box><size>{DRONE_COL_XY} {DRONE_COL_XY} {DRONE_COL_Z}</size></box></geometry>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
-          <material><ambient>{rgba}</ambient><diffuse>{rgba}</diffuse></material>
+          <geometry><box><size>{DRONE_VIS_XY} {DRONE_VIS_XY} {DRONE_VIS_Z}</size></box></geometry>
+          <material>
+            <ambient>{rgba}</ambient><diffuse>{rgba}</diffuse>
+            <emissive>{rgba}</emissive>
+          </material>
         </visual>
       </link>
       <plugin filename="gz-sim-velocity-control-system"
@@ -190,7 +303,7 @@ def env_to_sdf(env, world_name: str = "arena") -> str:
       <max_step_size>0.004</max_step_size>
       <real_time_factor>1.0</real_time_factor>
     </physics>
-{_WORLD_PLUGINS}{_GROUND_AND_SUN}"""]
+{_WORLD_PLUGINS}{_gui_config(float(env.arena_size))}{_GROUND_AND_SUN}"""]
     parts.append(_wall_models(float(env.arena_size)))
     for k in range(env.n_obstacles):
         x, y = env._obstacle_pos[k]
