@@ -83,6 +83,12 @@ def test_drones_are_kinematic_and_commandable(env_and_root):
         assert "gz::sim::systems::VelocityControl" in plugins
         topic = plugins["gz::sim::systems::VelocityControl"].find("topic")
         assert topic.text == f"/model/{name}/cmd_vel"
+        # Odometry out: per-drone topic so the bridge node knows WHO a
+        # measurement belongs to (the fused pose topic loses names in
+        # the ros_gz translation).
+        assert "gz::sim::systems::OdometryPublisher" in plugins
+        od = plugins["gz::sim::systems::OdometryPublisher"].find("odom_topic")
+        assert od.text == f"/model/{name}/odometry"
 
 
 def test_same_seed_same_world():

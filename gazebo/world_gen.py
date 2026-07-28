@@ -35,6 +35,14 @@ GAZEBO CONCEPTS USED HERE (beginner notes)
   forces, no motor model.  This matches our double-integrator
   contract: the bridge integrates the policy's acceleration into a
   velocity (same dt / v_max clip) and publishes it; Gazebo executes.
+- OdometryPublisher plugin (per drone): the mirror of VelocityControl.
+  It broadcasts the drone's own position AND velocity on
+  ``/model/<name>/odometry`` 20x/second.  One private topic per drone
+  means a reader always knows WHO a measurement belongs to from the
+  topic name alone.  (The world-level ``dynamic_pose/info`` firehose
+  also exists, but the ros_gz bridge drops the model names when
+  translating it — verified 2026-07-27 — so per-model odometry is our
+  pose source.)
 - gravity: real physics would drop a hovering box.  Drone links set
   ``<gravity>false</gravity>`` so altitude holds without a controller
   — the honest equivalent of the 2D env's "altitude doesn't exist".
@@ -241,6 +249,11 @@ def _drone_model(name: str, x: float, y: float, z: float,
       <plugin filename="gz-sim-velocity-control-system"
               name="gz::sim::systems::VelocityControl">
         <topic>/model/{name}/cmd_vel</topic>
+      </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_topic>/model/{name}/odometry</odom_topic>
+        <odom_publish_frequency>20</odom_publish_frequency>
       </plugin>
     </model>
 """

@@ -236,6 +236,11 @@
               name="gz::sim::systems::VelocityControl">
         <topic>/model/blue_0/cmd_vel</topic>
       </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_topic>/model/blue_0/odometry</odom_topic>
+        <odom_publish_frequency>20</odom_publish_frequency>
+      </plugin>
     </model>
     <model name="blue_1">
       <pose>38.963 54.949 5.000 0 0 0</pose>
@@ -260,6 +265,11 @@
       <plugin filename="gz-sim-velocity-control-system"
               name="gz::sim::systems::VelocityControl">
         <topic>/model/blue_1/cmd_vel</topic>
+      </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_topic>/model/blue_1/odometry</odom_topic>
+        <odom_publish_frequency>20</odom_publish_frequency>
       </plugin>
     </model>
     <model name="blue_2">
@@ -286,6 +296,11 @@
               name="gz::sim::systems::VelocityControl">
         <topic>/model/blue_2/cmd_vel</topic>
       </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_topic>/model/blue_2/odometry</odom_topic>
+        <odom_publish_frequency>20</odom_publish_frequency>
+      </plugin>
     </model>
     <model name="blue_3">
       <pose>129.637 127.509 5.000 0 0 0</pose>
@@ -310,6 +325,11 @@
       <plugin filename="gz-sim-velocity-control-system"
               name="gz::sim::systems::VelocityControl">
         <topic>/model/blue_3/cmd_vel</topic>
+      </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_topic>/model/blue_3/odometry</odom_topic>
+        <odom_publish_frequency>20</odom_publish_frequency>
       </plugin>
     </model>
     <model name="blue_4">
@@ -336,6 +356,11 @@
               name="gz::sim::systems::VelocityControl">
         <topic>/model/blue_4/cmd_vel</topic>
       </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_topic>/model/blue_4/odometry</odom_topic>
+        <odom_publish_frequency>20</odom_publish_frequency>
+      </plugin>
     </model>
     <model name="red_0">
       <pose>68.296 40.331 1.000 0 0 0</pose>
@@ -360,6 +385,11 @@
       <plugin filename="gz-sim-velocity-control-system"
               name="gz::sim::systems::VelocityControl">
         <topic>/model/red_0/cmd_vel</topic>
+      </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_topic>/model/red_0/odometry</odom_topic>
+        <odom_publish_frequency>20</odom_publish_frequency>
       </plugin>
     </model>
     <model name="red_1">
@@ -386,6 +416,11 @@
               name="gz::sim::systems::VelocityControl">
         <topic>/model/red_1/cmd_vel</topic>
       </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_topic>/model/red_1/odometry</odom_topic>
+        <odom_publish_frequency>20</odom_publish_frequency>
+      </plugin>
     </model>
     <model name="red_2">
       <pose>121.426 46.513 1.000 0 0 0</pose>
@@ -410,6 +445,11 @@
       <plugin filename="gz-sim-velocity-control-system"
               name="gz::sim::systems::VelocityControl">
         <topic>/model/red_2/cmd_vel</topic>
+      </plugin>
+      <plugin filename="gz-sim-odometry-publisher-system"
+              name="gz::sim::systems::OdometryPublisher">
+        <odom_topic>/model/red_2/odometry</odom_topic>
+        <odom_publish_frequency>20</odom_publish_frequency>
       </plugin>
     </model>
   </world>
