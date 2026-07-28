@@ -393,6 +393,47 @@ against the training stat:
   ~0; the events occur on-mission while cornering the last surviving red
   (episodes run to `max_steps` because ≈1 red typically escapes).
 
+*Crash-penalty ablation* (`pool_fixed_v3`, warm-started full from
+`pool_fixed_v1`). Raised both penalties **2.0/1.0 → 5.0/5.0** and
+lengthened episodes (`max_steps 200 → 400`), fine-tune recipe
+(`lr 4e-5, ent 0.002`), on the same fixed 5/3/4 task (obstacle radii
+5–15 m):
+
+| | caught/3 | obstacle events | ally events |
+|---|---|---|---|
+| `pool_fixed_v1` (2.0/1.0) | ~2.95–2.97 | ~0.9–1.1 | ~1.1–2.0 |
+| `pool_fixed_v3` (5.0/5.0) | 2.88–2.95 | ~0.8–1.1 | **~0.7–0.9** (late) |
+
+The higher penalty **roughly halves ally-crash events** (~1.3 → ~0.9
+avg) and leaves obstacle events flat, at a small capture cost. Two
+findings worth recording:
+
+- **Diminishing returns + a caution cost.** Crash events were already
+  near a floor (~1/episode); pushing the penalty to 5/5 traded a slight
+  capture dip and *lower mean return* (the policy takes wider, longer
+  detours around obstacles — caution costs steps) for the ally-crash
+  gain. The residual ~1 crash is inherent to the task: cornering a red
+  hiding beside a large obstacle forces a gap-threading approach. **The
+  4-obstacle env is not "too hard" — at ~2.95/3 with ~1 crash it is
+  effectively solved.** A ~3.0/3.0 penalty is the likely sweet spot; see
+  the design-questions note.
+- **`best_ckpt_metric='mean_return'` mis-selects on crash-penalty runs.**
+  Because caution *lowers* return over training, `mean_return` peaks
+  early — `pool_fixed_v3/best.pt` was saved at **rollout 1** (≈ the
+  warm-start), not the improved-crash policy. The only v3 checkpoint that
+  reflects the 5/5 training is `checkpoint_00100`. Every crash-penalty
+  run hits this; fix the selector (track `mean_caught`, or a
+  `caught − λ·crash` composite) before the curriculum runs.
+
+**Warm-start base chosen for the variable-N / moving-obstacle curriculum:
+`pool_fixed_v1/best.pt` (rollout 922, fully converged, 2.97/3).** v3 has
+no converged best-checkpoint (its `best.pt` is rollout 1; `checkpoint_00100`
+is a mid-training, lower-capture snapshot), and the static-obstacle
+caution v3 added is re-learned during the curriculum anyway (moving
+obstacles need *anticipatory* caution, learned fresh). Carry v3's
+**5.0/5.0** penalties into the curriculum runs, and fix the checkpoint
+selector first.
+
 ### 4. Moving obstacles — reciprocating patrol (implemented + tested; training pending) · `feature/moving-obstacles`
 
 Backlog §4 with the simplest kinematics: a fraction of obstacles patrol

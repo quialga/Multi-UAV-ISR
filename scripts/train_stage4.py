@@ -182,7 +182,21 @@ def _parse_args() -> argparse.Namespace:
     # Best-ckpt tracking
     p.add_argument("--best-ckpt-metric",       default=d.get("best_ckpt_metric",
                                                               "mean_return"),
-                   choices=("mean_return", "mean_caught"))
+                   choices=("mean_return", "mean_caught",
+                            "det_caught", "det_composite"),
+                   help="Which metric selects best.pt.  'mean_return' / "
+                        "'mean_caught' are the STOCHASTIC training stats "
+                        "(mean_return mis-selects on crash-penalty runs — "
+                        "caution lowers return, so it peaks at ~rollout 1).  "
+                        "'det_caught' / 'det_composite' use the DETERMINISTIC "
+                        "eval (robust; require --eval-interval > 0).  "
+                        "det_composite = det_caught − λ·(obstacle+ally crash "
+                        "events) — the crash-aware selector for penalty runs.")
+    p.add_argument("--best-ckpt-crash-lambda", type=float,
+                   default=d.get("best_ckpt_crash_lambda", 0.5),
+                   help="λ for the 'det_composite' metric: how many caught "
+                        "reds one crash EVENT is worth trading.  Only used "
+                        "when --best-ckpt-metric det_composite.")
     p.add_argument("--best-ckpt-min-delta",    type=float,
                    default=d.get("best_ckpt_min_delta", 0.05))
     p.add_argument("--best-ckpt-min-episodes", type=int,
@@ -485,6 +499,30 @@ def main() -> None:
 
     best_metric_val: float = float("-inf")
     best_ckpt_path = run_dir / "best.pt"
+    # Det-based selectors need the deterministic eval to actually run.
+    det_based_metric = args.best_ckpt_metric in ("det_caught", "det_composite")
+    if det_based_metric and args.eval_interval <= 0:
+        raise SystemExit(
+            f"--best-ckpt-metric {args.best_ckpt_metric} needs "
+            f"--eval-interval > 0 (got {args.eval_interval}); best.pt would "
+            f"never be written.  Use a stochastic metric or enable eval.")
+
+    def _maybe_save_best(metric_val: float, rollout: int, extra: dict) -> None:
+        """Save best.pt iff metric_val beats the running best by >=
+        min_delta.  One tracker / one file, whatever the metric — a run
+        uses a single metric, so there is no cross-metric contamination."""
+        nonlocal best_metric_val
+        if metric_val >= best_metric_val + args.best_ckpt_min_delta:
+            best_metric_val = metric_val
+            torch.save({
+                "policy_state": policy.state_dict(),
+                "rollout":      rollout + 1,
+                "global_step":  global_step,
+                "args":         args_dict_saved,
+                "best_metric":  {"name": args.best_ckpt_metric,
+                                 "value": metric_val, **extra},
+            }, best_ckpt_path)
+            writer.add_scalar("rollout/best_metric", metric_val, global_step)
 
     def _current_lr_frac(r: int) -> float:
         if args.lr_schedule == "constant" or args.n_rollouts <= 1:
@@ -651,24 +689,30 @@ def main() -> None:
                 f"mean={det_mean:.2f}/{args.n_red}{crash_str}"
             )
 
-        # Best-ckpt tracking.
-        n_completed = int(ep_stats.get("n_completed", 0))
-        if n_completed >= args.best_ckpt_min_episodes:
-            metric_val = float(ep_stats.get(args.best_ckpt_metric, 0.0))
-            if metric_val >= best_metric_val + args.best_ckpt_min_delta:
-                best_metric_val = metric_val
-                torch.save({
-                    "policy_state": policy.state_dict(),
-                    "rollout":      rollout + 1,
-                    "global_step":  global_step,
-                    "args":         args_dict_saved,
-                    "best_metric":  {
-                        "name":  args.best_ckpt_metric,
-                        "value": metric_val,
-                        "n_completed": n_completed,
-                    },
-                }, best_ckpt_path)
-                writer.add_scalar("rollout/best_metric", metric_val, global_step)
+            # Best-ckpt tracking on DETERMINISTIC metrics — only updatable
+            # here, where the det eval exists.  det_composite trades caught
+            # against crash EVENTS so caution can't tank the selector the
+            # way mean_return does.
+            if det_based_metric:
+                if args.best_ckpt_metric == "det_caught":
+                    sel = det_mean
+                else:  # det_composite
+                    sel = det_mean - args.best_ckpt_crash_lambda * (
+                        det_ocrash_m + det_acrash_m)
+                _maybe_save_best(sel, rollout, {
+                    "det_caught":           det_mean,
+                    "det_obstacle_crashes": det_ocrash_m,
+                    "det_ally_crashes":     det_acrash_m,
+                })
+
+        # Best-ckpt tracking on STOCHASTIC metrics (det metrics are handled
+        # at eval time above).
+        if not det_based_metric:
+            n_completed = int(ep_stats.get("n_completed", 0))
+            if n_completed >= args.best_ckpt_min_episodes:
+                metric_val = float(ep_stats.get(args.best_ckpt_metric, 0.0))
+                _maybe_save_best(metric_val, rollout,
+                                 {"n_completed": n_completed})
 
         if (rollout + 1) % args.save_interval == 0:
             ckpt_path = run_dir / f"checkpoint_{rollout+1:05d}.pt"
