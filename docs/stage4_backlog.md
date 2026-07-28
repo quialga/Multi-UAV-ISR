@@ -582,12 +582,16 @@ Items where the "right" choice depends on empirical results:
   hazard makes crashes both more likely and more costly).  See
   `stage4_results.md` §3 "Crash-penalty ablation".
 
-- **Best-checkpoint selector on crash-penalty runs** *(actionable bug,
-  not just a design question).*  `best_ckpt_metric='mean_return'`
-  mis-selects when crash penalties are on: caution lowers return over
-  training, so `mean_return` peaks at ~rollout 1 and `best.pt` is saved
-  as ≈ the warm-start (observed on `pool_fixed_v3`).  Fix before the
-  curriculum runs — track `mean_caught`, or better a
-  `caught − λ·crash_events` composite (needs the det-eval crash counts,
-  now available).  ~10 lines in the best-ckpt block of
-  `scripts/train_stage4.py`.
+- **Best-checkpoint selector on crash-penalty runs** — ✅ **FIXED.**
+  `best_ckpt_metric='mean_return'` mis-selected when crash penalties are
+  on: caution lowers return over training, so `mean_return` peaked at
+  ~rollout 1 and `best.pt` was saved as ≈ the warm-start (observed on
+  `pool_fixed_v3`).  Added two DETERMINISTIC selectors to
+  `--best-ckpt-metric`: `det_caught` (deterministic mean caught) and
+  `det_composite` (`det_caught − λ·(obstacle+ally crash events)`, λ via
+  `--best-ckpt-crash-lambda`, default 0.5).  These update best-ckpt at
+  eval time (require `--eval-interval > 0`; a startup guard errors
+  otherwise).  **Use `--best-ckpt-metric det_composite` for the curriculum
+  runs.**  The `mean_return` / `mean_caught` stochastic selectors are kept
+  for back-compat and remain the default.  See the best-ckpt block +
+  `_maybe_save_best` in `scripts/train_stage4.py`.
