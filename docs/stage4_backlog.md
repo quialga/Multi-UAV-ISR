@@ -573,3 +573,21 @@ Items where the "right" choice depends on empirical results:
 - **Grid resolution.**  Locked at 5m for v1.  Ablations: 3m (finer
   localisation, 4× compute) vs 10m (much lighter, cell often contains
   multiple entities).
+- **Crash-penalty sweet spot.**  `pool_fixed_v1` used 2.0/1.0;
+  `pool_fixed_v3` raised to 5.0/5.0, which ~halved ally-crash events but
+  cost a little capture + mean return (caution → longer detours).  Crash
+  events are near a floor (~1/episode), so returns diminish past this.
+  **~3.0/3.0 is the likely sweet spot** — an ablation candidate before
+  the moving-obstacle runs, where the right balance may shift (a moving
+  hazard makes crashes both more likely and more costly).  See
+  `stage4_results.md` §3 "Crash-penalty ablation".
+
+- **Best-checkpoint selector on crash-penalty runs** *(actionable bug,
+  not just a design question).*  `best_ckpt_metric='mean_return'`
+  mis-selects when crash penalties are on: caution lowers return over
+  training, so `mean_return` peaks at ~rollout 1 and `best.pt` is saved
+  as ≈ the warm-start (observed on `pool_fixed_v3`).  Fix before the
+  curriculum runs — track `mean_caught`, or better a
+  `caught − λ·crash_events` composite (needs the det-eval crash counts,
+  now available).  ~10 lines in the best-ckpt block of
+  `scripts/train_stage4.py`.
