@@ -125,13 +125,51 @@ Verified headless: reds fled their nearest blues at the correct
 headings (~20 m in 15 s, per-axis v_max saturation) and pinned
 against the boundary walls exactly like the env's wall-stop.
 
+## Milestone 3 — closed loop: the trained policy flies (DONE, verified 2026-07-30)
+
+`policy_bridge.py` (read its docstring — it is the plain-language
+walkthrough of the whole architecture) closes the loop:
+
+    Gazebo odometry → shadow env (sync kinematic state) → referee
+    (env's capture rule + crash event counters) → env's own belief/
+    occlusion/track perception → frozen policy act_deterministic with
+    GRU hidden state carried across ticks → accel→vel integration
+    (env's exact DT / per-axis v_max) → cmd_vel for 5 blues;
+    reds keep the milestone-2 flee heuristic, honouring the referee.
+
+Decisions that matter:
+
+- **Sim-time ticking**: `/clock` is bridged and the node sets
+  `use_sim_time`, so the 1 Hz decision timer counts GAZEBO seconds —
+  pausing the sim pauses the brain; faster-than-realtime batch eval
+  (milestone 4) keeps 1 decision per sim-second.
+- **Checkpoint loading**: `crash_penalty_v3/best.pt` predates the
+  count-agnostic critic pool, so exactly one CRITIC tensor is stale
+  (`critic_trunk.0.weight` 512→194). Loaded via `load_full_stage4`
+  (76/77 tensors); deployment is actor-only, and the bridge asserts
+  the actor copied completely.
+- Torch in WSL: `pip install --user --break-system-packages torch
+  --index-url https://download.pytorch.org/whl/cpu`.
+
+First verified episode (headless, seed 0): blues hunted from 16 m
+standoff down to **capture of red_2 at t=167 s**; episode report:
+1/3 caught in 200 s, 1 obstacle-contact event, 0 ally-proximity
+events. Note the gap vs the pure-Python deterministic eval
+(~2.95/3): quantifying and attributing it (control latency, odometry
+staleness, single-episode noise) is precisely milestone 4.
+
+Run it (two WSL terminals):
+
+```bash
+# T1: source ROS, then:  gz sim ~/arena_seed0.sdf   (press play)
+# T2:
+bash /mnt/c/Users/quial/sources/Multi-UAV-ISR/gazebo/milestone3.sh
+```
+
 ## Roadmap (remaining Phase 1 milestones)
 
-3. **Closed loop**: shadow env consumes Gazebo odometry →
-   `_update_belief_maps()` → `structured_belief_observation()` → frozen
-   policy (GRU hidden state carried across steps) → accel→vel
-   integration → `cmd_vel`; referee (captures at 3 m, crash counts)
-   from shadow-env logic.
 4. **Parity + eval**: lockstep same-seed comparison vs the pure-Python
-   rollout; then a 20-episode deterministic eval (target: catch rate
-   within noise of `runs/stage4/crash_penalty_v3`'s ~2.95/3).
+   rollout (localises any bug to the one seam Gazebo owns:
+   kinematics); then a 20-episode deterministic eval at
+   faster-than-realtime (target: catch rate within noise of
+   `crash_penalty_v3`'s ~2.95/3), attributing any residual gap.
