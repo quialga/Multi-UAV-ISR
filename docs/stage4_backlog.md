@@ -65,6 +65,21 @@ v6.x architecture.  Kept as short pointers so the reader can trace
   treatment so blues hug boundaries safely under the crash penalty.
   See `_build_obstacle_tracks` / `_obstacle_graph_from_tracks`,
   `tests/test_obstacle_tracks.py`.
+- **Red wall-repulsion** (not a numbered item; scripted-adversary fix)
+  — `run_from_nearest_uav` fled straight away from the nearest blue,
+  which ran a cornered red into the arena wall; the perpendicular
+  velocity clipped and the red slid ALONG the boundary, pinning itself.
+  Blue then learned a degenerate wall-trapping counter (observed in the
+  simulator: reds AND blues hugging walls).  The heuristic already
+  repelled off OBSTACLES for this exact reason ("strawman adversary");
+  extended the same falloff repulsion to the four arena walls, gated on
+  a new `arena_size` arg (None ⇒ off ⇒ byte-identical; the env now
+  passes it).  Corners get a diagonal push from two walls.  *Measured:*
+  under a greedy pursuer, red time within 8 m of a wall fell 0.63 → 0.42.
+  Makes the scripted red a less exploitable benchmark and a better base
+  for self-play.  Retrain the curriculum against it (the v1 warm-start
+  learned wall-camping).  See `run_from_nearest_uav`,
+  `tests/test_red_wall_repulsion.py`.
 - **Variable entity counts** (not a numbered item; branch
   `feature/variable-entities`) — `n_red` / `n_obstacles` are now a
   padded CAPACITY; `n_red_min` / `n_obstacles_min` sample the active

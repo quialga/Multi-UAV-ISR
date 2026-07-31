@@ -33,6 +33,7 @@ def run_from_nearest_uav(
     red_active:   np.ndarray,           # (N_red,) bool
     obstacle_pos: Optional[np.ndarray] = None,   # (N_obs, 2)
     obstacle_r:   Optional[np.ndarray] = None,   # (N_obs,)
+    arena_size:   Optional[float] = None,        # square side; enables walls
 ) -> np.ndarray:
     """
     Scripted red policy used by ``PursuitEnv``.
@@ -50,6 +51,16 @@ def run_from_nearest_uav(
     the boundary and falls off with distance; the result is renormalised
     to unit magnitude (still max-effort).  With no obstacles supplied
     the behaviour is byte-identical to the original.
+
+    Wall repulsion (``arena_size`` given): the SAME treatment for the
+    arena boundary.  A red fleeing straight away from a pursuer otherwise
+    runs into the wall, has its perpendicular velocity clipped, and slides
+    along the boundary — pinning itself exactly like the obstacle case and
+    letting blue learn a degenerate wall-trapping counter.  An inward push
+    from each of the four walls within ``influence`` metres is blended into
+    the same repulsion term, so a cornered red curves back toward open
+    space.  With ``arena_size=None`` (the default) wall repulsion is off
+    and the behaviour is byte-identical to callers that don't pass it.
 
     The function is pure (no hidden state).
 
@@ -88,6 +99,25 @@ def run_from_nearest_uav(
                     strength = (influence - surf[o]) / influence   # in (0, 1]
                     strength = float(np.clip(strength, 0.0, 1.0))
                     repulse += strength * (oc[o] / od[o])          # outward unit
+
+        # 2b. Wall repulsion: inward push from each of the four arena walls
+        #     within the influence band — same falloff as obstacles, added
+        #     to the same term.  Corners get pushes from two walls at once
+        #     (a diagonal inward nudge), which is exactly what un-pins a
+        #     cornered red.
+        if arena_size is not None:
+            rx, ry = float(red_pos[i, 0]), float(red_pos[i, 1])
+            walls = (
+                (rx,              np.array([ 1.0,  0.0], dtype=np.float32)),  # left
+                (arena_size - rx, np.array([-1.0,  0.0], dtype=np.float32)),  # right
+                (ry,              np.array([ 0.0,  1.0], dtype=np.float32)),  # bottom
+                (arena_size - ry, np.array([ 0.0, -1.0], dtype=np.float32)),  # top
+            )
+            for dist, inward in walls:
+                if dist < influence:
+                    strength = float(np.clip(
+                        (influence - dist) / influence, 0.0, 1.0))
+                    repulse += strength * inward
 
         vec = flee + w_repulse * repulse
         v_norm = float(np.linalg.norm(vec))
@@ -529,7 +559,7 @@ class PursuitEnv(ParallelEnv):
         # them.  Policies that don't use it accept and ignore the args.
         red_a = self.red_policy(
             self._blue_pos, self._red_pos, self._red_active,
-            self._obstacle_pos, self._obstacle_r,
+            self._obstacle_pos, self._obstacle_r, self.arena_size,
         )
         red_a = np.clip(red_a.astype(np.float32), -1.0, 1.0)
         red_a[~self._red_active] = 0.0  # defensive
