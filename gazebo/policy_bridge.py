@@ -349,7 +349,7 @@ def main() -> None:
     p = argparse.ArgumentParser(
         description="Milestone 3: trained policy drives the blues.")
     p.add_argument("--ckpt",
-                   default=str(REPO / "runs/stage4/crash_penalty_v3/best.pt"),
+                   default=str(REPO / "runs/stage4/pool_fixed_v1/best.pt"),
                    help="Stage 4 checkpoint to fly.")
     p.add_argument("--seed", type=int, default=0,
                    help="MUST match world_gen's --seed (same scenario).")
