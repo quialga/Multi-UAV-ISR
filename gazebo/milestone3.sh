@@ -2,12 +2,19 @@
 # gazebo/milestone3.sh — translator + the FULL closed loop:
 # trained policy on the blues, flee heuristic on the reds, referee.
 #
-# Same wiring pattern as milestone2.sh, three additions:
-#   - the 5 blue cmd_vel channels (the trained policy now drives them),
-#   - Gazebo's /clock into ROS, so the brain ticks on SIMULATED time
-#     (pause the sim and the brain pauses; run the sim faster and the
-#     brain keeps perfect 1-decision-per-sim-second step),
-#   - policy_bridge.py instead of scripted_reds.py (see its docstring).
+# Starts two processes:
+#   1. ros_gz_bridge parameter_bridge — the TRANSLATOR copying messages
+#      between Gazebo's and ROS's separate topic systems, for the
+#      topics listed below: per-drone odometry GZ->ROS, per-drone
+#      cmd_vel ROS->GZ ([ = into ROS, ] = into Gazebo), plus Gazebo's
+#      /clock into ROS so the brain ticks on SIMULATED time (pause the
+#      sim and the brain pauses; run it faster and the brain keeps a
+#      perfect 1-decision-per-sim-second step).
+#   2. policy_bridge.py — the closed-loop brain (see its docstring for
+#      a plain-language walkthrough of the whole architecture).
+#
+# The bridge runs in the background; the brain in the foreground so its
+# log is visible.  Ctrl+C stops the brain and the trap stops the bridge.
 #
 # PREREQUISITE: the sim is up in another terminal and PLAYING:
 #     source /opt/ros/jazzy/setup.bash

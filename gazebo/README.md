@@ -83,16 +83,15 @@ y-drift and altitude locked at 5.0 m — the kinematic contract holds.
 Contract tests: `tests/test_world_gen.py` (pure Python, no Gazebo
 needed — parses the SDF and checks it mirrors the env layout).
 
-## Milestone 2 — scripted red evaders (DONE, verified 2026-07-28)
+## Milestone 2 — scripted red evaders (superseded, folded into M3)
 
-The reds get their first brain: `scripted_reds.py` (see its docstring
-for a plain-language walkthrough) runs the env's own
-`run_from_nearest_uav` heuristic — imported, not re-implemented — in a
-1 Hz look→think→act loop against live Gazebo poses, integrating
-acceleration→velocity with the env's exact `DT`/`V_MAX_RED` and
-publishing per-red `cmd_vel`.
-
-Plumbing decisions that matter:
+Milestone 2 was a standalone node (`scripted_reds.py`) that drove only
+the reds with the env's `run_from_nearest_uav` heuristic while the
+blues hovered — the first "read poses → decide → write commands" loop.
+Milestone 3's `policy_bridge.py` fully subsumes it (it drives both
+teams and adds the referee), so the M2 node and its `milestone2.sh`
+launcher were **removed** to avoid a second place the red-command path
+has to stay faithful. Its plumbing lessons, which still apply, live on:
 
 - **Per-drone odometry, not the fused pose topic.** Each drone carries
   an `OdometryPublisher` plugin (`/model/<name>/odometry`, 20 Hz).
@@ -100,29 +99,14 @@ Plumbing decisions that matter:
   the ros_gz `Pose_V→TFMessage` translation (verified: names present
   in the raw gz message, empty `child_frame_id` after the bridge), so
   identity rides on the topic name instead. Bonus: odometry carries
-  velocity, which milestone 3's shadow env needs.
-- **`ros_gz_bridge parameter_bridge`** translates the 8 odometry
-  topics GZ→ROS and the 3 red `cmd_vel` topics ROS→GZ
-  (`[` = into ROS, `]` = into Gazebo in the mapping syntax).
+  velocity, which the shadow env needs.
+- **`ros_gz_bridge parameter_bridge`** translates odometry topics
+  GZ→ROS and `cmd_vel` topics ROS→GZ (`[` = into ROS, `]` = into
+  Gazebo in the mapping syntax).
 - WSL Python setup: system `python3` + ROS's numpy + user-level
-  `pettingzoo` (`pip install --user --break-system-packages`), repo
-  imported straight from `/mnt/c` via `PYTHONPATH` — **prepend**, never
-  overwrite, or `rclpy` disappears.
-
-Run it (two WSL terminals):
-
-```bash
-# T1: the sim (press play!)
-source /opt/ros/jazzy/setup.bash && gz sim ~/arena_seed0.sdf
-```
-
-```bash
-# T2: translator + brain (Ctrl+C to stop)
-bash /mnt/c/Users/quial/sources/Multi-UAV-ISR/gazebo/milestone2.sh
-```
-
-Verified headless: reds fled their nearest blues at the correct
-headings (~20 m in 15 s, per-axis v_max saturation).
+  `pettingzoo` / `torch` (`pip install --user --break-system-packages`),
+  repo imported straight from `/mnt/c` via `PYTHONPATH` — **prepend**,
+  never overwrite, or `rclpy` disappears.
 
 ### The stuck-at-the-wall bug (found by watching, fixed 2026-07-31)
 

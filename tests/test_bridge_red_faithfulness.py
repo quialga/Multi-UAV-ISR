@@ -8,14 +8,14 @@ the wall repulsion the training env applies — they fled straight into
 walls and pinned, diverging from the adversary the policy trained
 against.  See docs/stage4_backlog.md "Red wall-repulsion".
 
-The bridge modules import rclpy/torch (WSL-only), so we can't import
-and call them here.  Instead we assert two things that together
+The bridge module imports rclpy/torch (WSL-only), so we can't import
+and call it here.  Instead we assert two things that together
 guarantee faithfulness:
 
 1. The behavioural contract: with ``arena_size`` the scripted red is
    steered AWAY from a nearby wall; without it, straight into the wall.
    (If this ever flips, the "pass arena_size" requirement is moot.)
-2. The source contract: each bridge node's red-command call passes an
+2. The source contract: the bridge's red-command call passes an
    ``arena_size`` argument.  A cheap, formatting-tolerant check that
    fails loudly if someone reverts the call to the 5-arg form.
 """
@@ -71,7 +71,3 @@ def _red_policy_call_passes_arena_size(path: Path) -> bool:
 
 def test_policy_bridge_red_call_passes_arena_size():
     assert _red_policy_call_passes_arena_size(GAZEBO / "policy_bridge.py")
-
-
-def test_scripted_reds_red_call_passes_arena_size():
-    assert _red_policy_call_passes_arena_size(GAZEBO / "scripted_reds.py")
