@@ -201,6 +201,7 @@ in — no drift. Status of every seam between bridge and training env:
 | Referee (captures, belief wipe) | exact | env's step-5 block mirrored; per-tick ordering matches step |
 | Crash report card | exact rule | obstacle = env's attempted-entry mask; ally = env's radius rule; rising-edge events like the training eval |
 | Physics interference | designed out | walls stand off 0.5 m outside the line; obstacle collision shells thinner than the true radius — contact physics is a failsafe that never engages in normal flight; frictionless everywhere |
+| Red adversary | exact | bridge drives reds via `env.red_policy(...)` with `arena_size` — the exact call `PursuitEnv.step` uses, so wall repulsion (and any future red-policy change) tracks automatically. Guarded by `tests/test_bridge_red_faithfulness.py` |
 | Executed motion between ticks | approximate | Gazebo moves continuously where the env teleports once per second; endpoints coincide by construction (`exec_vel`), mid-second positions have no env counterpart |
 | Control latency | residual gap | the brain thinks ~0.1–0.2 s of sim time per tick while Gazebo keeps moving; the env applies actions instantly. Quantified in milestone 4 (lockstep pause-step eval) |
 
@@ -208,6 +209,12 @@ Post-fix closed-loop episode (seed 0, `pool_fixed_v1`): **2/3 caught
 in 200 s** (captures t=42 s, t=145 s), 2 obstacle-contact events, 0
 ally events — up from 1/3 with first capture at t=167 s before the
 wall/faithfulness fixes.
+
+After merging main's red wall-repulsion (`env.red_policy` fix above),
+a re-run caught **3/3 in 186 s** (captures t=43/182/185 s), 0 obstacle
+and 0 ally events — now against the harder, non-pinning reds. (Single
+stochastic episode, not a controlled comparison — milestone 4 does the
+20-episode eval.)
 
 ## Roadmap (remaining Phase 1 milestones)
 

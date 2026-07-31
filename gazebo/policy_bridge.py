@@ -357,10 +357,15 @@ class PolicyBridge(Node):
             hit_b & ~self.prev_obs_mask))
         self.prev_obs_mask = hit_b
 
-        # Reds: milestone-2 flee logic, honouring the referee.
-        red_a = run_from_nearest_uav(
+        # Reds: the SHADOW ENV's own red policy, called with the EXACT
+        # argument list PursuitEnv.step uses (incl. arena_size, which
+        # enables the scripted evader's wall repulsion).  Going through
+        # env.red_policy rather than importing run_from_nearest_uav by
+        # name means the Gazebo adversary tracks any future red-policy
+        # change automatically — no silent train/deploy drift.
+        red_a = env.red_policy(
             env._blue_pos, env._red_pos, env._red_active,
-            env._obstacle_pos, env._obstacle_r)
+            env._obstacle_pos, env._obstacle_r, env.arena_size)
         red_a = np.clip(red_a.astype(np.float32), -1.0, 1.0)
         exec_r, self.red_vel, _ = integrate_cmd(
             env._red_pos, self.red_vel, red_a, V_MAX_RED, DT,

@@ -197,10 +197,13 @@ class ScriptedReds(Node):
 
         # THINK: the training env's own evader logic, byte-identical.
         # (No referee yet, so every red counts as active/uncaught.)
+        # arena_size is passed so the reds get the SAME wall repulsion
+        # the env applies — without it they flee straight into walls and
+        # pin themselves, diverging from training.
         red_active = np.ones(self.n_red, dtype=bool)
         accel = run_from_nearest_uav(
             blue_pos, red_pos, red_active,
-            self.obstacle_pos, self.obstacle_r,
+            self.obstacle_pos, self.obstacle_r, self.arena_size,
         )
         accel = np.clip(accel.astype(np.float32), -1.0, 1.0)
 
