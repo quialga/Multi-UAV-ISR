@@ -102,6 +102,7 @@ from nav_msgs.msg import Odometry
 
 from isr.env.pursuit_env import PursuitEnv, run_from_nearest_uav
 from isr.agents.gnn_stage4_policy import GNNStage4Policy, split_stage4_obs
+from gazebo.kinematics import integrate_cmd
 
 # The env's kinematic contract (isr/env/entities.py + PursuitEnv
 # defaults).  BLUE_UAV.v_max = 1.5, RED_TARGET.v_max = 1.0, dt = 1.0.
@@ -314,9 +315,12 @@ class PolicyBridge(Node):
         accel = mean.squeeze(0).numpy().astype(np.float32)
         accel = np.clip(accel, -1.0, 1.0)          # env clips actions too
 
-        # ---- 6. ACT: integrate accel -> vel (env's exact rule) ---------
-        self.blue_vel = np.clip(self.blue_vel + accel * DT,
-                                -V_MAX_BLUE, V_MAX_BLUE)
+        # ---- 6. ACT: integrate accel -> vel (env's exact rule, incl.
+        # the wall-stop: zero the component that would push past a
+        # wall — see gazebo/kinematics.py) ------------------------------
+        self.blue_vel = integrate_cmd(env._blue_pos, self.blue_vel,
+                                      accel, V_MAX_BLUE, DT,
+                                      env.arena_size)
         for i in range(self.n_blue):
             self._publish(f"blue_{i}", self.blue_vel[i])
 
@@ -325,8 +329,9 @@ class PolicyBridge(Node):
             env._blue_pos, env._red_pos, env._red_active,
             env._obstacle_pos, env._obstacle_r)
         red_a = np.clip(red_a.astype(np.float32), -1.0, 1.0)
-        self.red_vel = np.clip(self.red_vel + red_a * DT,
-                               -V_MAX_RED, V_MAX_RED)
+        self.red_vel = integrate_cmd(env._red_pos, self.red_vel,
+                                     red_a, V_MAX_RED, DT,
+                                     env.arena_size)
         self.red_vel[~env._red_active] = 0.0       # caught reds freeze
         for j in range(self.n_red):
             self._publish(f"red_{j}", self.red_vel[j])

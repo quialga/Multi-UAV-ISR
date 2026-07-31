@@ -88,6 +88,18 @@ DRONE_COL_Z  = 0.2
 DRONE_VIS_XY = 3.0
 DRONE_VIS_Z  = 0.8
 
+# Frictionless contact for every surface a drone can touch.  The
+# training env has NO friction concept: at a wall it zeroes only the
+# into-the-wall velocity component and lets the agent slide freely
+# along it (PursuitEnv._integrate).  Gazebo's default friction instead
+# GRIPS a drone pressed against a wall/pillar so hard it cannot slide
+# at all (the "stuck at the wall" bug).  mu = tangential friction
+# coefficient; 0 = ice.  (The command-side half of this fix is
+# gazebo/kinematics.py.)
+_FRICTIONLESS = ("<surface><friction><ode>"
+                 "<mu>0</mu><mu2>0</mu2>"
+                 "</ode></friction></surface>")
+
 def _gui_config(arena: float) -> str:
     """GUI layout with a start camera that FRAMES THE ARENA.
 
@@ -237,6 +249,7 @@ def _drone_model(name: str, x: float, y: float, z: float,
         </inertial>
         <collision name="collision">
           <geometry><box><size>{DRONE_COL_XY} {DRONE_COL_XY} {DRONE_COL_Z}</size></box></geometry>
+          {_FRICTIONLESS}
         </collision>
         <visual name="visual">
           <geometry><box><size>{DRONE_VIS_XY} {DRONE_VIS_XY} {DRONE_VIS_Z}</size></box></geometry>
@@ -267,6 +280,7 @@ def _obstacle_model(k: int, x: float, y: float, r: float) -> str:
       <link name="body">
         <collision name="collision">
           <geometry><cylinder><radius>{r:.3f}</radius><length>{OBSTACLE_H}</length></cylinder></geometry>
+          {_FRICTIONLESS}
         </collision>
         <visual name="visual">
           <geometry><cylinder><radius>{r:.3f}</radius><length>{OBSTACLE_H}</length></cylinder></geometry>
@@ -295,6 +309,7 @@ def _wall_models(arena: float) -> str:
       <link name="body">
         <collision name="collision">
           <geometry><box><size>{sx:.3f} {sy:.3f} {WALL_H}</size></box></geometry>
+          {_FRICTIONLESS}
         </collision>
         <visual name="visual">
           <geometry><box><size>{sx:.3f} {sy:.3f} {WALL_H}</size></box></geometry>

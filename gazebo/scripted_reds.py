@@ -111,6 +111,7 @@ from nav_msgs.msg import Odometry               # position+velocity letter
 
 from isr.env.pursuit_env import run_from_nearest_uav
 from gazebo.world_gen import make_env
+from gazebo.kinematics import integrate_cmd
 
 # The env's exact kinematic constants (isr/env/entities.py: RED_TARGET
 # has v_max = 1.0; PursuitEnv default dt = 1.0).  Change nothing here
@@ -126,10 +127,12 @@ class ScriptedReds(Node):
     arrives, a timer fires) — we never write a while-loop ourselves.
     """
 
-    def __init__(self, n_blue: int, n_red: int, obstacle_pos, obstacle_r):
+    def __init__(self, n_blue: int, n_red: int, obstacle_pos, obstacle_r,
+                 arena_size: float):
         super().__init__("scripted_reds")
         self.n_blue = n_blue
         self.n_red = n_red
+        self.arena_size = arena_size
         # Obstacle geometry is STATIC scenario knowledge (sampled at
         # reset, mirrored into the world file) — the flee heuristic
         # uses it to steer around pillars instead of hugging them.
@@ -201,10 +204,12 @@ class ScriptedReds(Node):
         )
         accel = np.clip(accel.astype(np.float32), -1.0, 1.0)
 
-        # INTEGRATE: acceleration -> velocity, the env's exact rule
-        # (per-axis clip at v_max, not a diagonal-length clip).
-        self.red_vel = np.clip(self.red_vel + accel * DT,
-                               -V_MAX_RED, V_MAX_RED)
+        # INTEGRATE: acceleration -> velocity, the env's exact rule —
+        # per-axis clip at v_max AND the wall-stop (zero the component
+        # that would push past a wall; see gazebo/kinematics.py for
+        # why skipping this left drones wedged against walls).
+        self.red_vel = integrate_cmd(red_pos, self.red_vel, accel,
+                                     V_MAX_RED, DT, self.arena_size)
 
         # ACT: one velocity letter per red.  z stays 0 (hold altitude).
         for j, pub in enumerate(self.cmd_pubs):
@@ -234,7 +239,8 @@ def main() -> None:
 
     rclpy.init()
     node = ScriptedReds(args.n_blue, args.n_red,
-                        env._obstacle_pos, env._obstacle_r)
+                        env._obstacle_pos, env._obstacle_r,
+                        args.arena_size)
     try:
         rclpy.spin(node)          # hand control to ROS; timers/mail run
     except (KeyboardInterrupt,

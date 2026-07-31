@@ -122,8 +122,27 @@ bash /mnt/c/Users/quial/sources/Multi-UAV-ISR/gazebo/milestone2.sh
 ```
 
 Verified headless: reds fled their nearest blues at the correct
-headings (~20 m in 15 s, per-axis v_max saturation) and pinned
-against the boundary walls exactly like the env's wall-stop.
+headings (~20 m in 15 s, per-axis v_max saturation).
+
+### The stuck-at-the-wall bug (found by watching, fixed 2026-07-31)
+
+Symptom: any drone touching a wall froze there permanently. Two
+compounding mismatches with the env's wall contract
+(`PursuitEnv._integrate`: clip position, zero ONLY the into-wall
+velocity component, sliding stays free, no friction anywhere):
+
+1. **Command side** — the bridge nodes integrated acceleration into a
+   velocity that never learned about walls, so a drone kept being
+   commanded at full speed INTO the wall. Fix:
+   `gazebo/kinematics.integrate_cmd` mirrors the env's rule
+   (fuzz-tested bit-identical in `tests/test_gazebo_kinematics.py`).
+2. **Physics side** — Gazebo's default contact friction gripped a
+   pressed drone so hard it couldn't even slide sideways. The env has
+   no friction concept. Fix: `mu = 0` on every touchable surface
+   (drones, walls, obstacles) in the world file.
+
+Verified: pressed full-speed into the west wall, a drone still slides
+tangentially at commanded speed and escapes on demand.
 
 ## Milestone 3 — closed loop: the trained policy flies (DONE, verified 2026-07-30)
 

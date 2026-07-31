@@ -110,6 +110,7 @@
       <link name="body">
         <collision name="collision">
           <geometry><box><size>130.500 0.500 12.0</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>130.500 0.500 12.0</size></box></geometry>
@@ -124,6 +125,7 @@
       <link name="body">
         <collision name="collision">
           <geometry><box><size>130.500 0.500 12.0</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>130.500 0.500 12.0</size></box></geometry>
@@ -138,6 +140,7 @@
       <link name="body">
         <collision name="collision">
           <geometry><box><size>0.500 130.500 12.0</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>0.500 130.500 12.0</size></box></geometry>
@@ -152,6 +155,7 @@
       <link name="body">
         <collision name="collision">
           <geometry><box><size>0.500 130.500 12.0</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>0.500 130.500 12.0</size></box></geometry>
@@ -166,6 +170,7 @@
       <link name="body">
         <collision name="collision">
           <geometry><cylinder><radius>11.370</radius><length>12.0</length></cylinder></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><cylinder><radius>11.370</radius><length>12.0</length></cylinder></geometry>
@@ -179,6 +184,7 @@
       <link name="body">
         <collision name="collision">
           <geometry><cylinder><radius>5.165</radius><length>12.0</length></cylinder></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><cylinder><radius>5.165</radius><length>12.0</length></cylinder></geometry>
@@ -192,6 +198,7 @@
       <link name="body">
         <collision name="collision">
           <geometry><cylinder><radius>11.066</radius><length>12.0</length></cylinder></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><cylinder><radius>11.066</radius><length>12.0</length></cylinder></geometry>
@@ -205,6 +212,7 @@
       <link name="body">
         <collision name="collision">
           <geometry><cylinder><radius>14.351</radius><length>12.0</length></cylinder></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><cylinder><radius>14.351</radius><length>12.0</length></cylinder></geometry>
@@ -223,6 +231,7 @@
         </inertial>
         <collision name="collision">
           <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>3.0 3.0 0.8</size></box></geometry>
@@ -253,6 +262,7 @@
         </inertial>
         <collision name="collision">
           <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>3.0 3.0 0.8</size></box></geometry>
@@ -283,6 +293,7 @@
         </inertial>
         <collision name="collision">
           <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>3.0 3.0 0.8</size></box></geometry>
@@ -313,6 +324,7 @@
         </inertial>
         <collision name="collision">
           <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>3.0 3.0 0.8</size></box></geometry>
@@ -343,6 +355,7 @@
         </inertial>
         <collision name="collision">
           <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>3.0 3.0 0.8</size></box></geometry>
@@ -373,6 +386,7 @@
         </inertial>
         <collision name="collision">
           <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>3.0 3.0 0.8</size></box></geometry>
@@ -403,6 +417,7 @@
         </inertial>
         <collision name="collision">
           <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>3.0 3.0 0.8</size></box></geometry>
@@ -433,6 +448,7 @@
         </inertial>
         <collision name="collision">
           <geometry><box><size>0.6 0.6 0.2</size></box></geometry>
+          <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
           <geometry><box><size>3.0 3.0 0.8</size></box></geometry>

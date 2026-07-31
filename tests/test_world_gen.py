@@ -95,3 +95,19 @@ def test_same_seed_same_world():
     a = env_to_sdf(make_env(0, 5, 3, 4, 130.0))
     b = env_to_sdf(make_env(0, 5, 3, 4, 130.0))
     assert a == b
+
+
+def test_contact_surfaces_are_frictionless(env_and_root):
+    """The env has no friction concept (wall-stop zeroes only the
+    into-wall velocity component; sliding is free).  Gazebo's default
+    friction wedged drones against walls permanently, so every surface
+    a drone can touch must declare mu = 0."""
+    env, root = env_and_root
+    models = _models(root)
+    touchable = ([f"blue_{i}" for i in range(env.n_blue)]
+                 + [f"red_{j}" for j in range(env.n_red)]
+                 + [f"obstacle_{k}" for k in range(env.n_obstacles)]
+                 + ["wall_south", "wall_north", "wall_west", "wall_east"])
+    for name in touchable:
+        mu = models[name].find(".//collision//friction/ode/mu")
+        assert mu is not None and float(mu.text) == 0.0, name
