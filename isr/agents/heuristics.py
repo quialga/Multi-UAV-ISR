@@ -151,6 +151,7 @@ def stationary_red(
     red_active: np.ndarray,
     obstacle_pos: Optional[np.ndarray] = None,   # accepted, unused
     obstacle_r:   Optional[np.ndarray] = None,   # accepted, unused
+    arena_size:   Optional[float] = None,        # accepted, unused
 ) -> np.ndarray:
     """
     Red doesn't move.  Easiest possible adversary — given Stage 1's
@@ -180,6 +181,7 @@ def random_red(seed: Optional[int] = None):
         red_active: np.ndarray,
         obstacle_pos: Optional[np.ndarray] = None,
         obstacle_r:   Optional[np.ndarray] = None,
+        arena_size:   Optional[float] = None,
     ) -> np.ndarray:
         out = rng.uniform(-1.0, 1.0, size=red_pos.shape).astype(np.float32)
         out[~red_active] = 0.0
