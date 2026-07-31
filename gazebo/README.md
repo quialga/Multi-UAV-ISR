@@ -185,10 +185,34 @@ Run it (two WSL terminals):
 bash /mnt/c/Users/quial/sources/Multi-UAV-ISR/gazebo/milestone3.sh
 ```
 
+## Faithfulness audit (2026-07-31)
+
+Goal: the deployed policy must experience the SAME world it trained
+in — no drift. Status of every seam between bridge and training env:
+
+| Seam | Status | Mechanism |
+|---|---|---|
+| Scenario (spawns, obstacle layout) | exact | same `reset(seed)`; startup check warns on mismatch |
+| Perception (belief, occlusion, noise, tracks) | exact | env's own code runs in the shadow env, untouched |
+| Policy invocation | exact | `act_deterministic` + GRU hidden, identical to training eval |
+| Velocity clip / wall / obstacle motion rules | exact | `kinematics.integrate_cmd`; fuzz-tested trajectory-identical to `_integrate` + `_clip_positions_from_obstacles` (positions, velocities, crash masks) |
+| Observation velocities | exact | shadow env fed the integrator's `state_vel` (the env's post-step velocity), not odometry twist |
+| First observation | exact | tick 1 consumes the reset-time belief update (no double fuse) |
+| Referee (captures, belief wipe) | exact | env's step-5 block mirrored; per-tick ordering matches step |
+| Crash report card | exact rule | obstacle = env's attempted-entry mask; ally = env's radius rule; rising-edge events like the training eval |
+| Physics interference | designed out | walls stand off 0.5 m outside the line; obstacle collision shells thinner than the true radius — contact physics is a failsafe that never engages in normal flight; frictionless everywhere |
+| Executed motion between ticks | approximate | Gazebo moves continuously where the env teleports once per second; endpoints coincide by construction (`exec_vel`), mid-second positions have no env counterpart |
+| Control latency | residual gap | the brain thinks ~0.1–0.2 s of sim time per tick while Gazebo keeps moving; the env applies actions instantly. Quantified in milestone 4 (lockstep pause-step eval) |
+
+Post-fix closed-loop episode (seed 0, `pool_fixed_v1`): **2/3 caught
+in 200 s** (captures t=42 s, t=145 s), 2 obstacle-contact events, 0
+ally events — up from 1/3 with first capture at t=167 s before the
+wall/faithfulness fixes.
+
 ## Roadmap (remaining Phase 1 milestones)
 
 4. **Parity + eval**: lockstep same-seed comparison vs the pure-Python
    rollout (localises any bug to the one seam Gazebo owns:
    kinematics); then a 20-episode deterministic eval at
-   faster-than-realtime (target: catch rate within noise of
-   `crash_penalty_v3`'s ~2.95/3), attributing any residual gap.
+   faster-than-realtime, attributing any residual gap (control
+   latency is the prime suspect).

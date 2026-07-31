@@ -106,14 +106,14 @@
     </model>
     <model name="wall_south">
       <static>true</static>
-      <pose>65.000 -0.250 6.000 0 0 0</pose>
+      <pose>65.000 -0.750 6.000 0 0 0</pose>
       <link name="body">
         <collision name="collision">
-          <geometry><box><size>130.500 0.500 12.0</size></box></geometry>
+          <geometry><box><size>131.500 0.500 12.0</size></box></geometry>
           <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
-          <geometry><box><size>130.500 0.500 12.0</size></box></geometry>
+          <geometry><box><size>131.500 0.500 12.0</size></box></geometry>
           <material><ambient>0.7 0.7 0.75 0.35</ambient><diffuse>0.7 0.7 0.75 0.35</diffuse></material>
           <transparency>0.65</transparency>
         </visual>
@@ -121,14 +121,14 @@
     </model>
     <model name="wall_north">
       <static>true</static>
-      <pose>65.000 130.250 6.000 0 0 0</pose>
+      <pose>65.000 130.750 6.000 0 0 0</pose>
       <link name="body">
         <collision name="collision">
-          <geometry><box><size>130.500 0.500 12.0</size></box></geometry>
+          <geometry><box><size>131.500 0.500 12.0</size></box></geometry>
           <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
-          <geometry><box><size>130.500 0.500 12.0</size></box></geometry>
+          <geometry><box><size>131.500 0.500 12.0</size></box></geometry>
           <material><ambient>0.7 0.7 0.75 0.35</ambient><diffuse>0.7 0.7 0.75 0.35</diffuse></material>
           <transparency>0.65</transparency>
         </visual>
@@ -136,14 +136,14 @@
     </model>
     <model name="wall_west">
       <static>true</static>
-      <pose>-0.250 65.000 6.000 0 0 0</pose>
+      <pose>-0.750 65.000 6.000 0 0 0</pose>
       <link name="body">
         <collision name="collision">
-          <geometry><box><size>0.500 130.500 12.0</size></box></geometry>
+          <geometry><box><size>0.500 131.500 12.0</size></box></geometry>
           <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.500 130.500 12.0</size></box></geometry>
+          <geometry><box><size>0.500 131.500 12.0</size></box></geometry>
           <material><ambient>0.7 0.7 0.75 0.35</ambient><diffuse>0.7 0.7 0.75 0.35</diffuse></material>
           <transparency>0.65</transparency>
         </visual>
@@ -151,14 +151,14 @@
     </model>
     <model name="wall_east">
       <static>true</static>
-      <pose>130.250 65.000 6.000 0 0 0</pose>
+      <pose>130.750 65.000 6.000 0 0 0</pose>
       <link name="body">
         <collision name="collision">
-          <geometry><box><size>0.500 130.500 12.0</size></box></geometry>
+          <geometry><box><size>0.500 131.500 12.0</size></box></geometry>
           <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
-          <geometry><box><size>0.500 130.500 12.0</size></box></geometry>
+          <geometry><box><size>0.500 131.500 12.0</size></box></geometry>
           <material><ambient>0.7 0.7 0.75 0.35</ambient><diffuse>0.7 0.7 0.75 0.35</diffuse></material>
           <transparency>0.65</transparency>
         </visual>
@@ -169,7 +169,7 @@
       <pose>41.979 19.097 6.000 0 0 0</pose>
       <link name="body">
         <collision name="collision">
-          <geometry><cylinder><radius>11.370</radius><length>12.0</length></cylinder></geometry>
+          <geometry><cylinder><radius>11.020</radius><length>12.0</length></cylinder></geometry>
           <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
@@ -183,7 +183,7 @@
       <pose>96.327 106.276 6.000 0 0 0</pose>
       <link name="body">
         <collision name="collision">
-          <geometry><cylinder><radius>5.165</radius><length>12.0</length></cylinder></geometry>
+          <geometry><cylinder><radius>4.815</radius><length>12.0</length></cylinder></geometry>
           <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
@@ -197,7 +197,7 @@
       <pose>87.950 69.362 6.000 0 0 0</pose>
       <link name="body">
         <collision name="collision">
-          <geometry><cylinder><radius>11.066</radius><length>12.0</length></cylinder></geometry>
+          <geometry><cylinder><radius>10.716</radius><length>12.0</length></cylinder></geometry>
           <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">
@@ -211,7 +211,7 @@
       <pose>96.585 15.274 6.000 0 0 0</pose>
       <link name="body">
         <collision name="collision">
-          <geometry><cylinder><radius>14.351</radius><length>12.0</length></cylinder></geometry>
+          <geometry><cylinder><radius>14.001</radius><length>12.0</length></cylinder></geometry>
           <surface><friction><ode><mu>0</mu><mu2>0</mu2></ode></friction></surface>
         </collision>
         <visual name="visual">

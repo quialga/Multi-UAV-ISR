@@ -204,18 +204,21 @@ class ScriptedReds(Node):
         )
         accel = np.clip(accel.astype(np.float32), -1.0, 1.0)
 
-        # INTEGRATE: acceleration -> velocity, the env's exact rule —
-        # per-axis clip at v_max AND the wall-stop (zero the component
-        # that would push past a wall; see gazebo/kinematics.py for
-        # why skipping this left drones wedged against walls).
-        self.red_vel = integrate_cmd(red_pos, self.red_vel, accel,
-                                     V_MAX_RED, DT, self.arena_size)
+        # INTEGRATE: acceleration -> velocity with the env's exact
+        # motion contract (per-axis v_max clip, wall arrival, obstacle
+        # rollback — see gazebo/kinematics.py).  exec_vel is what we
+        # PUBLISH (lands the drone on the env's next position);
+        # state_vel is the env's post-step velocity we carry to the
+        # next tick.
+        exec_vel, self.red_vel, _ = integrate_cmd(
+            red_pos, self.red_vel, accel, V_MAX_RED, DT,
+            self.arena_size, self.obstacle_pos, self.obstacle_r)
 
         # ACT: one velocity letter per red.  z stays 0 (hold altitude).
         for j, pub in enumerate(self.cmd_pubs):
             cmd = Twist()
-            cmd.linear.x = float(self.red_vel[j, 0])
-            cmd.linear.y = float(self.red_vel[j, 1])
+            cmd.linear.x = float(exec_vel[j, 0])
+            cmd.linear.y = float(exec_vel[j, 1])
             pub.publish(cmd)
 
 

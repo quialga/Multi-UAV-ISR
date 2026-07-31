@@ -88,6 +88,20 @@ DRONE_COL_Z  = 0.2
 DRONE_VIS_XY = 3.0
 DRONE_VIS_Z  = 0.8
 
+# The COMMAND layer (gazebo/kinematics.py) enforces the env's exact
+# wall/obstacle motion rules, so Gazebo's contact physics must be a
+# FAILSAFE that never engages in normal flight — if physics blocked a
+# drone before the command rule did, positions would drift from the
+# env (e.g. a wall-hugger stopping 0.3 m short of coordinate 0 because
+# of its own body width).  Hence:
+#   - walls sit OUTSIDE the arena line by WALL_STANDOFF, so a drone
+#     CENTRE can reach exactly 0 / arena_size like in the env;
+#   - obstacle COLLISION cylinders are slightly thinner than the true
+#     radius (visual stays exact), so the command-side stop at the
+#     true radius fires before any physical contact.
+WALL_STANDOFF     = 0.5
+OBSTACLE_COL_SHRINK = 0.35
+
 # Frictionless contact for every surface a drone can touch.  The
 # training env has NO friction concept: at a wall it zeroes only the
 # into-the-wall velocity component and lets the agent slide freely
@@ -273,13 +287,14 @@ def _drone_model(name: str, x: float, y: float, z: float,
 
 
 def _obstacle_model(k: int, x: float, y: float, r: float) -> str:
+    r_col = max(r - OBSTACLE_COL_SHRINK, 0.1)
     return f"""\
     <model name="obstacle_{k}">
       <static>true</static>
       <pose>{x:.3f} {y:.3f} {OBSTACLE_H / 2:.3f} 0 0 0</pose>
       <link name="body">
         <collision name="collision">
-          <geometry><cylinder><radius>{r:.3f}</radius><length>{OBSTACLE_H}</length></cylinder></geometry>
+          <geometry><cylinder><radius>{r_col:.3f}</radius><length>{OBSTACLE_H}</length></cylinder></geometry>
           {_FRICTIONLESS}
         </collision>
         <visual name="visual">
@@ -294,11 +309,13 @@ def _obstacle_model(k: int, x: float, y: float, r: float) -> str:
 def _wall_models(arena: float) -> str:
     """Four static translucent slabs on the arena boundary."""
     half = arena / 2.0
+    off = WALL_STANDOFF + WALL_T / 2      # wall centre, outside the line
+    span = arena + 2 * WALL_STANDOFF + WALL_T
     specs = [
-        ("wall_south", half, -WALL_T / 2, arena + WALL_T, WALL_T),
-        ("wall_north", half, arena + WALL_T / 2, arena + WALL_T, WALL_T),
-        ("wall_west", -WALL_T / 2, half, WALL_T, arena + WALL_T),
-        ("wall_east", arena + WALL_T / 2, half, WALL_T, arena + WALL_T),
+        ("wall_south", half, -off, span, WALL_T),
+        ("wall_north", half, arena + off, span, WALL_T),
+        ("wall_west", -off, half, WALL_T, span),
+        ("wall_east", arena + off, half, WALL_T, span),
     ]
     out = []
     for name, x, y, sx, sy in specs:

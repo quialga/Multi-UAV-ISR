@@ -64,8 +64,15 @@ def test_obstacles_match_env_layout(env_and_root):
         x, y = map(float, m.find("pose").text.split()[:2])
         assert abs(x - float(env._obstacle_pos[k, 0])) < 1e-3
         assert abs(y - float(env._obstacle_pos[k, 1])) < 1e-3
-        r = float(m.find(".//cylinder/radius").text)
-        assert abs(r - float(env._obstacle_r[k])) < 1e-3
+        # VISUAL radius = the env's true radius (what you see and what
+        # occlusion models); COLLISION radius is slightly thinner so
+        # the command-side stop at the true radius always fires before
+        # physics engages (physics = failsafe only).
+        r_env = float(env._obstacle_r[k])
+        r_vis = float(m.find(".//visual//cylinder/radius").text)
+        r_col = float(m.find(".//collision//cylinder/radius").text)
+        assert abs(r_vis - r_env) < 1e-3
+        assert abs(r_col - max(r_env - 0.35, 0.1)) < 1e-3
 
 
 def test_drones_are_kinematic_and_commandable(env_and_root):
