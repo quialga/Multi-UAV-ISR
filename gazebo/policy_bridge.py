@@ -36,32 +36,16 @@ imported, byte-identical to training) turn them into the observation
 the network expects.  The env is called "shadow" because it mirrors
 Gazebo's reality without simulating any motion itself.
 
-ONE TICK, STEP BY STEP (the loop below, in order)
--------------------------------------------------
-    1. SYNC     copy positions+velocities from Gazebo odometry into
-                the shadow env (Gazebo replaced the env's kinematics,
-                so this is the env's "movement" phase).
-    2. REFEREE  the env's own capture rule: any red within 3 m of any
-                blue is caught -> marked inactive, its belief blob is
-                wiped (exactly what env.step does).  Also counts
-                obstacle / ally near-collisions for the report card.
-    3. PERCEIVE run the env's belief-map update (noisy sweeps,
-                occlusion, decay) and build the graph observation.
-    4. THINK    the frozen network, deterministically (no exploration
-                noise) — same call as training's evaluation:
-                act_deterministic(observation, memory).
-    5. MEMORY   the network is recurrent: it carries a small hidden
-                state ("what I remember from previous seconds") that
-                we pass back in every tick and reset only at episode
-                start.  Forgetting to carry this would silently
-                lobotomise the policy.
-    6. ACT      the network outputs accelerations; integrate them into
-                velocities with the env's exact rule (dt = 1 s, per-
-                axis clip at 1.5 m/s) and publish one cmd_vel per blue.
-                Reds get their milestone-2 flee commands (caught reds
-                get zero — they freeze, like the env's frozen reds).
-    7. CLOCK    when all reds are caught (or 200 s pass), stop every
-                drone, print the episode report, and exit.
+ONE TICK, STEP BY STEP
+----------------------
+The per-tick decision logic (sync -> referee -> belief -> observe ->
+think -> integrate) lives in ``gazebo/brain.py`` (``ClosedLoopBrain``),
+deliberately free of ROS so the parity test can run the EXACT same code
+without Gazebo (tests/test_bridge_parity.py).  THIS file is the thin
+ROS wrapper around it: each simulated second it reads the drones'
+odometry, calls ``brain.tick(blue_pos, red_pos)``, and publishes the
+velocity commands the brain returns (stopping every drone and printing
+the episode report when the brain signals the episode is over).
 
 WHY THE LOOP RUNS ON SIMULATION TIME, NOT WALL-CLOCK TIME
 ---------------------------------------------------------
@@ -101,86 +85,30 @@ from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 
 from isr.env.pursuit_env import PursuitEnv, run_from_nearest_uav
-from isr.agents.gnn_stage4_policy import GNNStage4Policy, split_stage4_obs
-from gazebo.kinematics import integrate_cmd
-
-# The env's kinematic contract (isr/env/entities.py + PursuitEnv
-# defaults).  BLUE_UAV.v_max = 1.5, RED_TARGET.v_max = 1.0, dt = 1.0.
-DT         = 1.0
-V_MAX_BLUE = 1.5
-V_MAX_RED  = 1.0
-
-
-def env_kwargs_from_checkpoint(a: dict) -> dict:
-    """Rebuild the training env's configuration from the checkpoint's
-    saved arguments, so the shadow env perceives EXACTLY like the env
-    the policy was trained in (same noise rates, same belief decay,
-    same grid...).  Mirrors scripts/train_stage4.py's env_kwargs."""
-    return dict(
-        n_blue                   = a["n_blue"],
-        n_red                    = a["n_red"],
-        arena_size               = a["arena_size"],
-        max_steps                = a["max_steps"],
-        capture_radius           = a["capture_radius"],
-        sensor_radius            = a["sensor_radius"],
-        n_obstacles              = a["n_obstacles"],
-        obstacle_radius_min      = a["obstacle_radius_min"],
-        obstacle_radius_max      = a["obstacle_radius_max"],
-        obstacle_spawn_clearance = a["obstacle_spawn_clearance"],
-        use_belief_maps          = True,
-        belief_grid_size         = a["belief_grid_size"],
-        belief_channels          = a["belief_channels"],
-        belief_clip              = a["belief_clip"],
-        p_TP                     = a["p_tp"],
-        p_FP                     = a["p_fp"],
-        ray_step_size            = a["ray_step_size"],
-        enemy_belief_decay       = a.get("enemy_belief_decay", 1.0),
-        enemy_belief_diffusion   = a.get("enemy_belief_diffusion", 0.0),
-        sensor_pos_noise_std     = a.get("sensor_pos_noise_std", 1.0),
-        # Crash knobs affect only rewards (unused at deployment) but
-        # blue_collision_radius also feeds the referee's ally counter.
-        crash_obstacle_penalty   = a.get("crash_obstacle_penalty", 0.0),
-        crash_blue_penalty       = a.get("crash_blue_penalty", 0.0),
-        blue_collision_radius    = a.get("blue_collision_radius", 2.0),
-    )
+from isr.agents.gnn_stage4_policy import GNNStage4Policy
+from gazebo.brain import ClosedLoopBrain, env_kwargs_from_checkpoint, DT
 
 
 class PolicyBridge(Node):
-    """One ROS node closing the whole loop at 1 (simulated) Hz."""
+    """Thin ROS wrapper: odometry -> ClosedLoopBrain.tick -> cmd_vel.
 
-    def __init__(self, env: PursuitEnv, policy: GNNStage4Policy):
+    All decision logic lives in gazebo/brain.py; this class only does
+    ROS I/O (subscribe odometry, publish velocities, log)."""
+
+    def __init__(self, brain: ClosedLoopBrain):
         # use_sim_time: our timer ticks on GAZEBO's clock (see module
         # docstring).  Must be set before the timer is created.
         super().__init__(
             "policy_bridge",
             parameter_overrides=[Parameter("use_sim_time", value=True)])
-        self.env = env
-        self.policy = policy
-        self.n_blue = env.n_blue
-        self.n_red = env.n_red
+        self.brain = brain
+        self.n_blue = brain.n_blue
+        self.n_red = brain.n_red
 
-        # The network's recurrent memory (batch of 1 "env" = Gazebo).
-        self.hidden = policy.initial_hidden(1, torch.device("cpu"))
-
-        # Commanded velocities = the drones' kinematic state.  The env
-        # integrates acceleration into velocity; we do it here (Gazebo
-        # then executes the velocity, closing the double-integrator).
-        self.blue_vel = np.zeros((self.n_blue, 2), dtype=np.float32)
-        self.red_vel = np.zeros((self.n_red, 2), dtype=np.float32)
-
-        # Latest odometry per drone: name -> (pos(2,), vel(2,)).
-        self.odom: dict[str, tuple[np.ndarray, np.ndarray]] = {}
-
-        # Report-card counters (rising-edge events, like the training
-        # eval): a blue parked against a pillar counts one crash, not
-        # one per second.
-        self.prev_obs_mask = np.zeros(self.n_blue, dtype=bool)
-        self.prev_ally_mask = np.zeros(self.n_blue, dtype=bool)
-        self.obs_crash_events = 0
-        self.ally_crash_events = 0
+        # Latest odometry position per drone: name -> pos(2,).
+        self.pos: dict[str, np.ndarray] = {}
         self.spawn_checked = False
-        self.done = False
-        self._ticked_once = False
+        self._spawn_blue = brain.env._blue_pos.copy()
 
         names = ([f"blue_{i}" for i in range(self.n_blue)]
                  + [f"red_{j}" for j in range(self.n_red)])
@@ -195,22 +123,17 @@ class PolicyBridge(Node):
         self.create_timer(DT, self._tick)
         self.get_logger().info(
             f"policy_bridge up: {self.n_blue} blues on the trained policy, "
-            f"{self.n_red} reds fleeing; episode <= {env.max_steps} sim-s")
+            f"{self.n_red} reds fleeing; "
+            f"episode <= {brain.env.max_steps} sim-s")
 
     # ------------------------------------------------------------------ #
 
     def _on_odom(self, name: str, msg: Odometry) -> None:
-        """Remember this drone's newest position and velocity.
-
-        Note on frames: odometry velocity is expressed in the drone's
-        OWN body frame.  Our drones never rotate (we command no yaw),
-        so body frame == world frame and no conversion is needed."""
+        """Remember this drone's newest position (x, y).  Odometry also
+        carries velocity, but the brain uses its own integrator state
+        for velocities (the env's post-step values), so we ignore it."""
         p = msg.pose.pose.position
-        v = msg.twist.twist.linear
-        self.odom[name] = (
-            np.array([p.x, p.y], dtype=np.float32),
-            np.array([v.x, v.y], dtype=np.float32),
-        )
+        self.pos[name] = np.array([p.x, p.y], dtype=np.float32)
 
     def _publish(self, name: str, vel_xy) -> None:
         cmd = Twist()
@@ -225,155 +148,51 @@ class PolicyBridge(Node):
     # ------------------------------------------------------------------ #
 
     def _tick(self) -> None:
-        if self.done:
+        if self.brain.done:
             return
-        env = self.env
-
-        # ---- 1. SYNC: Gazebo's reality -> shadow env state ------------
-        # POSITIONS come from Gazebo (it owns motion).  VELOCITIES come
-        # from OUR integrator state (gazebo/kinematics.py): those are
-        # the env's exact post-step velocities — the values the policy
-        # saw in its observations during training.  Odometry twist
-        # would differ at walls/obstacles (partial approach speeds,
-        # body-frame subtleties) and inject observation drift.
         try:
-            blue = [self.odom[f"blue_{i}"] for i in range(self.n_blue)]
-            red = [self.odom[f"red_{j}"] for j in range(self.n_red)]
+            blue_pos = np.stack([self.pos[f"blue_{i}"]
+                                 for i in range(self.n_blue)])
+            red_pos = np.stack([self.pos[f"red_{j}"]
+                                for j in range(self.n_red)])
         except KeyError:
             self.get_logger().warning(
                 "waiting for odometry... (is the sim running? press play)")
             return
-        env._blue_pos = np.stack([p for p, _ in blue]).astype(np.float32)
-        env._blue_vel = self.blue_vel.copy()
-        env._red_pos = np.stack([p for p, _ in red]).astype(np.float32)
-        red_v = self.red_vel.copy()
-        red_v[~env._red_active] = 0.0
-        env._red_vel = red_v
 
-        # One-time sanity check: the Gazebo world and the shadow env
-        # must describe the SAME scenario (same --seed as world_gen).
+        # One-time sanity check: Gazebo world and shadow env must be the
+        # SAME scenario (same --seed as world_gen).
         if not self.spawn_checked:
             self.spawn_checked = True
-            drift = float(np.abs(env._blue_pos
-                                 - self._spawn_blue).max())
+            drift = float(np.abs(blue_pos - self._spawn_blue).max())
             if drift > 1.0:
                 self.get_logger().error(
                     f"spawn mismatch up to {drift:.1f} m — was the world "
                     f"file generated with a different --seed?  Perception "
                     f"(obstacle layout!) will be wrong.")
 
-        # ---- First tick = the env's "reset observation" ----------------
-        # PursuitEnv.reset already ran ONE belief update before
-        # returning the first observation, and the eval loop acts on it
-        # without any referee/clock advance.  Mirror that exactly: on
-        # tick 1, skip straight to observation + action (a second
-        # belief update here would double-fuse evidence at t=0 — a
-        # small but real drift from the training timeline).
-        if not self._ticked_once:
-            self._ticked_once = True
-            self._think_and_act()
-            return
+        result = self.brain.tick(blue_pos, red_pos)
+        env = self.brain.env
 
-        # ---- 2. REFEREE: the env's own capture rule --------------------
-        # (Mirrors PursuitEnv.step step-5 exactly: nearest-blue distance
-        # <= capture_radius -> caught, freeze, wipe the belief blob.)
-        if env._red_active.any():
-            dists = np.linalg.norm(
-                env._red_pos[:, None, :] - env._blue_pos[None, :, :],
-                axis=-1)
-            newly = env._red_active & (dists.min(axis=1)
-                                       <= env.capture_radius)
-            if newly.any():
-                env._red_active &= ~newly
-                env._red_vel[newly] = 0.0
-                if env._belief_maps is not None:
-                    env._clear_enemy_belief_at(env._red_pos[newly])
-                for j in np.flatnonzero(newly):
-                    self.get_logger().info(
-                        f"*** CAPTURE: red_{j} at t={env._t}s "
-                        f"({int(env._red_active.sum())} remaining)")
-
-        # Report card, ally half: the env's exact rule (pairwise
-        # distance <= blue_collision_radius, post-move positions);
-        # rising edges = events, like the training eval.  (The
-        # obstacle half uses the exact attempted-entry mask from
-        # integrate_cmd, counted in _think_and_act.)
-        bb = np.linalg.norm(
-            env._blue_pos[:, None, :] - env._blue_pos[None, :, :], axis=-1)
-        np.fill_diagonal(bb, np.inf)
-        ally_mask = (bb <= env.blue_collision_radius).any(axis=1)
-        self.ally_crash_events += int(np.count_nonzero(
-            ally_mask & ~self.prev_ally_mask))
-        self.prev_ally_mask = ally_mask
-
-        # ---- Episode clock / termination (env.step step-7) -------------
-        env._t += 1
-        all_caught = not env._red_active.any()
-        if all_caught or env._t >= env.max_steps:
-            self._stop_all()
-            self.done = True
-            n = self.n_red - int(env._red_active.sum())
+        for j in result.captures:
             self.get_logger().info(
-                f"=== EPISODE OVER: caught {n}/{self.n_red} in {env._t}s | "
-                f"obstacle-contact events {self.obs_crash_events} | "
-                f"ally-proximity events {self.ally_crash_events} ===")
+                f"*** CAPTURE: red_{j} at t={env._t}s "
+                f"({int(env._red_active.sum())} remaining)")
+
+        if result.done:
+            self._stop_all()
+            self.get_logger().info(
+                f"=== EPISODE OVER: caught {self.brain.n_caught}/{self.n_red} "
+                f"in {env._t}s | obstacle-contact events "
+                f"{self.brain.obs_crash_events} | ally-proximity events "
+                f"{self.brain.ally_crash_events} ===")
             rclpy.shutdown()
             return
 
-        # ---- 3. PERCEIVE: the env's own sensor + belief pipeline -------
-        env._update_belief_maps()
-        self._think_and_act()
-
-    def _think_and_act(self) -> None:
-        """Observation -> policy -> env-faithful commands.  Split out
-        so the first tick can run it directly on the reset-time belief
-        (matching the training eval's first observation exactly)."""
-        env = self.env
-        obs = env.structured_belief_observation()
-
-        # ---- 4-5. THINK with MEMORY: same call as training's eval ------
-        obs_t = {k: torch.from_numpy(v).float().unsqueeze(0)
-                 for k, v in obs.items()}
-        partial_obs, _ = split_stage4_obs(obs_t)
-        with torch.no_grad():
-            mean, self.hidden = self.policy.act_deterministic(
-                partial_obs, self.hidden)
-        accel = mean.squeeze(0).numpy().astype(np.float32)
-        accel = np.clip(accel, -1.0, 1.0)          # env clips actions too
-
-        # ---- 6. ACT: env's exact motion contract (walls + obstacle
-        # rollback), two velocities per tick — publish exec_vel so
-        # Gazebo lands on the env's next position, remember state_vel
-        # (the env's post-step velocity) for the next observation.
-        exec_b, self.blue_vel, hit_b = integrate_cmd(
-            env._blue_pos, self.blue_vel, accel, V_MAX_BLUE, DT,
-            env.arena_size, env._obstacle_pos, env._obstacle_r)
         for i in range(self.n_blue):
-            self._publish(f"blue_{i}", exec_b[i])
-
-        # Report card, obstacle half: hit_b IS the env's
-        # attempted-to-enter-a-pillar crash mask (rising edges).
-        self.obs_crash_events += int(np.count_nonzero(
-            hit_b & ~self.prev_obs_mask))
-        self.prev_obs_mask = hit_b
-
-        # Reds: the SHADOW ENV's own red policy, called with the EXACT
-        # argument list PursuitEnv.step uses (incl. arena_size, which
-        # enables the scripted evader's wall repulsion).  Going through
-        # env.red_policy rather than importing run_from_nearest_uav by
-        # name means the Gazebo adversary tracks any future red-policy
-        # change automatically — no silent train/deploy drift.
-        red_a = env.red_policy(
-            env._blue_pos, env._red_pos, env._red_active,
-            env._obstacle_pos, env._obstacle_r, env.arena_size)
-        red_a = np.clip(red_a.astype(np.float32), -1.0, 1.0)
-        exec_r, self.red_vel, _ = integrate_cmd(
-            env._red_pos, self.red_vel, red_a, V_MAX_RED, DT,
-            env.arena_size, env._obstacle_pos, env._obstacle_r)
-        self.red_vel[~env._red_active] = 0.0       # caught reds freeze
-        exec_r[~env._red_active] = 0.0
+            self._publish(f"blue_{i}", result.blue_exec[i])
         for j in range(self.n_red):
-            self._publish(f"red_{j}", exec_r[j])
+            self._publish(f"red_{j}", result.red_exec[j])
 
         if env._t and env._t % 20 == 0:
             nearest = float(np.min(np.linalg.norm(
@@ -385,46 +204,25 @@ class PolicyBridge(Node):
                 f"{int(env._red_active.sum())}/{self.n_red}  "
                 f"nearest blue-red dist={nearest:5.1f} m")
 
-    # Stashed at construction for the spawn sanity check.
-    _spawn_blue: np.ndarray = None
 
-
-def main() -> None:
-    p = argparse.ArgumentParser(
-        description="Milestone 3: trained policy drives the blues.")
-    p.add_argument("--ckpt",
-                   default=str(REPO / "runs/stage4/pool_fixed_v1/best.pt"),
-                   help="Stage 4 checkpoint to fly.")
-    p.add_argument("--seed", type=int, default=0,
-                   help="MUST match world_gen's --seed (same scenario).")
-    args = p.parse_args()
-
-    print(f"Loading checkpoint {args.ckpt} ...")
-    ck = torch.load(args.ckpt, map_location="cpu", weights_only=False)
+def load_policy(ckpt_path: str):
+    """Load a Stage 4 checkpoint's ACTOR for deployment.  Uses the
+    shape-matched soft loader: post-pool checkpoints (pool_fixed_*) copy
+    77/77 tensors; older ones (crash_penalty_v3) copy 76/77 (the stale
+    count-agnostic critic tensor stays at init).  Deployment runs the
+    actor only, so we assert every actor tensor copied and ignore the
+    critic.  Returns (policy, checkpoint_dict)."""
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     a = ck["args"]
-
-    # Shadow env: the training env's exact perception configuration.
-    env = PursuitEnv(**env_kwargs_from_checkpoint(a),
-                     red_policy=run_from_nearest_uav, seed=args.seed)
-    env.reset(seed=args.seed)
-
-    # The frozen brain, rebuilt with the trained architecture.  Loaded
-    # via the repo's shape-matched soft loader: post-pool checkpoints
-    # (pool_fixed_*) copy 77/77 tensors; older ones (crash_penalty_v3)
-    # predate the count-agnostic critic pool and copy 76/77 (only the
-    # stale critic_trunk.0.weight stays at init).  Deployment runs the
-    # ACTOR only (act_deterministic), so either way what matters — and
-    # what we assert — is that the actor copied completely.
     policy = GNNStage4Policy(
         n_blue=a["n_blue"], n_red=a["n_red"], n_obs=a["n_obstacles"],
         d_hidden=a["d_hidden"], n_msg_rounds=a["n_msg_rounds"],
         use_hidden_in_gnn=a.get("share_hidden_via_gnn", True),
     )
-    n_copied = policy.load_full_stage4(args.ckpt)
+    n_copied = policy.load_full_stage4(ckpt_path)
     n_total = len(policy.state_dict())
     print(f"Loaded {n_copied}/{n_total} tensors "
-          f"(the missing ones are stale-shape CRITIC tensors; "
-          f"the actor is complete).")
+          f"(any missing are stale-shape CRITIC tensors; actor complete).")
     actor_keys = [k for k in policy.state_dict() if k.startswith("actor")]
     src = ck["policy_state"]
     n_actor_ok = sum(1 for k in actor_keys
@@ -432,12 +230,32 @@ def main() -> None:
                      == policy.state_dict()[k].shape)
     assert n_actor_ok == len(actor_keys), "actor tensors failed to load!"
     policy.eval()
+    return policy, ck
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        description="Milestone 3: trained policy drives the blues.")
+    p.add_argument("--ckpt",
+                   default=str(REPO / "runs/stage4/pool_fixed_v4/best.pt"),
+                   help="Stage 4 checkpoint to fly.")
+    p.add_argument("--seed", type=int, default=0,
+                   help="MUST match world_gen's --seed (same scenario).")
+    args = p.parse_args()
+
+    print(f"Loading checkpoint {args.ckpt} ...")
+    policy, ck = load_policy(args.ckpt)
     print(f"Policy loaded: rollout {ck.get('rollout')}, "
           f"best_metric {ck.get('best_metric')}")
 
+    # Shadow env: the training env's exact perception configuration.
+    env = PursuitEnv(**env_kwargs_from_checkpoint(ck["args"]),
+                     red_policy=run_from_nearest_uav, seed=args.seed)
+    env.reset(seed=args.seed)
+    brain = ClosedLoopBrain(env, policy)
+
     rclpy.init()
-    node = PolicyBridge(env, policy)
-    node._spawn_blue = env._blue_pos.copy()
+    node = PolicyBridge(brain)
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt,

@@ -200,10 +200,31 @@ and 0 ally events — now against the harder, non-pinning reds. (Single
 stochastic episode, not a controlled comparison — milestone 4 does the
 20-episode eval.)
 
+## Milestone 4a — exact code parity (DONE, 2026-08)
+
+The decision logic was extracted from the ROS node into a ROS-free
+`ClosedLoopBrain` (`gazebo/brain.py`); `policy_bridge.py` is now a thin
+wrapper (odometry → `brain.tick()` → publish). Single source of truth —
+no second implementation to drift.
+
+`tests/test_bridge_parity.py` then proves the brain is **bit-identical**
+to the training deterministic rollout: it runs the training eval loop
+(`PursuitEnv` stepping itself) and the brain (fed the reference's own
+positions, no Gazebo) on the same seed + policy, and asserts equal
+actions every step, equal episode length, and equal reds caught — for
+several seeds. This works because the brain's tick interleaves its RNG
+draws (sensor noise, belief sampling) into the *same* global sequence
+as `env.step` (the `_ticked_once` first-tick case keeps reset's
+pre-observation belief aligned), and motion is separately fuzz-proven
+identical (`test_gazebo_kinematics.py`). Result: **any** behaviour
+difference in Gazebo is now provably attributable to the one seam
+Gazebo owns — continuous physics + control latency — not to a bridge
+bug.
+
 ## Roadmap (remaining Phase 1 milestones)
 
-4. **Parity + eval**: lockstep same-seed comparison vs the pure-Python
-   rollout (localises any bug to the one seam Gazebo owns:
-   kinematics); then a 20-episode deterministic eval at
-   faster-than-realtime, attributing any residual gap (control
-   latency is the prime suspect).
+4b. **Statistical eval**: an N-episode (≈20) deterministic run at
+    faster-than-realtime, comparing the Gazebo catch rate / crash
+    counts to the checkpoint's Python `det_*` baseline and attributing
+    the residual gap (control latency is the prime suspect; sim-time +
+    step-mode can pause during inference to measure and remove it).

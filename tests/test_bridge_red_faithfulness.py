@@ -69,5 +69,7 @@ def _red_policy_call_passes_arena_size(path: Path) -> bool:
     return False
 
 
-def test_policy_bridge_red_call_passes_arena_size():
-    assert _red_policy_call_passes_arena_size(GAZEBO / "policy_bridge.py")
+def test_brain_red_call_passes_arena_size():
+    # The red-command call lives in the ROS-free decision module
+    # (gazebo/brain.py); the ROS node is a thin wrapper around it.
+    assert _red_policy_call_passes_arena_size(GAZEBO / "brain.py")
