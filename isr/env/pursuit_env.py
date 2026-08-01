@@ -217,6 +217,16 @@ class PursuitEnv(ParallelEnv):
         crash_obstacle_penalty:   float = 0.0,   # magnitude; applied as -x
         crash_blue_penalty:       float = 0.0,   # magnitude; applied as -x
         blue_collision_radius:    float = 2.0,   # m; < capture_radius (3)
+        # ----- Clearance / barrier shaping (backlog §16 #1) ---------------
+        # Dense per-agent shaping that penalises being within
+        # ``clearance_margin`` metres of an obstacle SURFACE, growing as the
+        # blue approaches and continuing to grow INSIDE the disk — so its
+        # gradient points continuously toward open space (a proactive "keep
+        # distance" AND a "get out, this way" signal the flat crash penalty
+        # can't give).  Both default OFF (weight 0.0) so behaviour is
+        # byte-preserved.  See docs/stage4_backlog.md §16.
+        clearance_weight:         float = 0.0,   # per-step magnitude; 0 = off
+        clearance_margin:         float = 8.0,   # m band beyond the surface
         # ----- Variable entity counts (generalisation) --------------------
         # ``n_red`` / ``n_obstacles`` are the PADDED CAPACITY (fixed tensor
         # shapes).  When a *_min is set, each reset samples the actual
@@ -361,9 +371,13 @@ class PursuitEnv(ParallelEnv):
         self.crash_obstacle_penalty   = float(crash_obstacle_penalty)
         self.crash_blue_penalty       = float(crash_blue_penalty)
         self.blue_collision_radius    = float(blue_collision_radius)
+        self.clearance_weight         = float(clearance_weight)
+        self.clearance_margin         = float(clearance_margin)
         assert self.crash_obstacle_penalty >= 0.0
         assert self.crash_blue_penalty >= 0.0
         assert self.blue_collision_radius >= 0.0
+        assert self.clearance_weight >= 0.0
+        assert self.clearance_margin > 0.0
         # Diagnostic: crash counts for the LAST step (rendering/logging).
         self._last_obstacle_crashes: int = 0
         self._last_blue_crashes:     int = 0
@@ -655,6 +669,27 @@ class PursuitEnv(ParallelEnv):
         if self.crash_blue_penalty > 0.0:
             r_crash -= self.crash_blue_penalty * blue_ally_crash
 
+        # 6d. Per-agent CLEARANCE / barrier shaping: r_clear_i (backlog §16).
+        #     A dense, smooth penalty for being within clearance_margin of an
+        #     obstacle SURFACE.  "Depth into the band" t is 0 at the margin
+        #     edge, 1 at the surface, and > 1 INSIDE the disk, so the penalty
+        #     keeps growing inward and its position-gradient points OUTWARD
+        #     everywhere in range — the proactive "keep clear" and the
+        #     "get out, this way" signal.  Summed over obstacles (a blue in a
+        #     tight gap feels both).  Off (byte-identical) when weight = 0.
+        r_clear = np.zeros(self.n_blue, dtype=np.float32)
+        if (self.clearance_weight > 0.0 and self.n_obstacles > 0
+                and self._obstacle_pos is not None
+                and len(self._obstacle_pos) > 0):
+            # (N_blue, N_obs) signed distance to each obstacle surface.
+            cd = np.linalg.norm(
+                self._blue_pos[:, None, :] - self._obstacle_pos[None, :, :],
+                axis=-1,
+            ) - self._obstacle_r[None, :]
+            t = (self.clearance_margin - cd) / self.clearance_margin  # depth
+            t = np.clip(t, 0.0, None)                                 # 0 outside band
+            r_clear = -self.clearance_weight * t.sum(axis=1).astype(np.float32)
+
         # 7. Termination check.
         self._t += 1
         all_caught = bool(not self._red_active.any())
@@ -673,11 +708,12 @@ class PursuitEnv(ParallelEnv):
         if self.use_belief_maps:
             self._update_belief_maps()
 
-        # 8. Pack the per-agent dicts.  r_i = r_team (shared) + r_crash_i
-        #    (individual).  With both penalties off, r_crash_i = 0 and
-        #    every agent gets the identical shared reward as before.
+        # 8. Pack the per-agent dicts.  r_i = r_team (shared) + r_crash_i +
+        #    r_clear_i (individual).  With crash penalties and clearance
+        #    weight off, both are 0 and every agent gets the identical shared
+        #    reward as before.
         rewards     = {
-            a: float(r_team + r_crash[i])
+            a: float(r_team + r_crash[i] + r_clear[i])
             for i, a in enumerate(self.possible_agents)
         }
         terminateds = {a: terminated for a in self.possible_agents}
@@ -689,6 +725,7 @@ class PursuitEnv(ParallelEnv):
                 "t":                  self._t,
                 "obstacle_crashes":   self._last_obstacle_crashes,
                 "blue_crashes":       self._last_blue_crashes,
+                "clearance_penalty":  float(-r_clear.sum()),  # >=0 magnitude
             }
             for a in self.possible_agents
         }

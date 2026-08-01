@@ -612,7 +612,16 @@ a **constraint-shaped** treatment, not a bigger negative number.
 
 **Three pieces (roughly in priority order):**
 
-1. **Dense clearance / barrier shaping (the workhorse).**  A smooth
+1. **Dense clearance / barrier shaping (the workhorse).**  ✅ **LANDED.**
+   `clearance_weight` (0 = off, default) / `clearance_margin` (8 m) on
+   `PursuitEnv`; CLI `--clearance-weight` / `--clearance-margin`.  Per-agent
+   reward `r_clear_i = −w · Σ_o clip((margin − surface_dist)/margin, 0, ∞)`
+   summed over obstacles: 0 beyond the band, ramps to `w` at the surface,
+   and keeps growing INSIDE the disk, so the gradient points OUT everywhere
+   in range.  Reported as `info["clearance_penalty"]`.  See `_step` §6d and
+   `tests/test_clearance_shaping.py` (7 tests: off-by-default, zero beyond
+   margin, monotone approach, grows-inside, outward finite-diff gradient,
+   multi-obstacle sum).  *Design spec kept below.*  A smooth
    per-step reward term that is **deepest inside an obstacle and decays
    outward** over a margin band.  Unlike the current *flat* occupancy
    penalty (same value anywhere inside → zero positional gradient → tells

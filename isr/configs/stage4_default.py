@@ -106,6 +106,10 @@ STAGE4_DEFAULTS = {
     "crash_obstacle_penalty":  0.0,   # per-step penalty for hitting an obstacle
     "crash_blue_penalty":      0.0,   # per-step penalty for a blue-blue collision
     "blue_collision_radius":   2.0,   # m; < 3 m capture radius so it's a true crash
+    # Dense clearance / barrier shaping (backlog §16 #1): keeps blues off
+    # obstacle surfaces with a smooth outward gradient.  0 = off.
+    "clearance_weight":        0.0,   # per-step shaping magnitude
+    "clearance_margin":        8.0,   # m band beyond an obstacle surface
 
     # ----- Ally comms -----------------------------------------------------
     # bb_edge_visible IS present in the Stage 4 obs dict and is gated by

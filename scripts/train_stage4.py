@@ -146,6 +146,17 @@ def _parse_args() -> argparse.Namespace:
                    default=d["blue_collision_radius"],
                    help="Distance (m) below which two blues count as "
                         "collided.")
+    p.add_argument("--clearance-weight", type=float,
+                   default=d.get("clearance_weight", 0.0),
+                   help="Dense per-step clearance/barrier shaping magnitude "
+                        "(backlog §16): penalises being within "
+                        "--clearance-margin of an obstacle surface, growing "
+                        "inward so its gradient points toward open space. "
+                        "0 = off.")
+    p.add_argument("--clearance-margin", type=float,
+                   default=d.get("clearance_margin", 8.0),
+                   help="Metres beyond an obstacle surface where clearance "
+                        "shaping acts.")
     # Parallelism
     p.add_argument("--n-workers", type=int, default=0,
                    help="Env-stepping worker processes (0 = in-process, "
@@ -366,6 +377,8 @@ def main() -> None:
         crash_obstacle_penalty  = args.crash_obstacle_penalty,
         crash_blue_penalty      = args.crash_blue_penalty,
         blue_collision_radius   = args.blue_collision_radius,
+        clearance_weight        = args.clearance_weight,
+        clearance_margin        = args.clearance_margin,
     )
 
     # Red policy mix parsing.
