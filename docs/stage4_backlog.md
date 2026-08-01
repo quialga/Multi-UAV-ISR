@@ -563,15 +563,94 @@ not the full update rule.
 - Path (a) merges with §10 and is the right long-term answer if
   belief-map quality becomes the bottleneck.
 
+*Graph-embedding-conditioned variant (raised 2026-08).*  Rather than a
+kernel conditioned only on local velocity, make the predict-step kernel a
+function of a **global graph embedding** (a hyper-network / FiLM-style
+conditioning: the pooled GNN feature parameterises the belief-update
+kernel).  Appealing because the global embedding already fuses every
+UAV's evidence, so the kernel could learn *scene-specific* motion (e.g.
+"this obstacle is mid-sweep, shift its mass along +x").  Same NumPy↔torch
+blocker as above, plus the extra machinery of generating kernel weights
+from an embedding.
+
+**Honest relevance to the current crash problem (important).**  §15 is a
+*perception / anticipation* improvement — it sharpens *where* a moving
+obstacle will be.  The `moving_v1` failure (see `stage4_results.md` §5)
+was **not** perception; it was a **reward-structure / optimisation**
+collapse (per-step crash penalty exploding under sweeps and dominating
+the return).  Better prediction does not fix a diverging reward, so §15
+is **not** the first-order lever here — §16 (clearance shaping / crash as
+a constraint) is.  Two further caveats specific to *this* setup: (i) the
+obstacle **velocity is already a graph feature**, and reciprocating
+motion is piecewise-constant-velocity, so a learned kernel mostly adds
+*wall-bounce* anticipation — a narrow gain until the motion model gets
+richer/stochastic; (ii) §15a (the cheap aux head) should run *first* to
+*measure* whether the encoder is even motion-limited before paying for
+15b's numpy↔torch surgery.
+
 **Recommendation:** start with 15a (aux head).  The GRU hidden state
 already tracks temporal patterns implicitly; the aux head makes that
 explicit and measures how much the encoder actually learns about
 motion.  If the aux head's prediction error stays high (the encoder
 doesn't learn motion), that motivates 15b / §10 to give it a better
-input signal.
+input signal.  But sequence all of §15 **after** §16 — fix the reward
+structure before sharpening perception.
 
 **Blocking**: 15a — none (same pattern as `aux_hidden_coef`).
 15b — the NumPy↔PyTorch boundary (same blocker as §5 and §10).
+
+## 16. Crash-avoidance as a CONSTRAINT (clearance shaping / safe-RL)
+
+**Motivation (from the `moving_v1` collapse — `stage4_results.md` §5).**
+Operating stance: *a crash = losing a drone*, so near-zero crashes
+matters more than a marginal catch.  A scalar crash **penalty** in the
+reward is the wrong tool for that: it is a *soft trade-off* (the policy
+accepts crashes whenever catches outweigh them), and cranking it just
+reproduces the moving-obstacle divergence (penalty dominates the return,
+training degrades on both capture and crashes).  Near-zero crashes needs
+a **constraint-shaped** treatment, not a bigger negative number.
+
+**Three pieces (roughly in priority order):**
+
+1. **Dense clearance / barrier shaping (the workhorse).**  A smooth
+   per-step reward term that is **deepest inside an obstacle and decays
+   outward** over a margin band.  Unlike the current *flat* occupancy
+   penalty (same value anywhere inside → zero positional gradient → tells
+   the drone it is being punished but **not which way to escape**), the
+   barrier's gradient points continuously toward clear space: a proactive
+   "keep your distance" *and* a real "get out, THIS direction" signal.
+   This is the same idea as the red heuristic's obstacle repulsion, moved
+   into the **blue reward**.  It also cures the divergence: the policy
+   learns to keep a buffer, so occupancy (and thus the crash term) never
+   explodes.  Flag-gated, small magnitude, off by default.
+   - *Design note (why not pure event-based):* penalising only crash
+     *entry* (rising edge) removes the incentive to *leave* a crash under
+     the soft-stop physics — the barrier's inside-gradient is what
+     supplies that incentive instead.
+2. **Discrete crash-event = drone-loss semantics.**  A crash is a
+   one-time catastrophic event (you lose the drone), not per-step
+   occupancy.  Ultimately model it literally as **destroy-on-crash**
+   (remove the blue mid-episode — now feasible via the variable-entity
+   machinery: a crashed blue goes inactive like a caught red, and the
+   masked-mean critic / count-agnostic actor already handle a shrinking
+   team).  Introduce *after* clearance shaping already makes crashes rare,
+   so destruction events don't destabilise training (the reason the old
+   `--terminate-on-crash` sketch was deferred).
+3. **Constrained-RL / Lagrangian (most principled, most work).**  Treat
+   `E[crash_events] ≤ ε` as a hard constraint with a learned Lagrange
+   multiplier (PPO-Lagrangian / CPO style) instead of a fixed penalty
+   weight.  The multiplier self-tunes the trade-off, avoiding the manual
+   penalty-magnitude search that produced v1/v3/moving_v1.
+
+**Also:** keep `lr` at the default (`1e-4`) and entropy **low** (a safety
+task wants precise, not erratic, control near obstacles — do NOT raise
+entropy; consider annealing it down), and **curriculum** the motion
+(`fraction 0.1 / speed 0.5` first).
+
+**Blocking:** #1 is ~a dozen lines in `_step` + a flag + a test (no
+numpy↔torch issue — it reads the same obstacle geometry the crash check
+already uses).  #2 reuses the caught-red inactivation path.  #3 is a
+larger PPO change.  **Start with #1.**
 
 ---
 

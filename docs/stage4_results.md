@@ -434,7 +434,7 @@ obstacles need *anticipatory* caution, learned fresh). Carry v3's
 **5.0/5.0** penalties into the curriculum runs, and fix the checkpoint
 selector first.
 
-### 4. Moving obstacles — reciprocating patrol (implemented + tested; training pending) · `feature/moving-obstacles`
+### 4. Moving obstacles — reciprocating patrol (implemented; first run diverged — see §5) · `feature/moving-obstacles`
 
 Backlog §4 with the simplest kinematics: a fraction of obstacles patrol
 back-and-forth along one axis, bouncing off the arena walls
@@ -460,3 +460,71 @@ belief truth** the policy must track and anticipate.
 avoidance policy (`--warm-start-full`), ramping `obstacle_speed` up from
 a low value (curriculum knob), optionally combined with `--n-red-min` /
 `--n-obstacles-min` for variable counts in the same run.
+
+### 5. Curriculum training results — wall-repelling reds + the crash problem
+
+Two runs on top of the wall-repulsion fix (§backlog "Red wall-repulsion")
+and the crash-aware selector: a fixed-obstacle baseline, then the first
+moving-obstacle attempt.
+
+**`pool_fixed_v4` — the honest fixed baseline (wall-repelling reds).**
+From scratch, `n_blue=5 n_red=3 n_obstacles=4` static, radii 5–15 m,
+`max_steps=200`, crash `2.0/2.0`, default recipe (`lr 1e-4, ent 0.008`,
+1000 rollouts, 512 envs), `--best-ckpt-metric det_composite`.
+
+| run | mean | stat | rand | **run** | crash events (o / a) |
+|---|---|---|---|---|---|
+| `pool_fixed_v1` (old pinning reds) | 2.97 | 3.00 | 3.00 | 2.90 | ~1 / ~1–2 |
+| **`pool_fixed_v4` (wall-repelling reds)** | **2.78** | 2.95 | 2.95 | **2.45** | 1.25 / 1.17 |
+
+The entire drop is on the **fleeing `run` red (2.90 → 2.45)**; `stat`/`rand`
+are unchanged (those reds don't flee). That ~0.45 is the **wall-camping
+gift being removed** — 2.78/3 is the real capture number against a
+non-degenerate evader, not a regression. Two plumbing confirmations: the
+selector fix works (`best.pt` at **rollout 950**, no more rollout-1
+mis-save), and crash *events* stay ~1.2. This is a solid base; more
+epochs might lift `run` slightly but with diminishing returns.
+
+**`moving_v1` — first moving-obstacle attempt (diverged; stopped ~225).**
+Warm-started from `pool_fixed_v4`; `moving_obstacle_fraction=0.25`,
+`obstacle_speed=1.0`, `obstacle_belief_decay=0.9`, `max_steps=320`, crash
+`3.0/3.0`, `lr 4e-5, ent 0.002`.
+
+Symptom: return slid **`+5.76 → +2.14 → … → −1.82`** (went negative),
+capture bled `2.93 → 2.70`, and ally-crash events *rose* (`~1.4 → ~2.1`)
+while obstacle occupancy only halved (`crash(o) 10.2 → 6`). KL (~0.002)
+and clip (~0.01) stayed tiny — **not** a numerical/PPO blow-up, a steady
+*degradation on the objective*.
+
+Diagnosis — a **reward-conflict collapse**, not perception:
+
+- **The per-step crash penalty is mis-specified for *moving* obstacles.**
+  A blue *swept over* by an obstacle eats the penalty every step it's
+  pinned (`crash(o)=10` occupancy at rollout 1), even though it couldn't
+  avoid the sweep. At `3.0` over 320 steps that term comes to **dominate
+  the return** — larger than the whole catch reward — so the optimiser is
+  driven by an avoidance signal the warm-started (static-obstacle) policy
+  can't yet satisfy. It degrades capture trying to cut crashes, can't cut
+  them enough, and slides on both.
+- **Too-gentle recipe.** `lr 4e-5 / ent 0.002` (fine-tune values) can't
+  adapt to genuinely new dynamics fast enough to escape the high-crash
+  basin. (Higher *entropy* is **not** the fix — for a safety task more
+  exploration means more erratic actions near obstacles; keep it low,
+  consider annealing down.)
+- **`max_steps` 200 → 320 warm-start mismatch** miscalibrates the
+  warm-started critic (`val ~12–15` early) to the longer horizon.
+
+**Direction (crash-avoidance as a hard goal).** The operating stance
+shifted: *a crash = losing a drone*, so near-zero crashes matters more
+than a marginal catch. Key realisation — **a scalar penalty term can't
+reliably reach ~0 crashes** (it's a soft trade-off; the policy accepts
+crashes when catches outweigh them, and cranking it just reproduces this
+collapse). The intended fix is a **dense clearance/barrier shaping**
+reward (deepest inside an obstacle, decaying outward, so its *gradient*
+points continuously toward clear space — a proactive "keep distance" plus
+a real "get out, this way" signal that the flat step-penalty never gave),
+paired with a **discrete crash-event = drone-loss** semantics (ultimately
+destroy-on-crash, now feasible via the variable-entity machinery), under
+a **motion curriculum** (`fraction 0.1 / speed 0.5` first) with the
+**default `lr 1e-4`, low entropy**. See `stage4_backlog.md` §5 / §10 /
+§15 for the perception-side options and the safe-RL framing.
