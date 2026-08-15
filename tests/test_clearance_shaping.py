@@ -149,3 +149,98 @@ def test_clearance_reduces_reward_but_not_when_off():
         _, rew, _, _, _ = env.step({env.agents[0]: np.zeros(2, np.float32)})
         rewards[w] = rew[env.agents[0]]
     assert rewards[0.5] < rewards[0.0]
+
+
+# --------------------------------------------------------------------------
+#  Blue<->blue (ally) clearance barrier
+# --------------------------------------------------------------------------
+
+def _ally_env(ally_weight=0.6, ally_margin=3.0, coll_r=2.0, seed=0):
+    env = PursuitEnv(
+        n_blue=2, n_red=1, n_obstacles=0, arena_size=130.0, max_steps=50,
+        blue_collision_radius=coll_r,
+        clearance_ally_weight=ally_weight, clearance_ally_margin=ally_margin,
+        red_policy=stationary_red, seed=seed,
+    )
+    env.reset(seed=seed)
+    env._red_pos[0] = np.array([5.0, 5.0], dtype=np.float32)  # far from the pair
+    return env
+
+
+def _ally_pen(env, p0, p1):
+    """Step with the two blues teleported apart by a chosen gap; return the
+    (per-agent) clearance-penalty magnitude and the two rewards."""
+    env._blue_pos[0] = np.array(p0, dtype=np.float32)
+    env._blue_pos[1] = np.array(p1, dtype=np.float32)
+    env._blue_vel[:] = 0.0
+    _, rew, _, _, info = env.step(
+        {a: np.zeros(2, dtype=np.float32) for a in env.agents})
+    ag = env.possible_agents
+    return info[ag[0]]["clearance_penalty"], rew[ag[0]], rew[ag[1]]
+
+
+def test_ally_off_by_default_is_byte_identical():
+    """ally_weight=0 => no blue<->blue term even when the two blues overlap."""
+    env = _ally_env(ally_weight=0.0)
+    pen, _, _ = _ally_pen(env, [60.0, 65.0], [60.0, 65.0])   # coincident
+    assert pen == 0.0
+
+
+def test_ally_zero_beyond_margin():
+    """Blues farther apart than collision_radius + ally_margin feel nothing."""
+    env = _ally_env(ally_weight=0.6, ally_margin=3.0, coll_r=2.0)
+    # separation 2 + 3 + 4 = 9 m > band
+    pen, _, _ = _ally_pen(env, [60.0, 65.0], [69.0, 65.0])
+    assert pen == 0.0
+
+
+def test_ally_penalty_grows_as_blues_close_in():
+    """Monotone: closer blues => larger penalty; 0 exactly at the band edge."""
+    env = _ally_env(ally_weight=0.6, ally_margin=3.0, coll_r=2.0)
+    edge  = _ally_pen(env, [60.0, 65.0], [65.0, 65.0])[0]   # sep 5 = 2+3 (edge)
+    mid   = _ally_pen(env, [60.0, 65.0], [63.5, 65.0])[0]   # sep 3.5
+    touch = _ally_pen(env, [60.0, 65.0], [62.0, 65.0])[0]   # sep 2 (collision surf)
+    assert np.isclose(edge, 0.0, atol=1e-6)
+    assert 0.0 < mid < touch
+
+
+def test_ally_penalty_is_symmetric():
+    """Both blues in a close pair take the same hit (bb distance symmetric,
+    self-pair excluded), so with only the ally term their rewards match."""
+    env = _ally_env(ally_weight=0.6, ally_margin=3.0, coll_r=2.0)
+    pen, r0, r1 = _ally_pen(env, [60.0, 65.0], [63.0, 65.0])
+    assert pen > 0.0
+    assert np.isclose(r0, r1, atol=1e-6)
+
+
+def test_ally_gradient_points_apart():
+    """Separating the pair by 1 m reduces the penalty — the barrier pushes
+    the two blues apart."""
+    env = _ally_env(ally_weight=0.6, ally_margin=3.0, coll_r=2.0)
+    near = _ally_pen(env, [60.0, 65.0], [63.0, 65.0])[0]
+    far  = _ally_pen(env, [60.0, 65.0], [64.0, 65.0])[0]
+    assert far < near
+
+
+def test_obstacle_and_ally_clearance_compose():
+    """A blue near BOTH an obstacle and an ally accrues both penalties in a
+    single finite clearance term."""
+    env = PursuitEnv(
+        n_blue=2, n_red=1, n_obstacles=1, arena_size=130.0, max_steps=50,
+        obstacle_radius_min=8.0, obstacle_radius_max=8.0,
+        blue_collision_radius=2.0,
+        clearance_weight=0.5, clearance_margin=8.0,
+        clearance_ally_weight=0.5, clearance_ally_margin=3.0,
+        red_policy=stationary_red, seed=2,
+    )
+    env.reset(seed=2)
+    o = env._obstacle_pos[0].copy()
+    r = env._obstacle_r[0]
+    env._red_pos[0] = np.array([5.0, 5.0], dtype=np.float32)
+    env._blue_pos[0] = o + np.array([r + 1.0, 0.0], dtype=np.float32)  # near obstacle
+    env._blue_pos[1] = env._blue_pos[0] + np.array([2.5, 0.0], dtype=np.float32)  # + near ally
+    env._blue_vel[:] = 0.0
+    _, _, _, _, info = env.step(
+        {a: np.zeros(2, dtype=np.float32) for a in env.agents})
+    pen = info[env.possible_agents[0]]["clearance_penalty"]
+    assert np.isfinite(pen) and pen > 0.0

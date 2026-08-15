@@ -227,6 +227,14 @@ class PursuitEnv(ParallelEnv):
         # byte-preserved.  See docs/stage4_backlog.md §16.
         clearance_weight:         float = 0.0,   # per-step magnitude; 0 = off
         clearance_margin:         float = 8.0,   # m band beyond the surface
+        # Blue<->blue barrier: same falloff, but the "surface" is the
+        # blue_collision_radius.  Needed alongside the obstacle term — with
+        # obstacle clearance alone, blues avoiding obstacles crowd into the
+        # same clear space and just MIGRATE crashes obstacle->ally (observed
+        # on clearance_fixed_v1).  A tighter margin than obstacles so it does
+        # not fight normal converge-on-a-red coordination.  0 = off.
+        clearance_ally_weight:    float = 0.0,   # per-step magnitude; 0 = off
+        clearance_ally_margin:    float = 3.0,   # m band beyond the collision radius
         # ----- Variable entity counts (generalisation) --------------------
         # ``n_red`` / ``n_obstacles`` are the PADDED CAPACITY (fixed tensor
         # shapes).  When a *_min is set, each reset samples the actual
@@ -373,11 +381,15 @@ class PursuitEnv(ParallelEnv):
         self.blue_collision_radius    = float(blue_collision_radius)
         self.clearance_weight         = float(clearance_weight)
         self.clearance_margin         = float(clearance_margin)
+        self.clearance_ally_weight    = float(clearance_ally_weight)
+        self.clearance_ally_margin    = float(clearance_ally_margin)
         assert self.crash_obstacle_penalty >= 0.0
         assert self.crash_blue_penalty >= 0.0
         assert self.blue_collision_radius >= 0.0
         assert self.clearance_weight >= 0.0
         assert self.clearance_margin > 0.0
+        assert self.clearance_ally_weight >= 0.0
+        assert self.clearance_ally_margin > 0.0
         # Diagnostic: crash counts for the LAST step (rendering/logging).
         self._last_obstacle_crashes: int = 0
         self._last_blue_crashes:     int = 0
@@ -688,7 +700,21 @@ class PursuitEnv(ParallelEnv):
             ) - self._obstacle_r[None, :]
             t = (self.clearance_margin - cd) / self.clearance_margin  # depth
             t = np.clip(t, 0.0, None)                                 # 0 outside band
-            r_clear = -self.clearance_weight * t.sum(axis=1).astype(np.float32)
+            r_clear -= self.clearance_weight * t.sum(axis=1).astype(np.float32)
+
+        # 6e. Blue<->blue CLEARANCE: the same barrier, "surface" = the
+        #     collision radius.  Without it, obstacle clearance alone just
+        #     bunches blues together and migrates crashes obstacle->ally.
+        #     Symmetric (both blues in a close pair feel it); self-pairs
+        #     excluded.  Off (byte-identical) when weight = 0.
+        if self.clearance_ally_weight > 0.0 and self.n_blue > 1:
+            bb = np.linalg.norm(
+                self._blue_pos[:, None, :] - self._blue_pos[None, :, :], axis=-1,
+            ) - self.blue_collision_radius            # signed dist to collision
+            ta = (self.clearance_ally_margin - bb) / self.clearance_ally_margin
+            ta = np.clip(ta, 0.0, None)
+            np.fill_diagonal(ta, 0.0)                 # exclude self-pair
+            r_clear -= self.clearance_ally_weight * ta.sum(axis=1).astype(np.float32)
 
         # 7. Termination check.
         self._t += 1

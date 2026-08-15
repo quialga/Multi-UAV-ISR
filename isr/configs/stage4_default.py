@@ -107,9 +107,16 @@ STAGE4_DEFAULTS = {
     "crash_blue_penalty":      0.0,   # per-step penalty for a blue-blue collision
     "blue_collision_radius":   2.0,   # m; < 3 m capture radius so it's a true crash
     # Dense clearance / barrier shaping (backlog §16 #1): keeps blues off
-    # obstacle surfaces with a smooth outward gradient.  0 = off.
-    "clearance_weight":        0.0,   # per-step shaping magnitude
+    # obstacle surfaces (and off each other) with a smooth outward gradient.
+    # ON by default for Stage 4 (crash-avoidance is a first-class goal); the
+    # ally term is also on so obstacle clearance can't just migrate crashes
+    # blue->blue.  Set the weights to 0 on the CLI to disable.  (The env
+    # constructor still defaults these to 0.0, so non-Stage-4 callers /
+    # tests are byte-preserved.)
+    "clearance_weight":        0.6,   # obstacle barrier magnitude
     "clearance_margin":        8.0,   # m band beyond an obstacle surface
+    "clearance_ally_weight":   0.6,   # blue<->blue barrier magnitude
+    "clearance_ally_margin":   3.0,   # m band beyond the collision radius
 
     # ----- Ally comms -----------------------------------------------------
     # bb_edge_visible IS present in the Stage 4 obs dict and is gated by

@@ -619,9 +619,17 @@ a **constraint-shaped** treatment, not a bigger negative number.
    summed over obstacles: 0 beyond the band, ramps to `w` at the surface,
    and keeps growing INSIDE the disk, so the gradient points OUT everywhere
    in range.  Reported as `info["clearance_penalty"]`.  See `_step` §6d and
-   `tests/test_clearance_shaping.py` (7 tests: off-by-default, zero beyond
-   margin, monotone approach, grows-inside, outward finite-diff gradient,
-   multi-obstacle sum).  *Design spec kept below.*  A smooth
+   `tests/test_clearance_shaping.py`.  **Ally extension:**
+   `clearance_ally_weight` / `clearance_ally_margin` (3 m) add the same
+   barrier between blues ("surface" = `blue_collision_radius`) — needed
+   because obstacle clearance ALONE bunches blues into the same clear
+   space and just migrates crashes obstacle→ally (measured on
+   `clearance_fixed_v1`: obstacle events ~1.25→~0.9 but ally events
+   1.17→~1.7).  **Stage-4 config defaults both weights to 0.6, on;** the
+   env constructor still defaults them to 0.0 so non-Stage-4 callers /
+   tests stay byte-preserved.  13 tests total (obstacle + ally: off,
+   zero-beyond-margin, monotone, grows-inside, symmetric, gradient-apart,
+   compose).  *Design spec kept below.*  A smooth
    per-step reward term that is **deepest inside an obstacle and decays
    outward** over a margin band.  Unlike the current *flat* occupancy
    penalty (same value anywhere inside → zero positional gradient → tells

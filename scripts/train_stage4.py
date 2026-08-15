@@ -157,6 +157,17 @@ def _parse_args() -> argparse.Namespace:
                    default=d.get("clearance_margin", 8.0),
                    help="Metres beyond an obstacle surface where clearance "
                         "shaping acts.")
+    p.add_argument("--clearance-ally-weight", type=float,
+                   default=d.get("clearance_ally_weight", 0.0),
+                   help="Blue<->blue barrier magnitude (same falloff, "
+                        "'surface' = blue_collision_radius). Needed with "
+                        "--clearance-weight or crashes just migrate "
+                        "obstacle->ally. 0 = off.")
+    p.add_argument("--clearance-ally-margin", type=float,
+                   default=d.get("clearance_ally_margin", 3.0),
+                   help="Metres beyond the collision radius where the ally "
+                        "barrier acts (tighter than obstacles so it doesn't "
+                        "fight converge-on-a-red coordination).")
     # Parallelism
     p.add_argument("--n-workers", type=int, default=0,
                    help="Env-stepping worker processes (0 = in-process, "
@@ -379,6 +390,8 @@ def main() -> None:
         blue_collision_radius   = args.blue_collision_radius,
         clearance_weight        = args.clearance_weight,
         clearance_margin        = args.clearance_margin,
+        clearance_ally_weight   = args.clearance_ally_weight,
+        clearance_ally_margin   = args.clearance_ally_margin,
     )
 
     # Red policy mix parsing.
