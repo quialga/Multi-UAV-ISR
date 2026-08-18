@@ -625,9 +625,12 @@ a **constraint-shaped** treatment, not a bigger negative number.
    because obstacle clearance ALONE bunches blues into the same clear
    space and just migrates crashes obstacle→ally (measured on
    `clearance_fixed_v1`: obstacle events ~1.25→~0.9 but ally events
-   1.17→~1.7).  **Stage-4 config defaults both weights to 0.6, on;** the
-   env constructor still defaults them to 0.0 so non-Stage-4 callers /
-   tests stay byte-preserved.  13 tests total (obstacle + ally: off,
+   1.17→~1.7).  **Both weights are OPT-IN (default 0.0)** — set them
+   together per run (`--clearance-weight` / `--clearance-ally-weight`);
+   an earlier 0.6/0.6 default was reverted because a partial override
+   (obstacle set, ally left default) silently ran a *stronger* ally
+   barrier than intended and degraded capture (`clearance_fixed_v2`).
+   13 tests total (obstacle + ally: off,
    zero-beyond-margin, monotone, grows-inside, symmetric, gradient-apart,
    compose).  *Design spec kept below.*  A smooth
    per-step reward term that is **deepest inside an obstacle and decays

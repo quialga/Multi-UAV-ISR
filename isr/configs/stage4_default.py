@@ -108,14 +108,15 @@ STAGE4_DEFAULTS = {
     "blue_collision_radius":   2.0,   # m; < 3 m capture radius so it's a true crash
     # Dense clearance / barrier shaping (backlog §16 #1): keeps blues off
     # obstacle surfaces (and off each other) with a smooth outward gradient.
-    # ON by default for Stage 4 (crash-avoidance is a first-class goal); the
-    # ally term is also on so obstacle clearance can't just migrate crashes
-    # blue->blue.  Set the weights to 0 on the CLI to disable.  (The env
-    # constructor still defaults these to 0.0, so non-Stage-4 callers /
-    # tests are byte-preserved.)
-    "clearance_weight":        0.6,   # obstacle barrier magnitude
+    # OPT-IN (both weights 0 = off) — like every other shaping knob here.
+    # Enable per run via --clearance-weight / --clearance-ally-weight, and
+    # set BOTH together: obstacle clearance alone migrates crashes
+    # blue->blue, and leaving the ally weight unset would silently inherit
+    # whatever default this file carried.  The margins below only bite when
+    # their weight is > 0.
+    "clearance_weight":        0.0,   # obstacle barrier magnitude (0 = off)
     "clearance_margin":        8.0,   # m band beyond an obstacle surface
-    "clearance_ally_weight":   0.6,   # blue<->blue barrier magnitude
+    "clearance_ally_weight":   0.0,   # blue<->blue barrier magnitude (0 = off)
     "clearance_ally_margin":   3.0,   # m band beyond the collision radius
 
     # ----- Ally comms -----------------------------------------------------
