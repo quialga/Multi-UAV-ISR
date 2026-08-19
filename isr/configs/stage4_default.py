@@ -115,7 +115,10 @@ STAGE4_DEFAULTS = {
     # whatever default this file carried.  The margins below only bite when
     # their weight is > 0.
     "clearance_weight":        0.0,   # obstacle barrier magnitude (0 = off)
-    "clearance_margin":        8.0,   # m band beyond an obstacle surface
+    "clearance_margin":        4.0,   # m band beyond an obstacle surface
+                                      # (blue stops in ~1.6 m at v_max, so 4 m
+                                      # is ample reaction room without a huge
+                                      # no-go zone around big obstacles)
     "clearance_ally_weight":   0.0,   # blue<->blue barrier magnitude (0 = off)
     "clearance_ally_margin":   3.0,   # m band beyond the collision radius
 

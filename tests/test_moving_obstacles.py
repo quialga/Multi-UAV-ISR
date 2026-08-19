@@ -99,7 +99,7 @@ def test_seen_moving_obstacle_track_carries_velocity():
     mov = 0
     # Park a blue on top of the moving obstacle so it's a live track.
     env._blue_pos[0] = env._obstacle_pos[mov].copy()
-    pos, vel, conf = env._build_obstacle_tracks()
+    pos, vel, conf, _r = env._build_obstacle_tracks()
     i = int(np.linalg.norm(pos - env._obstacle_pos[mov], axis=1).argmin())
     assert conf[i] == 1.0
     assert np.allclose(vel[i], env._obstacle_vel[mov])   # own-radar Doppler
@@ -110,7 +110,7 @@ def test_unseen_obstacle_track_has_zero_velocity():
     env.reset(seed=4)
     env._blue_pos[:] = np.array([1.0, 1.0])   # far from every obstacle
     # (obstacles are spawned with wall clearance, so none sit at the corner)
-    _pos, vel, _conf = env._build_obstacle_tracks()
+    _pos, vel, _conf, _r = env._build_obstacle_tracks()
     assert np.allclose(vel, 0.0)              # memory tracks carry no Doppler
 
 

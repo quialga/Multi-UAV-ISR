@@ -226,7 +226,7 @@ class PursuitEnv(ParallelEnv):
         # can't give).  Both default OFF (weight 0.0) so behaviour is
         # byte-preserved.  See docs/stage4_backlog.md §16.
         clearance_weight:         float = 0.0,   # per-step magnitude; 0 = off
-        clearance_margin:         float = 8.0,   # m band beyond the surface
+        clearance_margin:         float = 4.0,   # m band beyond the surface
         # Blue<->blue barrier: same falloff, but the "surface" is the
         # blue_collision_radius.  Needed alongside the obstacle term — with
         # obstacle clearance alone, blues avoiding obstacles crowd into the
@@ -1986,7 +1986,7 @@ class PursuitEnv(ParallelEnv):
         node_feat = track_conf.reshape(K, 1).astype(np.float32)
         return node_feat, edge_feat, edge_vis
 
-    def _build_obstacle_tracks(self) -> Tuple[np.ndarray, np.ndarray]:
+    def _build_obstacle_tracks(self):
         """
         Actor-side obstacle "tracks", mirroring ``_build_enemy_tracks``:
         for every obstacle a blue currently senses, use the precise
@@ -2009,19 +2009,30 @@ class PursuitEnv(ParallelEnv):
         test), matching ``_build_enemy_tracks``.
 
         Returns ``(obs_pos (n_obstacles, 2), obs_vel (n_obstacles, 2),
-        obs_conf (n_obstacles,))`` in the same slot convention
-        ``_extract_belief_peaks`` uses: real tracks first, unplaced slots
-        padded with conf 0.  ``obs_vel`` is the obstacle's own-radar
-        velocity when it is a live (seen) track, else 0 (a memory track
-        carries no Doppler) — static obstacles are simply always 0.
+        obs_conf (n_obstacles,), obs_r (n_obstacles,))`` in the same slot
+        convention ``_extract_belief_peaks`` uses: real tracks first,
+        unplaced slots padded with conf 0.  ``obs_vel`` is the obstacle's
+        own-radar velocity when it is a live (seen) track, else 0 (a memory
+        track carries no Doppler) — static obstacles are simply always 0.
+        ``obs_r`` is the obstacle RADIUS: the true measured value for a seen
+        track, the surveyed field's mean (command prior) for a memory track.
+        The actor needs it because both the crash penalty and the clearance
+        barrier are defined on the SURFACE (centre_dist − radius), which a
+        centre-only track cannot locate when radii vary.
         """
         n_obs  = self.n_obstacles
         obs_pos  = np.zeros((n_obs, 2), dtype=np.float32)
         obs_vel  = np.zeros((n_obs, 2), dtype=np.float32)
         obs_conf = np.zeros((n_obs,),   dtype=np.float32)
+        obs_r    = np.zeros((n_obs,),   dtype=np.float32)   # obstacle RADIUS
+        # Command's prior on obstacle size for memory tracks (unseen): the
+        # belief peak has lost which physical obstacle it is, so use the
+        # surveyed field's mean radius.  A live (seen) track overrides this
+        # with the true measured radius below.
+        radius_prior = 0.5 * (self.obstacle_radius_min + self.obstacle_radius_max)
         placed = 0 if self._obstacle_pos is None else len(self._obstacle_pos)
         if placed == 0:
-            return obs_pos, obs_vel, obs_conf
+            return obs_pos, obs_vel, obs_conf, obs_r
 
         # Which placed obstacles does ANY blue currently see?  Distance-
         # only gate, exactly as the enemy track builder does.
@@ -2052,6 +2063,7 @@ class PursuitEnv(ParallelEnv):
             obs_pos[slot]  = pos
             if self._obstacle_vel is not None:
                 obs_vel[slot] = self._obstacle_vel[o]   # own-radar Doppler
+            obs_r[slot]    = self._obstacle_r[o]        # true measured radius
             obs_conf[slot] = 1.0
             slot += 1
 
@@ -2073,15 +2085,17 @@ class PursuitEnv(ParallelEnv):
                     continue
                 obs_pos[slot]  = peaks_pos[i]
                 obs_conf[slot] = peaks_conf[i]     # memory track: vel stays 0
+                obs_r[slot]    = radius_prior      # command prior (unknown exact)
                 slot += 1
 
-        return obs_pos, obs_vel, obs_conf
+        return obs_pos, obs_vel, obs_conf, obs_r
 
     def _obstacle_graph_from_tracks(
         self,
         track_pos: np.ndarray,   # (K, 2) world coords (shared track picture)
         track_vel: np.ndarray,   # (K, 2) obstacle velocity (0 unless moving+seen)
         conf:      np.ndarray,   # (K,)   track confidences
+        track_r:   np.ndarray,   # (K,)   obstacle radius (true if seen, prior else)
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Actor-side OBSTACLE node + edge features from the obstacle tracks
@@ -2113,7 +2127,12 @@ class PursuitEnv(ParallelEnv):
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
         edge_feat[edge_vis <= 0.0] = 0.0
-        node_feat = conf.reshape(K, 1).astype(np.float32)
+        # Node feature: [conf, radius / arena_size].  conf stays at index 0
+        # (used as the placed/active mask downstream).  Radius normalised by
+        # the arena side to match the position scaling in the edges.
+        node_feat = np.stack(
+            [conf, track_r / self.arena_size], axis=-1,
+        ).astype(np.float32)
         return node_feat, edge_feat, edge_vis
 
     def _true_obstacle_graph(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -2130,7 +2149,7 @@ class PursuitEnv(ParallelEnv):
         N = self.n_blue
         placed = 0 if self._obstacle_pos is None else len(self._obstacle_pos)
 
-        node_feat = np.zeros((n_obs, 1), dtype=np.float32)
+        node_feat = np.zeros((n_obs, 2), dtype=np.float32)   # [placed, radius]
         n_edges = n_obs * N
         src_pos = np.zeros((n_edges, 2), dtype=np.float32)
         src_vel = np.zeros((n_edges, 2), dtype=np.float32)   # true obstacle vel
@@ -2141,6 +2160,7 @@ class PursuitEnv(ParallelEnv):
             has = o < placed
             if has:
                 node_feat[o, 0] = 1.0
+                node_feat[o, 1] = self._obstacle_r[o] / self.arena_size
             for b in range(N):
                 e = o * N + b
                 dst_pos[e] = self._blue_pos[b]
@@ -2228,9 +2248,9 @@ class PursuitEnv(ParallelEnv):
             # Live own-sensor position when a blue senses the obstacle,
             # else the belief-map peak (command memory).  See
             # _build_obstacle_tracks for the doctrine.
-            obs_pos, obs_vel, obs_conf = self._build_obstacle_tracks()
+            obs_pos, obs_vel, obs_conf, obs_r = self._build_obstacle_tracks()
             ob_node, ob_edge, ob_vis = self._obstacle_graph_from_tracks(
-                obs_pos, obs_vel, obs_conf,
+                obs_pos, obs_vel, obs_conf, obs_r,
             )
             out["obstacle_features"] = ob_node
             out["ob_edge_features"]  = ob_edge

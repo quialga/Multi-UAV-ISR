@@ -65,6 +65,19 @@ v6.x architecture.  Kept as short pointers so the reader can trace
   treatment so blues hug boundaries safely under the crash penalty.
   See `_build_obstacle_tracks` / `_obstacle_graph_from_tracks`,
   `tests/test_obstacle_tracks.py`.
+- **Obstacle radius as a node feature** (not a numbered item; observability
+  fix) — the actor received the obstacle CENTRE (refined track) but never
+  its RADIUS, while the crash penalty and clearance barrier are defined on
+  the SURFACE (`centre_dist − radius`).  With radii 5–15 m the actor could
+  not locate the danger boundary from a centre alone.  Obstacle node
+  feature is now `[conf, radius/arena_size]` (`obs_feat_dim` 1→2, actor +
+  critic): true measured radius for a seen/live track, the surveyed field's
+  mean (command prior) for an unseen/memory track.  Warm-start soft-loads
+  75/77 tensors; the two `obs_input_mlp.0.weight` (actor+critic) reinit
+  (shape (d,1)→(d,2)).  The detection gate is still centre-distance only
+  (radius omission there is harmless — `sensor_radius=40` gives ample
+  warning).  See `_build_obstacle_tracks` / `_obstacle_graph_from_tracks`
+  / `_true_obstacle_graph`, `tests/test_obstacle_tracks.py`.
 - **Red wall-repulsion** (not a numbered item; scripted-adversary fix)
   — `run_from_nearest_uav` fled straight away from the nearest blue,
   which ran a cornered red into the arena wall; the perpendicular

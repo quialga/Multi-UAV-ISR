@@ -154,7 +154,7 @@ def _parse_args() -> argparse.Namespace:
                         "inward so its gradient points toward open space. "
                         "0 = off.")
     p.add_argument("--clearance-margin", type=float,
-                   default=d.get("clearance_margin", 8.0),
+                   default=d.get("clearance_margin", 4.0),
                    help="Metres beyond an obstacle surface where clearance "
                         "shaping acts.")
     p.add_argument("--clearance-ally-weight", type=float,
@@ -462,7 +462,7 @@ def main() -> None:
         n_obs             = vec_env.n_obstacles,
         blue_feat_dim     = vec_env.blue_feat_dim,
         red_feat_dim      = 1,
-        obs_feat_dim      = 1,
+        obs_feat_dim      = 2,   # [placed/conf, radius/arena_size]
         edge_feat_dim     = vec_env.edge_feat_dim,
         action_dim        = action_dim,
         d_hidden          = args.d_hidden,

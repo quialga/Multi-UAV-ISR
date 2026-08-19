@@ -746,7 +746,7 @@ def test_stage4_v6_obs_schema_with_obstacles():
     assert obs["rb_edge_features"].shape      == (n_rb, 7)
     assert obs["rb_edge_visible"].shape       == (n_rb,)
     assert obs["true_rb_edge_features"].shape == (n_rb, 7)
-    assert obs["obstacle_features"].shape     == (env.n_obstacles, 1)
+    assert obs["obstacle_features"].shape     == (env.n_obstacles, 2)  # [conf, radius]
     assert obs["ob_edge_features"].shape      == (n_ob, 7)
     assert obs["ob_edge_visible"].shape       == (n_ob,)
     assert obs["true_ob_edge_features"].shape == (n_ob, 7)
