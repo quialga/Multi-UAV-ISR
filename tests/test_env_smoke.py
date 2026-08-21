@@ -605,6 +605,11 @@ def test_stage4_occluded_cells_never_updated():
     # Force a known obstacle geometry: single disk at (65, 65) r=10.
     env._obstacle_pos = np.array([[65.0, 65.0]], dtype=np.float32)
     env._obstacle_r   = np.array([10.0],        dtype=np.float32)
+    # Refresh the derived obstacle-cell grid (real code does this whenever
+    # geometry changes — see _move_obstacles).  Without it the stale grid
+    # still marks the seed-0 disks, and the enemy-channel obstacle pin
+    # would fire on a cell this test expects to be plain occluded space.
+    env._recompute_obstacle_grid()
     # Blue at (45, 65).  Pick an occluded cell behind the obstacle at
     # (82, 65) — directly through the obstacle centre.
     env._blue_pos[0] = np.array([45.0, 65.0], dtype=np.float32)

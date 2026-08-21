@@ -198,7 +198,6 @@ class PursuitEnv(ParallelEnv):
         p_TP:                     float = 0.85,
         p_FP:                     float = 0.15,
         ray_step_size:            float = 2.5,
-        belief_window_size:       int   = 0,   # 0 = ego-centric windows disabled
         # ----- Phase A: Bayesian prediction step on the enemy channel -----
         # Both default OFF (1.0 / 0.0) so pre-Phase-A behaviour is
         # byte-preserved unless explicitly enabled (stage4 config
@@ -367,7 +366,6 @@ class PursuitEnv(ParallelEnv):
         self.p_TP                     = float(p_TP)
         self.p_FP                     = float(p_FP)
         self.ray_step_size            = float(ray_step_size)
-        self.belief_window_size       = int(belief_window_size)
         # Phase A prediction-step knobs (enemy channel only).
         self.enemy_belief_decay       = float(enemy_belief_decay)
         self.enemy_belief_diffusion   = float(enemy_belief_diffusion)
@@ -1544,25 +1542,75 @@ class PursuitEnv(ParallelEnv):
             L *= gamma
 
         if p_move > 0.0:
-            # Log-odds -> probability (clamped for logit stability).
-            P = 1.0 / (1.0 + np.exp(-L))
-            # 3x3 convolution via padded shifts (no scipy dependency).
-            Pp = np.pad(P, 1, mode="edge")
             centre = 1.0 - p_move
             w_orth = p_move * 0.20
             w_diag = p_move * 0.05
-            P_new = (
-                centre * Pp[1:-1, 1:-1]
-                + w_orth * (Pp[:-2, 1:-1] + Pp[2:, 1:-1]
-                            + Pp[1:-1, :-2] + Pp[1:-1, 2:])
-                + w_diag * (Pp[:-2, :-2] + Pp[:-2, 2:]
-                            + Pp[2:, :-2] + Pp[2:, 2:])
-            )
+
+            def _conv3(A: np.ndarray) -> np.ndarray:
+                """3x3 motion kernel via padded shifts (no scipy dep).
+                Edge-replicate padding = the target cannot leave the arena."""
+                Ap = np.pad(A, 1, mode="edge")
+                return (
+                    centre * Ap[1:-1, 1:-1]
+                    + w_orth * (Ap[:-2, 1:-1] + Ap[2:, 1:-1]
+                                + Ap[1:-1, :-2] + Ap[1:-1, 2:])
+                    + w_diag * (Ap[:-2, :-2] + Ap[:-2, 2:]
+                                + Ap[2:, :-2] + Ap[2:, 2:])
+                )
+
+            # Log-odds -> probability (clamped for logit stability).
+            P = 1.0 / (1.0 + np.exp(-L))
+
+            # Obstacle-aware diffusion: an enemy cannot move THROUGH or INTO
+            # an obstacle, so probability mass must not leak into masked
+            # cells.  Rather than dropping that mass (which would silently
+            # destroy probability), renormalise each source cell's outgoing
+            # kernel weight over its VALID neighbours only — a reflecting
+            # boundary at the obstacle wall.  With no obstacles, valid == 1
+            # everywhere, f == 1, and this reduces exactly to the plain
+            # convolution (byte-identical).
+            valid = None
+            og = getattr(self, "_obstacle_grid", None)
+            if og is not None:
+                valid = (og <= 0.5).astype(np.float32)
+                if valid.all():
+                    valid = None            # no masked cells -> fast path
+            if valid is not None:
+                f = _conv3(valid)           # fraction of weight landing valid
+                P_src = np.where(valid > 0.0, P, 0.0) / np.maximum(f, 1e-6)
+                P_new = _conv3(P_src) * valid
+            else:
+                P_new = _conv3(P)
+
             eps = 1e-6
             P_new = np.clip(P_new, eps, 1.0 - eps)
             L[:] = np.log(P_new / (1.0 - P_new))
 
         np.clip(L, -self.belief_clip, self.belief_clip, out=L)
+        self._pin_enemy_belief_in_obstacles()
+
+    def _pin_enemy_belief_in_obstacles(self) -> None:
+        """
+        Enemy-channel cells inside an obstacle are KNOWN-EMPTY, not
+        "unknown".  Reds are kinematically clipped out of obstacle disks
+        (``_clip_positions_from_obstacles``), so P(enemy | inside obstacle)
+        is 0 — yet those cells are permanently occluded, so the sensor
+        update never reaches them and they sit near log-odds 0 (= P 0.5,
+        "unknown").  That makes them ~5.8 log-odds HIGHER than properly
+        cleared open space, turning obstacle interiors into probability
+        sinks that attract phantom peaks (measured: ~6.6% of extracted
+        peaks landed inside an obstacle, tens of metres from any real red).
+
+        Pinning them to -belief_clip encodes what we actually know and
+        removes the bias.  Channel 1 (obstacle) is untouched — being
+        inside an obstacle is exactly where that channel SHOULD be high.
+        """
+        og = getattr(self, "_obstacle_grid", None)
+        if self._belief_maps is None or og is None:
+            return
+        mask = og > 0.5
+        if mask.any():
+            self._belief_maps[0][mask] = -self.belief_clip
 
     def _clear_enemy_belief_at(self, positions: np.ndarray) -> None:
         """
@@ -1717,6 +1765,10 @@ class PursuitEnv(ParallelEnv):
             -self.belief_clip, self.belief_clip,
             out=self._belief_maps[:C],
         )
+        # Obstacle interiors are known-empty on the ENEMY channel, not
+        # "unknown".  Re-pin after fusion so a moving obstacle's current
+        # footprint is always enforced.  See _pin_enemy_belief_in_obstacles.
+        self._pin_enemy_belief_in_obstacles()
 
     def _extract_belief_peaks(
         self,

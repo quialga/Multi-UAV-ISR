@@ -65,6 +65,35 @@ v6.x architecture.  Kept as short pointers so the reader can trace
   treatment so blues hug boundaries safely under the crash penalty.
   See `_build_obstacle_tracks` / `_obstacle_graph_from_tracks`,
   `tests/test_obstacle_tracks.py`.
+- **Obstacle-aware enemy belief channel** (not a numbered item; belief-map
+  correctness fix) — two coupled bugs.  (a) Cells inside an obstacle are
+  permanently occluded, so the sensor update never reached them and they
+  sat near log-odds 0 (= P 0.5, "unknown") — but reds are kinematically
+  clipped OUT of obstacle disks, so P(enemy | inside obstacle) = 0.
+  Measured: interiors averaged **−1.87** vs **−7.64** for properly cleared
+  open space (~5.8 log-odds HIGHER), making them probability sinks that
+  attracted phantom peaks (**6.6%** of extracted peaks landed inside an
+  obstacle, tens of metres from any red).  (b) The isotropic diffusion
+  kernel leaked mass INTO those masked cells, continuously re-filling what
+  decay pulled toward 0 — which is *why* they sat at −1.87 rather than a
+  clean 0.  Fix: `_pin_enemy_belief_in_obstacles` pins the enemy channel to
+  `−belief_clip` inside the current obstacle footprint (channel 1 untouched
+  — that is exactly where the obstacle channel *should* be high), and the
+  diffusion kernel now renormalises each source cell's outgoing weight over
+  its VALID neighbours (a reflecting boundary at the obstacle wall, which
+  conserves probability instead of silently destroying it; with no
+  obstacles it reduces exactly to the plain convolution).  *Measured after:*
+  interiors **−10.00**, phantom peaks **0.0%** (was 6.6%).  **Note:** mean
+  peak error is unchanged (**32.2 m** vs 31.0 m) — the ~30 m
+  `belief_track_error` is dominated by the *unseen-red fallback* (only ~34%
+  of active reds are in sensor range at any instant), not by these phantom
+  peaks; this fix removes a correctness bug and phantom tracks, not the
+  headline error.  Directional (velocity-aware) prediction remains open —
+  see §15b.  See `_predict_enemy_belief`,
+  `tests/test_belief_obstacle_mask.py`.
+- **`belief_window_size` removed** — dead constructor param/attribute, set
+  but never read anywhere since the CNN/ego-window design was dropped in
+  the v5.x redesign.
 - **Obstacle radius as a node feature** (not a numbered item; observability
   fix) — the actor received the obstacle CENTRE (refined track) but never
   its RADIUS, while the crash penalty and clearance barrier are defined on
