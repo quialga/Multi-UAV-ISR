@@ -760,6 +760,55 @@ degradation, not a regression.
 **Blocking**: none — ~15 lines in `_measured_vel` plus threading the
 line-of-sight vector through the two graph builders.
 
+## 18. Track continuity / coasting on a missed detection
+
+**Motivation.**  Now that live tracks obey the real detection chain
+(`track_detection`, see `stage4_results.md` §4b), a target is missed on
+~`1 − p_TP` of scans per observing blue.  Today a single miss drops the
+track **straight back to the belief-map peak** — a hard switch from a
+*measured* position (precise, `conf = 1`) to a *grid-quantised* one
+(~½ cell error).  Real radar does not behave that way.
+
+**What real trackers do.**  A **track** is a persistent object maintained
+across scans, distinct from the per-scan **detections** that feed it.  On a
+miss the tracker does not delete it, it **coasts**:
+
+1. propagate the track forward on its motion model (constant velocity),
+2. inflate the uncertainty (no measurement to correct the covariance),
+3. drop the track only after several consecutive misses (classic **M-of-N**
+   logic, e.g. 3 straight misses).
+
+So a blink degrades the estimate gracefully instead of collapsing it.
+
+**Why this is the right fix (vs exempting obstacles from `p_TP`).**  The
+tempting shortcut — "obstacles are big and static, just always detect them"
+— re-opens exactly the incoherence §4b closed: two different detection
+models fed by one sensor.  Coasting keeps the **sensor** honest (it still
+misses) and puts the memory where it physically belongs, in the
+**tracker**.
+
+**Sketch.**
+- Per target (red and obstacle) store: last-good measured position, last
+  measured velocity, and a `staleness` counter (scans since last hit).
+- On a **hit**: refresh all three, `staleness = 0`.
+- On a **miss**: emit `last_pos + last_vel · staleness · dt` with `conf`
+  decayed by staleness (and, if `sensor_noise_range_growth` is on, an
+  uncertainty that grows the same way).
+- Past `max_coast_scans`, fall through to the belief peak as today.
+- For a **static obstacle** coasting is exactly correct — it has not moved,
+  so the last measurement is still true and `conf` should decay slowly (or
+  not at all).  This is where the current flicker is most visible, because
+  clearance shaping (§16) is defined on the obstacle **surface**.
+- It helps **enemy** tracks too: a fleeing red would coast along its last
+  Doppler instead of jumping to a stale blob on every blink.
+
+**Blocking**: none technically — but deliberately **deferred until measured**.
+Add tracker state only if the precise↔quantised flicker actually shows up in
+the clearance / crash-event numbers; there is no point carrying per-target
+history to fix a problem that may not bite.  Check
+`eval_det/{obstacle,ally}_crashes` on a run with the realistic sensor model
+before building this.
+
 ---
 
 ## Design questions still open
