@@ -809,6 +809,82 @@ history to fix a problem that may not bite.  Check
 `eval_det/{obstacle,ally}_crashes` on a run with the realistic sensor model
 before building this.
 
+## 19. Information-seeking reward (potential-based, NOT hand-coded bonuses)
+
+**The idea as originally raised (2026-08).**  Two per-agent shaping terms:
+(a) a **reward** for a UAV that detects an enemy no other UAV has found so
+far, and (b) a **penalty** when a UAV loses an enemy that no other UAV is
+tracking.  Intent: make information-gathering — the actual point of ISR —
+a first-class objective instead of something rewarded only indirectly
+through captures.
+
+**Why NOT to ship those two terms as stated.**
+
+1. *They target a bottleneck we do not have.*  Against `pool_fixed_v4`:
+   stationary 2.95 / random 2.95 / **run 2.45**.  A STATIONARY red never
+   moves, so catching it is purely find-then-reach — and those score
+   2.95/3.  If search/detection were limiting, stationary would suffer
+   too.  The whole gap is the FLEEING red, i.e. a pursuit / coordination
+   problem, not a detection problem.
+2. *(a) is non-Markovian.*  "not found by any other UAV **so far**" depends
+   on episode history, so it needs a per-red `discovered` flag added to the
+   state; otherwise the policy receives rewards it cannot explain from what
+   it observes → high-variance gradients.
+3. *(b) has two concrete perverse incentives.*
+   - **Shadowing beats closing.**  Holding a track is easier than
+     capturing.  To capture you must close, which makes the red flee
+     harder and raises the chance of losing it — so a custody penalty
+     makes the final approach the riskiest moment and can teach the policy
+     to loiter at max sensor range instead of committing.  Symptom to
+     watch for: detection stats UP, capture DOWN.
+   - **Acquisition avoidance.**  If being the sole tracker is a liability,
+     never becoming the sole tracker is a valid way to avoid the penalty.
+
+**The principled form — potential-based shaping.**  Ng, Harada & Russell
+(1999), *Policy invariance under reward transformations*: any shaping of
+the form
+
+```
+F(s, s') = gamma * Phi(s') - Phi(s)
+```
+
+provably leaves the OPTIMAL POLICY UNCHANGED, whatever `Phi` is.  Define a
+team-knowledge potential over the belief state, e.g.
+
+```
+Phi(s) = - sum_r  uncertainty(track r)      # or -sum_r entropy / cov trace
+```
+
+Both original ideas then fall out **automatically and safely**:
+
+- discovering a previously-unknown red collapses its uncertainty → large
+  positive shaping (idea (a), without the history bookkeeping);
+- losing sole custody inflates uncertainty → negative shaping (idea (b),
+  without the shadowing incentive — because the shaping cannot change which
+  policy is optimal, it can only speed up finding it).
+
+It is also **Markovian by construction**: uncertainty is a function of the
+current belief state, not of who saw what earlier.
+
+**Sequencing / blocking.**  Deliberately deferred.  `moving_v1` collapsed
+from adding ONE reward term; obstacle clearance, ally clearance and the
+realistic sensor model (§4b) are all still unvalidated, so adding two more
+shaped terms now would make attribution impossible.  **Train first, then
+diagnose:**
+
+- uncaught reds mostly **undetected** for their lifetime → search IS the
+  bottleneck → implement the potential-based version above;
+- uncaught reds mostly **detected but uncaught** (what the stationary
+  result predicts) → the fix is pursuit / coordination, and detection
+  shaping will not help.
+
+*Measurement caveat when re-running this diagnostic:* `pool_fixed_v4`
+predates the obstacle-radius node feature, so loading it now reinitialises
+`obs_input_mlp.0.weight` in both encoders (75/77 tensors) — the obstacle
+encoder is RANDOM and the policy scores far below its logged 2.45/3.  Use
+the training-log det evals, or a checkpoint trained after the radius
+change, rather than re-evaluating that file.
+
 ---
 
 ## Design questions still open
