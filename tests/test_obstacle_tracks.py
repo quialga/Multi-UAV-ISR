@@ -25,6 +25,11 @@ def _seeded_env(noise=0.0, seed=2):
         n_blue=3, n_red=2, n_obstacles=4, arena_size=130.0, max_steps=40,
         sensor_radius=40.0, use_belief_maps=True,
         sensor_pos_noise_std=noise, red_policy=stationary_red,
+        # These tests measure POSITION precision of a seen track; pin the
+        # p_TP draw and the range-based confidence so a random radar miss
+        # (or an SNR-scaled conf) cannot flake them.
+        track_detection=False, track_conf_min=1.0,
+        sensor_noise_range_growth=0.0,
     )
     env.reset(seed=seed)
     # A few steps so the obstacle belief channel is populated (the

@@ -208,6 +208,43 @@ class PursuitEnv(ParallelEnv):
         # edge of a blue that can see the associated red uses the true
         # position + N(0, sigma^2) instead of the cell-centre grid peak.
         sensor_pos_noise_std:     float = 1.0,
+        # ----- Live-track sensor realism ----------------------------------
+        # A live track comes from the SAME radar that feeds the belief map,
+        # so it must obey the same detection chain: detect (p_TP) -> measure.
+        # Previously the track gate was range-only, so a target inside
+        # sensor_radius produced a conf-1.0 measurement EVERY step and even
+        # THROUGH obstacles, while the belief map applied p_TP/p_FP and an
+        # exact occlusion test off the same sensor.
+        #   track_occlusion  — require clear line of sight for a live track.
+        #   track_detection  — require the p_TP draw to fire; on a miss there
+        #                      is NO measurement and the track coasts on the
+        #                      belief/memory path (as an unseen target does).
+        # Both default True (physically coherent).  Set False to reproduce
+        # pre-fix runs.
+        track_occlusion:          bool  = True,
+        track_detection:          bool  = True,
+        # Doppler (radial-velocity) measurement noise.  Real radar measures
+        # velocity from phase, far more precisely than differencing noisy
+        # positions would allow, so keep this SMALL (~0.1) relative to
+        # sensor_pos_noise_std.  0.0 = perfect velocity (pre-fix).
+        sensor_vel_noise_std:     float = 0.0,
+        # Live-track confidence floor at max sensor range (SNR proxy: return
+        # power falls ~R^-4, so a distant track is a weaker, less trustworthy
+        # return).  conf(r) = c_min + (1-c_min)(1-(r/R)^2), using the range to
+        # the NEAREST detecting blue (best SNR wins).  Depends ONLY on range —
+        # never on whether the target is real, which would leak ground truth.
+        # 1.0 (default) = flat conf 1.0 everywhere (pre-fix).
+        track_conf_min:           float = 1.0,
+        # Range growth of MEASUREMENT NOISE — the other half of the same SNR
+        # story as track_conf_min: if a distant return is less trustworthy,
+        # it must also be less ACCURATE, or the model is incoherent.  Real
+        # cross-range error = R * sigma_angle with sigma_angle ~ 1/sqrt(SNR),
+        # so error grows steeply with range; this exposes it as a tunable
+        # multiplier rather than the raw exponent:
+        #     sigma(r) = sigma_base * (1 + growth * (r/R)^2)
+        # 0.0 (default) = range-independent noise (pre-fix).  1.0 = noise
+        # doubles at max sensor range.  Applies to BOTH position and Doppler.
+        sensor_noise_range_growth: float = 0.0,
         # ----- Crash penalties (per-agent shaped reward) ------------------
         # Both default 0.0 (off) so the shared-team-reward behaviour is
         # byte-preserved unless enabled.  When > 0, a crashing blue takes
@@ -366,6 +403,21 @@ class PursuitEnv(ParallelEnv):
         self.p_TP                     = float(p_TP)
         self.p_FP                     = float(p_FP)
         self.ray_step_size            = float(ray_step_size)
+        self.track_occlusion          = bool(track_occlusion)
+        self.track_detection          = bool(track_detection)
+        self.sensor_vel_noise_std     = float(sensor_vel_noise_std)
+        self.track_conf_min           = float(track_conf_min)
+        self.sensor_noise_range_growth = float(sensor_noise_range_growth)
+        assert self.sensor_vel_noise_std >= 0.0
+        assert self.sensor_noise_range_growth >= 0.0
+        assert 0.0 < self.track_conf_min <= 1.0, (
+            "track_conf_min must be in (0, 1]; 0 is reserved for dead/padded "
+            "track slots")
+        # Per-(blue, target) detection masks for THIS step, set by the track
+        # builders and consumed by the graph builders so a blue supplies
+        # own-sensor Doppler exactly when it actually detected the target.
+        self._last_red_detect: Optional[np.ndarray] = None   # (n_blue, n_red)
+        self._last_obs_detect: Optional[np.ndarray] = None   # (n_blue, n_obs)
         # Phase A prediction-step knobs (enemy channel only).
         self.enemy_belief_decay       = float(enemy_belief_decay)
         self.enemy_belief_diffusion   = float(enemy_belief_diffusion)
@@ -1862,6 +1914,63 @@ class PursuitEnv(ParallelEnv):
 
         return peak_pos, conf
 
+    def _blue_detected_red(self, b: int, r: int) -> bool:
+        """Did blue ``b`` detect red ``r`` on this step's scan?  Falls back
+        to the plain range test when no detection mask has been built yet
+        (e.g. a caller that skipped ``_build_enemy_tracks``)."""
+        m = self._last_red_detect
+        if m is not None:
+            return bool(m[b, r])
+        return bool(
+            self.sensor_radius is None
+            or np.linalg.norm(self._red_pos[r] - self._blue_pos[b])
+            <= self.sensor_radius
+        )
+
+    def _noise_scale(self, rng_m: float) -> float:
+        """Measurement-noise multiplier at measurement range ``rng_m``.
+
+        The same SNR falloff that lowers a distant track's CONFIDENCE also
+        degrades its ACCURACY, so both must move together or the sensor
+        model contradicts itself:  sigma(r) = sigma_base * (1 + g (r/R)^2).
+        Returns 1.0 when the growth knob is off or range is unbounded.
+        """
+        g = self.sensor_noise_range_growth
+        if g <= 0.0 or self.sensor_radius is None or not np.isfinite(rng_m):
+            return 1.0
+        x = float(np.clip(rng_m / self.sensor_radius, 0.0, 1.0))
+        return 1.0 + g * x * x
+
+    def _measured_vel(self, true_vel: np.ndarray,
+                      rng_m: float = float("inf")) -> np.ndarray:
+        """Own-sensor Doppler measurement = true velocity + Gaussian noise,
+        the noise growing with measurement range (see ``_noise_scale``).
+
+        Real radar derives velocity from phase over the coherent processing
+        interval, which is far more precise than differencing noisy
+        positions, so ``sensor_vel_noise_std`` should stay small relative to
+        ``sensor_pos_noise_std``.  NOTE: this models the measurement as
+        isotropic in 2-D; a real radar measures only the RADIAL component
+        well (see backlog "radial/tangential Doppler").
+        """
+        v = np.asarray(true_vel, dtype=np.float32)
+        if self.sensor_vel_noise_std <= 0.0:
+            return v
+        sigma = self.sensor_vel_noise_std * self._noise_scale(rng_m)
+        return (v + self._rng.normal(0.0, sigma, size=2).astype(np.float32)
+                ).astype(np.float32)
+
+    def _measured_pos(self, true_pos: np.ndarray,
+                      rng_m: float = float("inf")) -> np.ndarray:
+        """Fused measured position = true position + Gaussian noise, the
+        noise growing with measurement range (see ``_noise_scale``)."""
+        p = np.asarray(true_pos, dtype=np.float32)
+        if self.sensor_pos_noise_std <= 0.0:
+            return p
+        sigma = self.sensor_pos_noise_std * self._noise_scale(rng_m)
+        return (p + self._rng.normal(0.0, sigma, size=2).astype(np.float32)
+                ).astype(np.float32)
+
     def _build_enemy_tracks(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Populate the K = n_red enemy track slots DETECTION-FIRST.
@@ -1897,32 +2006,55 @@ class PursuitEnv(ParallelEnv):
         if len(active) == 0 or self._belief_maps is None:
             return track_pos, track_conf, track_red
 
-        # Which active reds does ANY blue currently see?
-        if self.sensor_radius is None:
-            vis_mask = np.ones(len(active), dtype=bool)
+        # Which active reds does ANY blue currently DETECT?  One detection
+        # chain, same statistics as the belief map: in range -> clear line of
+        # sight -> the p_TP draw fires.  A miss yields NO measurement at all
+        # (the radar simply did not report), so the track coasts on the
+        # memory path below, exactly like an out-of-range target.
+        n_act    = len(active)
+        red_act  = self._red_pos[active]                      # (n_act, 2)
+        vis_mask = np.zeros(n_act, dtype=bool)
+        best_rng = np.full(n_act, np.inf, dtype=np.float32)
+        detect   = np.zeros((self.n_blue, self.n_red), dtype=bool)
+        for b in range(self.n_blue):
+            d = np.linalg.norm(red_act - self._blue_pos[b][None, :], axis=1)
+            ok = (np.ones(n_act, dtype=bool) if self.sensor_radius is None
+                  else d <= self.sensor_radius)
+            if self.track_occlusion and ok.any():
+                ok &= ~self._rays_occluded_by_obstacles(
+                    self._blue_pos[b], red_act)
+            if self.track_detection and ok.any():
+                ok &= self._rng.random(n_act) < self.p_TP
+            vis_mask |= ok
+            best_rng = np.where(ok, np.minimum(best_rng, d), best_rng)
+            detect[b, active] = ok
+        self._last_red_detect = detect
+
+        # Live-track confidence: SNR proxy from the range to the NEAREST
+        # detecting blue (strongest return wins the fused track).
+        if self.track_conf_min >= 1.0 or self.sensor_radius is None:
+            live_conf = np.ones(n_act, dtype=np.float32)
         else:
-            d = np.linalg.norm(
-                self._red_pos[active][:, None, :]
-                - self._blue_pos[None, :, :], axis=-1,
-            )                                   # (n_active, n_blue)
-            vis_mask = d.min(axis=1) <= self.sensor_radius
+            x = np.clip(best_rng / self.sensor_radius, 0.0, 1.0)
+            live_conf = (self.track_conf_min
+                         + (1.0 - self.track_conf_min) * (1.0 - x * x)
+                         ).astype(np.float32)
+
         vis_reds    = active[vis_mask]
+        live_confs  = live_conf[vis_mask]
         unseen_reds = active[~vis_mask]
 
         cs = self.belief_cell_size
         slot = 0
 
-        # 1. Live tracks: fused measured position (true + noise).
-        for r in vis_reds:
+        # 1. Live tracks: fused measured position (true + range-scaled noise
+        #    from the best-SNR detector).
+        live_rngs = best_rng[vis_mask]
+        for r, c, rm in zip(vis_reds, live_confs, live_rngs):
             if slot >= K:
                 break
-            pos = self._red_pos[r].astype(np.float32)
-            if self.sensor_pos_noise_std > 0.0:
-                pos = pos + self._rng.normal(
-                    0.0, self.sensor_pos_noise_std, size=2,
-                ).astype(np.float32)
-            track_pos[slot]  = pos
-            track_conf[slot] = 1.0
+            track_pos[slot]  = self._measured_pos(self._red_pos[r], float(rm))
+            track_conf[slot] = float(c)
             track_red[slot]  = int(r)
             slot += 1
 
@@ -2024,14 +2156,18 @@ class PursuitEnv(ParallelEnv):
                 dst_pos[e] = self._blue_pos[b]
                 dst_vel[e] = self._blue_vel[b]
                 edge_vis[e] = track_conf[s]
-                if r >= 0 and (
-                    self.sensor_radius is None
-                    or np.linalg.norm(self._red_pos[r] - self._blue_pos[b])
-                    <= self.sensor_radius
-                ):
-                    # This blue sees the backing red -> own-sensor Doppler.
-                    src_vel[e] = self._red_vel[r]
-                # else: memory / out-of-range -> velocity stays 0.
+                if r >= 0 and self._blue_detected_red(b, r):
+                    # This blue DETECTED the backing red this scan -> its own
+                    # Doppler measurement (noisy, degrading with ITS range).
+                    # Gated by the same detection chain that produced the
+                    # track, so a blue can never report velocity for
+                    # something it did not detect.
+                    src_vel[e] = self._measured_vel(
+                        self._red_vel[r],
+                        float(np.linalg.norm(
+                            self._red_pos[r] - self._blue_pos[b])),
+                    )
+                # else: memory / undetected -> velocity stays 0.
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
         edge_feat[edge_vis <= 0.0] = 0.0     # zero padded/dead slots
@@ -2086,17 +2222,43 @@ class PursuitEnv(ParallelEnv):
         if placed == 0:
             return obs_pos, obs_vel, obs_conf, obs_r
 
-        # Which placed obstacles does ANY blue currently see?  Distance-
-        # only gate, exactly as the enemy track builder does.
-        idx = np.arange(placed)
-        if self.sensor_radius is None:
-            seen_mask = np.ones(placed, dtype=bool)
+        # Which placed obstacles does ANY blue currently DETECT?  Same
+        # detection chain as the enemy tracks / belief map: in range ->
+        # clear line of sight -> the p_TP draw fires.
+        idx  = np.arange(placed)
+        opos = self._obstacle_pos[:placed]
+        orad = self._obstacle_r[:placed]
+        seen_mask = np.zeros(placed, dtype=bool)
+        best_rng  = np.full(placed, np.inf, dtype=np.float32)
+        odet = np.zeros((self.n_blue, n_obs), dtype=bool)
+        for b in range(self.n_blue):
+            bp = self._blue_pos[b]
+            d  = np.linalg.norm(opos - bp[None, :], axis=1)
+            ok = (np.ones(placed, dtype=bool) if self.sensor_radius is None
+                  else d <= self.sensor_radius)
+            if self.track_occlusion and ok.any():
+                # Cast to the NEAR-SURFACE point, not the centre: a disk
+                # would otherwise always occlude itself.  The occlusion
+                # margin lets the first boundary surface be observed.
+                u    = (opos - bp[None, :]) / np.maximum(d, 1e-6)[:, None]
+                near = (opos - orad[:, None] * u).astype(np.float32)
+                ok &= ~self._rays_occluded_by_obstacles(bp, near)
+            if self.track_detection and ok.any():
+                ok &= self._rng.random(placed) < self.p_TP
+            seen_mask |= ok
+            best_rng = np.where(ok, np.minimum(best_rng, d), best_rng)
+            odet[b, :placed] = ok
+        self._last_obs_detect = odet
+
+        # Live-track confidence: SNR proxy from range to nearest detector.
+        if self.track_conf_min >= 1.0 or self.sensor_radius is None:
+            o_conf = np.ones(placed, dtype=np.float32)
         else:
-            d = np.linalg.norm(
-                self._obstacle_pos[:placed][:, None, :]
-                - self._blue_pos[None, :, :], axis=-1,
-            )                                    # (placed, n_blue)
-            seen_mask = d.min(axis=1) <= self.sensor_radius
+            x = np.clip(best_rng / self.sensor_radius, 0.0, 1.0)
+            o_conf = (self.track_conf_min
+                      + (1.0 - self.track_conf_min) * (1.0 - x * x)
+                      ).astype(np.float32)
+
         seen   = idx[seen_mask]
         unseen = idx[~seen_mask]
 
@@ -2107,16 +2269,13 @@ class PursuitEnv(ParallelEnv):
         for o in seen:
             if slot >= n_obs:
                 break
-            pos = self._obstacle_pos[o].astype(np.float32)
-            if self.sensor_pos_noise_std > 0.0:
-                pos = pos + self._rng.normal(
-                    0.0, self.sensor_pos_noise_std, size=2,
-                ).astype(np.float32)
-            obs_pos[slot]  = pos
+            rm = float(best_rng[o])
+            obs_pos[slot] = self._measured_pos(self._obstacle_pos[o], rm)
             if self._obstacle_vel is not None:
-                obs_vel[slot] = self._obstacle_vel[o]   # own-radar Doppler
+                # own-radar Doppler (noisy, degrading with range)
+                obs_vel[slot] = self._measured_vel(self._obstacle_vel[o], rm)
             obs_r[slot]    = self._obstacle_r[o]        # true measured radius
-            obs_conf[slot] = 1.0
+            obs_conf[slot] = float(o_conf[o])
             slot += 1
 
         # 2. Memory tracks: belief peaks for the unseen obstacles,

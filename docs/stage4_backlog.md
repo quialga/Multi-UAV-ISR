@@ -714,6 +714,52 @@ numpy↔torch issue — it reads the same obstacle geometry the crash check
 already uses).  #2 reuses the caught-red inactivation path.  #3 is a
 larger PPO change.  **Start with #1.**
 
+## 17. Radial / tangential Doppler decomposition
+
+**Motivation.**  The live-track sensor model now applies `p_TP` detection,
+line-of-sight gating, range-scaled position/Doppler noise, and range-based
+confidence (see `stage4_results.md`).  One realism gap remains: the actor
+receives the **full 2-D velocity vector**, but a real radar measures only
+the **radial** component (along the line of sight) from Doppler phase.  The
+**tangential** component is not directly observable — a tracker must infer
+it over several scans from angle rate, far more noisily.
+
+**Why it matters for THIS task.**  The asymmetry is task-relevant, not
+cosmetic:
+
+- A red **fleeing directly away** from a blue is almost pure radial →
+  measured beautifully.
+- A red **crossing** a blue's line of sight is almost pure tangential →
+  nearly invisible to Doppler — and that is exactly the geometry where
+  intercept prediction needs velocity most.
+
+The current model erases that distinction, so the policy gets crossing-target
+velocity for free.
+
+**Sketch.**
+
+```
+los       = (target_pos − blue_pos) / ‖·‖
+v_radial  = (v_true · los) los         # measured well (small noise)
+v_tangent = v_true − v_radial          # poorly observed
+v_meas    = v_radial + n_r·los + tangential_observability · v_tangent + n_t
+```
+
+New knob `tangential_observability ∈ [0, 1]`: `1.0` = today's behaviour
+(full vector), `0.0` = pure Doppler (radial only).  Applies per (blue,
+target) edge, since the line of sight is per-blue — which also makes the
+existing "own-sensor Doppler" doctrine sharper.
+
+**Deferred deliberately.**  Unlike the detection/occlusion fixes (physics
+violations), this one *changes what the policy can infer* about crossing
+targets, so it deserves its own before/after comparison rather than being
+bundled with the sensor-coherence work.  Expect intercept quality against
+the `run` evader to drop when it lands — that would be an honest
+degradation, not a regression.
+
+**Blocking**: none — ~15 lines in `_measured_vel` plus threading the
+line-of-sight vector through the two graph builders.
+
 ---
 
 ## Design questions still open

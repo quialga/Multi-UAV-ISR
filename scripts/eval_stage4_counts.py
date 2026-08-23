@@ -84,6 +84,14 @@ def _env_kwargs_from_train_args(
         enemy_belief_decay      = g("enemy_belief_decay", 0.99),
         enemy_belief_diffusion  = g("enemy_belief_diffusion", 0.2),
         sensor_pos_noise_std    = g("sensor_pos_noise_std", 1.0),
+        # Live-track sensor realism — defaults here reproduce PRE-fix
+        # behaviour so an older checkpoint (whose args lack these keys)
+        # evaluates in the sensor regime it was trained in.
+        track_occlusion         = g("track_occlusion", False),
+        track_detection         = g("track_detection", False),
+        sensor_vel_noise_std    = g("sensor_vel_noise_std", 0.0),
+        track_conf_min          = g("track_conf_min", 1.0),
+        sensor_noise_range_growth = g("sensor_noise_range_growth", 0.0),
         crash_obstacle_penalty  = g("crash_obstacle_penalty", 0.0),
         crash_blue_penalty      = g("crash_blue_penalty", 0.0),
         blue_collision_radius   = g("blue_collision_radius", 2.0),

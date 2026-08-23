@@ -113,6 +113,35 @@ def _parse_args() -> argparse.Namespace:
                    help="Live-sensor position accuracy (m) for visible "
                         "targets; continuous measurement replaces the "
                         "cell-centre peak on that blue's rb edge.")
+    p.add_argument("--no-track-occlusion", dest="track_occlusion",
+                   action="store_false",
+                   default=d.get("track_occlusion", True),
+                   help="Let live tracks see THROUGH obstacles (pre-fix "
+                        "behaviour). By default a live track needs clear "
+                        "line of sight, like the belief map.")
+    p.add_argument("--no-track-detection", dest="track_detection",
+                   action="store_false",
+                   default=d.get("track_detection", True),
+                   help="Make live-track detection perfect (pre-fix). By "
+                        "default a live track requires the same p_TP draw "
+                        "the belief map uses; on a miss the track coasts on "
+                        "the memory path.")
+    p.add_argument("--sensor-vel-noise-std", type=float,
+                   default=d.get("sensor_vel_noise_std", 0.1),
+                   help="Doppler measurement noise. Keep SMALL vs "
+                        "--sensor-pos-noise-std (radar measures velocity "
+                        "from phase, not by differencing positions).")
+    p.add_argument("--track-conf-min", type=float,
+                   default=d.get("track_conf_min", 0.5),
+                   help="Live-track confidence at max sensor range (SNR "
+                        "proxy; range-only so it never leaks true-vs-false). "
+                        "1.0 = flat conf 1.0 everywhere (pre-fix).")
+    p.add_argument("--sensor-noise-range-growth", type=float,
+                   default=d.get("sensor_noise_range_growth", 1.0),
+                   help="Range growth of measurement noise: sigma(r) = "
+                        "sigma_base * (1 + g (r/R)^2). The accuracy half of "
+                        "the same SNR falloff as --track-conf-min. "
+                        "0 = range-independent noise (pre-fix).")
     p.add_argument("--eval-interval", type=int, default=25,
                    help="Every N rollouts, DETERMINISTICALLY evaluate the "
                         "learned policy (the metric comparable to Stage 3; "
@@ -385,6 +414,11 @@ def main() -> None:
         enemy_belief_decay      = args.enemy_belief_decay,
         enemy_belief_diffusion  = args.enemy_belief_diffusion,
         sensor_pos_noise_std    = args.sensor_pos_noise_std,
+        track_occlusion         = args.track_occlusion,
+        track_detection         = args.track_detection,
+        sensor_vel_noise_std    = args.sensor_vel_noise_std,
+        track_conf_min          = args.track_conf_min,
+        sensor_noise_range_growth = args.sensor_noise_range_growth,
         crash_obstacle_penalty  = args.crash_obstacle_penalty,
         crash_blue_penalty      = args.crash_blue_penalty,
         blue_collision_radius   = args.blue_collision_radius,

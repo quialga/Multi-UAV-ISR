@@ -1051,7 +1051,10 @@ def test_stage4_detection_seeded_two_close_visible_reds_split():
     would have merged them is bypassed because live tracks are seeded
     directly from the sensor, not from belief peaks.
     """
-    env = _stage4_env(n_obstacles=0)
+    # track_detection=False: this test is about live-vs-memory ROUTING
+    # (NMS-collapse bypass), not about detection statistics — pin the p_TP
+    # draw so a random radar miss cannot flake it.
+    env = _stage4_env(n_obstacles=0, track_detection=False)
     env.reset(seed=0)
     env._red_active[:] = False
     env._red_active[:2] = True
@@ -1073,7 +1076,9 @@ def test_stage4_detection_seed_beats_belief_lag():
     still gets a LIVE precise track — detection does not wait on the
     memory layer.
     """
-    env = _stage4_env(n_obstacles=0)
+    # track_detection=False: this asserts a VISIBLE red is routed live
+    # despite belief lag — pin the p_TP draw so a radar miss cannot flake it.
+    env = _stage4_env(n_obstacles=0, track_detection=False)
     env.reset(seed=0)
     env._red_active[:] = False
     env._red_active[0] = True
@@ -1111,7 +1116,9 @@ def test_stage4_live_track_excludes_memory_duplicate():
     track: with 1 visible + 1 unseen red, the visible red's cell is
     excluded from memory-peak extraction.
     """
-    env = _stage4_env(n_obstacles=0)
+    # track_detection=False: this asserts the live/memory SPLIT and the
+    # live-cell exclusion, not detection statistics — pin the p_TP draw.
+    env = _stage4_env(n_obstacles=0, track_detection=False)
     env.reset(seed=0)
     cs = env.belief_cell_size
     env._red_active[:] = False

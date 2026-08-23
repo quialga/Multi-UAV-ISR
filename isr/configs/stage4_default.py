@@ -60,6 +60,22 @@ STAGE4_DEFAULTS = {
     # the peak could still miss the capture.  Radar range accuracy of
     # ~1 m at close range is realistic.
     "sensor_pos_noise_std":   1.0,
+    # Live-track sensor realism: a live track comes from the SAME radar that
+    # feeds the belief map, so it obeys the same detect(p_TP) -> measure
+    # chain and the same line-of-sight test.  Set the booleans False to
+    # reproduce pre-fix runs (range-only gate, conf 1.0, sees through walls).
+    "track_occlusion":        True,
+    "track_detection":        True,
+    # Doppler noise — keep SMALL vs sensor_pos_noise_std (radar measures
+    # velocity from phase, not by differencing noisy positions).
+    "sensor_vel_noise_std":   0.1,
+    # Live-track confidence floor at max range (SNR proxy).  Range-only, so
+    # it never leaks true-vs-false.  1.0 = flat conf (pre-fix).
+    "track_conf_min":         0.5,
+    # The other half of the same SNR story: a distant return is not just
+    # less trustworthy, it is less ACCURATE.  sigma(r) = sigma_base *
+    # (1 + g (r/R)^2); 1.0 = measurement noise doubles at max range.
+    "sensor_noise_range_growth": 1.0,
 
     # ----- Sensor model --------------------------------------------------
     "p_TP":                0.85,

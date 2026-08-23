@@ -461,6 +461,58 @@ avoidance policy (`--warm-start-full`), ramping `obstacle_speed` up from
 a low value (curriculum knob), optionally combined with `--n-red-min` /
 `--n-obstacles-min` for variable counts in the same run.
 
+### 4b. Live tracks now obey the same sensor model as the belief map
+
+**The inconsistency.**  The live-track gate was **range-only**, so a target
+inside `sensor_radius` produced a `conf = 1.0` measurement **every step**,
+even **through obstacles** — while the belief map, fed by the *same* radar,
+applied `p_TP = 0.85` / `p_FP = 0.15` and an exact line-of-sight test.  A
+real radar is one chain: **detect (P_d) → measure (position + Doppler)**.
+You cannot miss the detection and still report an accurate position.  The
+practical consequence was that any red within 40 m in a 130 m arena was
+effectively **oracle information**, which makes the Stage 4 "partial, noisy
+perception" framing weaker than it reads — **results above this section
+were obtained under that near-oracle in-range regime.**
+
+**What landed** (all with escape hatches to reproduce pre-fix runs):
+
+| knob | default | effect |
+|---|---|---|
+| `track_occlusion` | `True` | a live track needs clear line of sight |
+| `track_detection` | `True` | the `p_TP` draw must fire; a miss yields **no measurement** and the track coasts on the belief/memory path |
+| `sensor_vel_noise_std` | `0.1` | Doppler is measured, not exact (small vs the 1.0 m position noise — radar gets velocity from phase, not by differencing positions) |
+| `track_conf_min` | `0.5` | confidence falls with range (SNR proxy): `conf(r) = c_min + (1−c_min)(1−(r/R)²)` |
+| `sensor_noise_range_growth` | `1.0` | **accuracy** falls with range too: `σ(r) = σ_base(1 + g(r/R)²)` |
+
+The last two are deliberately coupled: confidence and accuracy are two
+consequences of the *same* SNR falloff, so degrading one while holding the
+other constant would be internally inconsistent.  Confidence depends on
+**range only** — never on true-vs-false status, which would leak ground
+truth into the actor (a false alarm is indistinguishable from a real
+detection at detection time; real systems separate them over *time* via
+track score, not instantaneously).
+
+**Measured** (5 seeds, random-walk blues, 4 obstacles):
+
+| | pre-fix | realistic |
+|---|---|---|
+| live tracks / in-range events | 100.0% | **94.2%** |
+| mean live position error | 1.25 m | **2.11 m** |
+| mean live confidence | 1.00 | **0.71** |
+
+94.2% (rather than 85%) is correct and worth understanding: a red in range
+of several blues gets an **independent detection draw per blue**, so fusion
+across platforms genuinely raises detection probability — `1 − (1−p_TP)ⁿ`.
+
+Occlusion-through-walls was rare in the current 4-obstacle map (**0.9%** of
+in-range events had *every* seeing blue blocked), so this is a correctness
+fix rather than an explanation of past training results; it would matter far
+more with fewer blues, larger obstacles, or an urban map.
+
+Still open: **radial/tangential Doppler** — the actor still gets the full
+2-D velocity vector, whereas a real radar measures only the radial
+component well.  See `stage4_backlog.md` §17.
+
 ### 5. Curriculum training results — wall-repelling reds + the crash problem
 
 Two runs on top of the wall-repulsion fix (§backlog "Red wall-repulsion")
