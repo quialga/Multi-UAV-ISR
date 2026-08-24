@@ -16,6 +16,18 @@ STAGE1_DEFAULTS = {
     "capture_radius": 3.0,
     "dt":             1.0,
 
+    # ----- Reward shape (env-level; inherited by every stage) ------------
+    # Previously hard-coded in PursuitEnv._step.  Surfaced here so the
+    # reward can be tuned/recorded without editing the env.  Defaults are
+    # exactly the historical values, so every earlier run is reproducible.
+    #   r_i = r_team + r_crash_i + r_clear_i - action_cost_i
+    #   r_team = catch_reward * n_caught - step_cost   [- uncaught_penalty
+    #                                        * n_uncaught at episode end]
+    "catch_reward":     10.0,   # per red caught (shared: a team success)
+    "step_cost":        0.05,   # per step (shared: mission time pressure)
+    "uncaught_penalty": 5.0,    # per red still alive at episode end (shared)
+    "action_cost_coef": 0.01,   # * |a_i|^2, INDIVIDUAL: own control effort
+
     # ----- Vectorisation -------------------------------------------------
     # Rollout collection runs n_envs copies of the env in parallel.
     # At rollout time we see (n_envs * rollout_steps * n_agents) samples,

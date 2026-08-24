@@ -282,3 +282,72 @@ def test_vec_env_reward_is_per_agent_and_stage1_collapse_matches():
     collapsed = reward_np.mean(axis=1)
     assert collapsed.shape == (4,)
     assert np.allclose(reward_np, reward_np[:, [0]])
+
+
+# ---------------------------------------------------------------------------
+#  Reward shape is configurable (was hard-coded in _step)
+# ---------------------------------------------------------------------------
+
+def test_reward_constants_default_to_historical_values():
+    """Defaults must reproduce the old hard-coded reward exactly, so every
+    earlier run stays reproducible."""
+    env = _env()
+    assert env.catch_reward == 10.0
+    assert env.step_cost == 0.05
+    assert env.uncaught_penalty == 5.0
+    assert env.action_cost_coef == 0.01
+
+
+def test_step_cost_and_action_cost_coef_take_effect():
+    """Both the shared step cost and the individual effort coefficient are
+    read from the constructor, not baked in."""
+    agents_a = None
+    env = PursuitEnv(n_blue=2, n_red=1, n_obstacles=0, arena_size=100.0,
+                     max_steps=50, capture_radius=3.0,
+                     step_cost=0.5, action_cost_coef=0.1,
+                     red_policy=stationary_red, seed=0)
+    env.reset(seed=0)
+    agents_a = env.possible_agents
+    acts = {a: np.zeros(2, dtype=np.float32) for a in agents_a}
+    acts[agents_a[0]] = np.array([1.0, 0.0], dtype=np.float32)
+    _, rew, _, _, _ = env.step(acts)
+    # idle agent pays only the shared step cost
+    assert np.isclose(rew[agents_a[1]], -0.5, atol=1e-6)
+    # mover additionally pays 0.1 * |a|^2 = 0.1
+    assert np.isclose(rew[agents_a[0]], -0.6, atol=1e-6)
+
+
+def test_catch_reward_and_uncaught_penalty_take_effect():
+    """catch_reward is paid on a capture; uncaught_penalty is charged per
+    surviving red when the episode ends."""
+    # Capture: blue starts on top of the red -> caught on the first step.
+    env = PursuitEnv(n_blue=1, n_red=1, n_obstacles=0, arena_size=100.0,
+                     max_steps=50, capture_radius=5.0, catch_reward=3.0,
+                     step_cost=0.0, action_cost_coef=0.0,
+                     red_policy=stationary_red, seed=0)
+    env.reset(seed=0)
+    env._blue_pos[0] = np.array([50.0, 50.0], dtype=np.float32)
+    env._red_pos[0] = np.array([51.0, 50.0], dtype=np.float32)
+    _, rew, term, _, _ = env.step({"blue_0": np.zeros(2, dtype=np.float32)})
+    assert term["blue_0"] and np.isclose(rew["blue_0"], 3.0, atol=1e-6)
+
+    # Truncation with the red alive -> -uncaught_penalty.
+    env = PursuitEnv(n_blue=1, n_red=1, n_obstacles=0, arena_size=100.0,
+                     max_steps=1, capture_radius=0.5, uncaught_penalty=2.0,
+                     step_cost=0.0, action_cost_coef=0.0,
+                     red_policy=stationary_red, seed=0)
+    env.reset(seed=0)
+    env._blue_pos[0] = np.array([1.0, 1.0], dtype=np.float32)
+    env._red_pos[0] = np.array([99.0, 99.0], dtype=np.float32)
+    _, rew, _, trunc, _ = env.step({"blue_0": np.zeros(2, dtype=np.float32)})
+    assert trunc["blue_0"] and np.isclose(rew["blue_0"], -2.0, atol=1e-6)
+
+
+def test_config_exposes_reward_shape():
+    """The four constants live in the config chain (stage1 -> 3 -> 4)."""
+    from isr.configs.stage1_default import STAGE1_DEFAULTS
+    from isr.configs.stage4_default import STAGE4_DEFAULTS
+    for k, v in (("catch_reward", 10.0), ("step_cost", 0.05),
+                 ("uncaught_penalty", 5.0), ("action_cost_coef", 0.01)):
+        assert STAGE1_DEFAULTS[k] == v
+        assert STAGE4_DEFAULTS[k] == v      # inherited

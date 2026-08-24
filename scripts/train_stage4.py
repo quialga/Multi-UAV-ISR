@@ -419,6 +419,13 @@ def main() -> None:
         sensor_vel_noise_std    = args.sensor_vel_noise_std,
         track_conf_min          = args.track_conf_min,
         sensor_noise_range_growth = args.sensor_noise_range_growth,
+        # Reward shape — config-only (no CLI flags: these define the task,
+        # they are not per-run knobs).  Recorded in the saved args below so
+        # a checkpoint still pins the reward it was trained under.
+        catch_reward            = STAGE4_DEFAULTS["catch_reward"],
+        step_cost               = STAGE4_DEFAULTS["step_cost"],
+        uncaught_penalty        = STAGE4_DEFAULTS["uncaught_penalty"],
+        action_cost_coef        = STAGE4_DEFAULTS["action_cost_coef"],
         crash_obstacle_penalty  = args.crash_obstacle_penalty,
         crash_blue_penalty      = args.crash_blue_penalty,
         blue_collision_radius   = args.blue_collision_radius,
@@ -535,7 +542,15 @@ def main() -> None:
     # fresh for the loaded weights.
     optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
 
-    args_dict_saved = {**vars(args), "policy_type": "gnn_stage4_v6"}
+    args_dict_saved = {
+        **vars(args), "policy_type": "gnn_stage4_v6",
+        # Reward shape is config-only (not argparse), but must be recorded
+        # so a checkpoint pins the reward it was trained under.
+        "catch_reward":     STAGE4_DEFAULTS["catch_reward"],
+        "step_cost":        STAGE4_DEFAULTS["step_cost"],
+        "uncaught_penalty": STAGE4_DEFAULTS["uncaught_penalty"],
+        "action_cost_coef": STAGE4_DEFAULTS["action_cost_coef"],
+    }
 
     # Buffer (generic dict-of-tensors).
     buffer = Stage4RolloutBuffer(

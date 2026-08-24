@@ -185,6 +185,17 @@ class PursuitEnv(ParallelEnv):
         dt:                       float              = 1.0,
         red_policy:               Optional[Callable] = None,
         seed:                     Optional[int]      = None,
+        # ----- Reward shape (was hard-coded in _step) ---------------------
+        #   r_i = r_team + r_crash_i + r_clear_i - action_cost_i
+        #   r_team = catch_reward * n_caught - step_cost
+        #            [- uncaught_penalty * n_uncaught at episode end]
+        # SHARED terms are mission-level (a catch is a team success, time
+        # pressure applies to everyone); control effort is INDIVIDUAL.
+        # Defaults are the historical hard-coded values.
+        catch_reward:             float = 10.0,
+        step_cost:                float = 0.05,
+        uncaught_penalty:         float = 5.0,
+        action_cost_coef:         float = 0.01,
         sensor_radius:            Optional[float]    = None,
         # ---- Stage 4: obstacles + belief map (all optional) --------------
         n_obstacles:              int   = 0,
@@ -402,6 +413,11 @@ class PursuitEnv(ParallelEnv):
         self.belief_clip              = float(belief_clip)
         self.p_TP                     = float(p_TP)
         self.p_FP                     = float(p_FP)
+        self.catch_reward             = float(catch_reward)
+        self.step_cost                = float(step_cost)
+        self.uncaught_penalty         = float(uncaught_penalty)
+        self.action_cost_coef         = float(action_cost_coef)
+        assert self.action_cost_coef >= 0.0
         self.ray_step_size            = float(ray_step_size)
         self.track_occlusion          = bool(track_occlusion)
         self.track_detection          = bool(track_detection)
@@ -700,8 +716,8 @@ class PursuitEnv(ParallelEnv):
 
         # 6. Reward.
         # 6a. TEAM (shared) component — see docs/design.md §3.7.
-        catch_bonus = 10.0 * n_caught_this_step
-        step_cost   = 0.05
+        catch_bonus = self.catch_reward * n_caught_this_step
+        step_cost   = self.step_cost
         r_team = catch_bonus - step_cost
 
         # 6b. Blue-blue collisions (per-agent): any two blues within
@@ -733,7 +749,8 @@ class PursuitEnv(ParallelEnv):
         #      of objective.  It also removes an n_blue dependence: the old
         #      form scaled the penalty each agent felt with team size, which
         #      fought the count-agnostic design.
-        action_cost = 0.01 * np.sum(blue_a ** 2, axis=1).astype(np.float32)
+        action_cost = (self.action_cost_coef
+                       * np.sum(blue_a ** 2, axis=1)).astype(np.float32)
 
         # 6c. Per-agent crash shaping: r_crash_i (applied as a negative).
         r_crash = np.zeros(self.n_blue, dtype=np.float32)
@@ -785,7 +802,7 @@ class PursuitEnv(ParallelEnv):
         truncated  = time_up and not all_caught
         if terminated or truncated:
             n_uncaught = int(self._red_active.sum())
-            r_team += -5.0 * n_uncaught                     # terminal penalty (team)
+            r_team += -self.uncaught_penalty * n_uncaught   # terminal penalty (team)
             self.agents = []                                # PettingZoo convention
 
         # Stage 4: update belief maps AFTER movement + capture so
