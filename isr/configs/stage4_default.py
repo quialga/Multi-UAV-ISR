@@ -80,6 +80,16 @@ STAGE4_DEFAULTS = {
     # ----- Sensor model --------------------------------------------------
     "p_TP":                0.85,
     "p_FP":                0.15,
+    # Per-channel override (backlog §8).  A concrete 15 m obstacle is far
+    # easier to detect than a small, actively-evading drone, yet both
+    # channels shared one (p_TP, p_FP).  This became load-bearing once live
+    # tracks started obeying p_TP: obstacles dropped out of live tracking
+    # ~15% of scans, flickering their perceived SURFACE — which is exactly
+    # what clearance shaping keys on.  Enemy deliberately INHERITS the pair
+    # above (0.85/0.15) so this stays a physics correction, not a difficulty
+    # change.  Also gets most of §18's benefit without tracker state.
+    "p_TP_obstacle":       0.95,
+    "p_FP_obstacle":       0.05,
     # Occlusion margin (m): the analytic segment-disk test cuts each
     # ray this far before the cell centre, so obstacle boundary cells
     # within this depth stay observable.  (Name kept from the old

@@ -414,6 +414,10 @@ def main() -> None:
         enemy_belief_decay      = args.enemy_belief_decay,
         enemy_belief_diffusion  = args.enemy_belief_diffusion,
         sensor_pos_noise_std    = args.sensor_pos_noise_std,
+        # Per-channel sensor quality — config-only, like the reward shape
+        # (it defines the task).  Enemy inherits p_TP / p_FP above.
+        p_TP_obstacle           = STAGE4_DEFAULTS["p_TP_obstacle"],
+        p_FP_obstacle           = STAGE4_DEFAULTS["p_FP_obstacle"],
         track_occlusion         = args.track_occlusion,
         track_detection         = args.track_detection,
         sensor_vel_noise_std    = args.sensor_vel_noise_std,
@@ -550,6 +554,8 @@ def main() -> None:
         "step_cost":        STAGE4_DEFAULTS["step_cost"],
         "uncaught_penalty": STAGE4_DEFAULTS["uncaught_penalty"],
         "action_cost_coef": STAGE4_DEFAULTS["action_cost_coef"],
+        "p_TP_obstacle":    STAGE4_DEFAULTS["p_TP_obstacle"],
+        "p_FP_obstacle":    STAGE4_DEFAULTS["p_FP_obstacle"],
     }
 
     # Buffer (generic dict-of-tensors).

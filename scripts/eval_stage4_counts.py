@@ -80,6 +80,10 @@ def _env_kwargs_from_train_args(
         belief_clip             = g("belief_clip", 10.0),
         p_TP                    = g("p_tp", 0.85),
         p_FP                    = g("p_fp", 0.15),
+        # Older checkpoints predate per-channel quality -> fall back to the
+        # shared pair so they evaluate in the regime they trained in.
+        p_TP_obstacle           = g("p_TP_obstacle", None),
+        p_FP_obstacle           = g("p_FP_obstacle", None),
         ray_step_size           = g("ray_step_size", 2.5),
         enemy_belief_decay      = g("enemy_belief_decay", 0.99),
         enemy_belief_diffusion  = g("enemy_belief_diffusion", 0.2),

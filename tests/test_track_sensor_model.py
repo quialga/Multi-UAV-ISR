@@ -296,3 +296,85 @@ def test_obstacle_velocity_is_per_blue_not_shared():
     assert not np.allclose(v_near, 0.0), "detecting blue lost its Doppler"
     assert np.allclose(v_far, 0.0), (
         "non-detecting blue received obstacle velocity it never measured")
+
+
+# --------------------------------------------------------------------- #
+#  Per-channel sensor quality (backlog §8)
+# --------------------------------------------------------------------- #
+
+def test_per_channel_defaults_fall_back_to_the_shared_pair():
+    """Passing only the base (p_TP, p_FP) sets BOTH channels — so every
+    caller/test that predates the split is byte-preserved."""
+    env = _env(p_TP=0.7, p_FP=0.2)
+    assert env.p_TP_enemy == env.p_TP_obstacle == 0.7
+    assert env.p_FP_enemy == env.p_FP_obstacle == 0.2
+
+
+def test_per_channel_override_is_independent():
+    """The obstacle channel can be set without touching the enemy channel."""
+    env = _env(p_TP=0.85, p_FP=0.15, p_TP_obstacle=0.95, p_FP_obstacle=0.05)
+    assert env.p_TP_enemy == 0.85 and env.p_FP_enemy == 0.15
+    assert env.p_TP_obstacle == 0.95 and env.p_FP_obstacle == 0.05
+
+
+def test_live_track_detection_uses_the_matching_channel():
+    """The enemy track draw uses p_TP_enemy and the obstacle track draw uses
+    p_TP_obstacle — the whole point of the split is that the two stay
+    coherent with the belief map they share a sensor with."""
+    env = _clear_geometry(_env(p_TP=0.5, p_TP_obstacle=1.0))
+    # Enemy: ~50% of scans (p_TP_enemy inherits the base 0.5).
+    hits = sum(int(env._build_enemy_tracks()[2][0] == 0) for _ in range(2000))
+    assert abs(hits / 2000 - 0.5) < 0.05
+
+    # Obstacle: p_TP_obstacle = 1.0 -> detected on every scan.  Park a blue
+    # right beside the obstacle so range/LOS are satisfied.
+    env2 = _env(p_TP=0.5, p_TP_obstacle=1.0)
+    o = env2._obstacle_pos[0].copy()
+    r0 = float(env2._obstacle_r[0])
+    env2._blue_pos[0] = o + np.array([r0 + 6.0, 0.0], dtype=np.float32)
+    for _ in range(50):
+        assert bool(env2._build_obstacle_tracks()[4][0] >= 0), (
+            "obstacle with p_TP_obstacle=1.0 must never drop out")
+
+
+def test_higher_obstacle_p_TP_reduces_live_track_dropout():
+    """The practical payoff: raising obstacle detection cuts the live-track
+    dropout that flickers an obstacle's perceived SURFACE (what clearance
+    shaping keys on)."""
+    def dropout(p_obs):
+        env = _env(p_TP=0.85, p_TP_obstacle=p_obs)
+        o = env._obstacle_pos[0].copy()
+        r0 = float(env._obstacle_r[0])
+        env._blue_pos[0] = o + np.array([r0 + 6.0, 0.0], dtype=np.float32)
+        miss = sum(int(env._build_obstacle_tracks()[4][0] < 0)
+                   for _ in range(2000))
+        return miss / 2000
+
+    assert dropout(0.95) < dropout(0.85), "0.95 should drop out less often"
+    assert abs(dropout(0.85) - 0.15) < 0.04
+    assert abs(dropout(0.95) - 0.05) < 0.03
+
+
+def test_belief_update_uses_per_channel_log_odds():
+    """Channel 1 (obstacle) accumulates stronger evidence per detection when
+    its sensor is better, so its log-odds separate from channel 0's."""
+    env = PursuitEnv(
+        n_blue=1, n_red=1, n_obstacles=1, arena_size=130.0, max_steps=50,
+        sensor_radius=40.0, use_belief_maps=True,
+        p_TP=0.85, p_FP=0.15, p_TP_obstacle=0.99, p_FP_obstacle=0.01,
+        red_policy=stationary_red, seed=0,
+    )
+    env.reset(seed=0)
+    # A better sensor => a larger |log-odds| step per detection.
+    assert env._L_detect_ch[1] > env._L_detect_ch[0]
+    assert env._L_no_detect_ch[1] < env._L_no_detect_ch[0]
+
+
+def test_config_sets_obstacle_channel_to_095():
+    from isr.configs.stage4_default import STAGE4_DEFAULTS
+    assert STAGE4_DEFAULTS["p_TP_obstacle"] == 0.95
+    assert STAGE4_DEFAULTS["p_FP_obstacle"] == 0.05
+    # Enemy deliberately unchanged — this is a correction, not a difficulty
+    # change.
+    assert STAGE4_DEFAULTS["p_TP"] == 0.85
+    assert STAGE4_DEFAULTS["p_FP"] == 0.15

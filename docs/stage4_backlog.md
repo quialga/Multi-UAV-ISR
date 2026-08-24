@@ -380,7 +380,26 @@ visibility already gives an interesting partial-comms behaviour;
 would matter for a scenario deliberately studying TDL loss (jamming,
 urban shadowing).
 
-## 8. Per-channel sensor noise
+## 8. Per-channel sensor noise — ✅ LANDED
+
+> **Shipped.**  `p_TP_enemy` / `p_FP_enemy` / `p_TP_obstacle` /
+> `p_FP_obstacle` on `PursuitEnv`, each defaulting to `None` -> fall back to
+> the shared `(p_TP, p_FP)`, so callers passing only the base pair are
+> byte-preserved.  Stage-4 config sets the OBSTACLE channel to **0.95/0.05**
+> and deliberately leaves the ENEMY channel at 0.85/0.15 — the original
+> sketch's `enemy: 0.75/0.20` was dropped because lowering enemy detection
+> is a *difficulty change* we would want measured, whereas the obstacle
+> correction is physics.  Applied to BOTH the belief update (per-channel
+> log-odds `_L_detect_ch` / `_L_no_detect_ch`) and the live-track detection
+> draw, so the two stay coherent — that coherence was the whole point.
+>
+> *Newly load-bearing* because live tracks now obey `p_TP` (§4b in
+> `stage4_results.md`): obstacles were dropping out of live tracking ~15% of
+> scans, flickering their perceived SURFACE, which is exactly what clearance
+> shaping (§16 #1) keys on.  Measured dropout 15% -> 5%, so this also buys
+> most of §18's benefit without any tracker state.  Config-only (no CLI
+> flags) but recorded in the saved checkpoint args.  See
+> `tests/test_track_sensor_model.py`.
 
 **Motivation.** In reality, obstacles are much easier to detect
 than moving targets (they're bigger, more predictable, don't try to

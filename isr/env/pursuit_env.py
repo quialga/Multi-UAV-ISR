@@ -208,6 +208,19 @@ class PursuitEnv(ParallelEnv):
         belief_clip:              float = 10.0,
         p_TP:                     float = 0.85,
         p_FP:                     float = 0.15,
+        # ----- Per-channel sensor quality (backlog §8) --------------------
+        # A concrete 15 m obstacle and a small, actively-evading drone are
+        # NOT equally detectable, yet both channels shared one (p_TP, p_FP).
+        # This became load-bearing once live tracks started obeying p_TP:
+        # obstacles were dropping out of live tracking ~15% of scans, which
+        # flickers their perceived SURFACE (what clearance shaping keys on).
+        # Each defaults to None -> fall back to the shared p_TP / p_FP, so
+        # callers that pass only the base pair are byte-preserved.
+        # Channel 0 = enemy, channel 1 = obstacle.
+        p_TP_enemy:               Optional[float] = None,
+        p_FP_enemy:               Optional[float] = None,
+        p_TP_obstacle:            Optional[float] = None,
+        p_FP_obstacle:            Optional[float] = None,
         ray_step_size:            float = 2.5,
         # ----- Phase A: Bayesian prediction step on the enemy channel -----
         # Both default OFF (1.0 / 0.0) so pre-Phase-A behaviour is
@@ -413,6 +426,11 @@ class PursuitEnv(ParallelEnv):
         self.belief_clip              = float(belief_clip)
         self.p_TP                     = float(p_TP)
         self.p_FP                     = float(p_FP)
+        # Per-channel resolution (None -> the shared base pair).
+        self.p_TP_enemy    = float(p_TP if p_TP_enemy    is None else p_TP_enemy)
+        self.p_FP_enemy    = float(p_FP if p_FP_enemy    is None else p_FP_enemy)
+        self.p_TP_obstacle = float(p_TP if p_TP_obstacle is None else p_TP_obstacle)
+        self.p_FP_obstacle = float(p_FP if p_FP_obstacle is None else p_FP_obstacle)
         self.catch_reward             = float(catch_reward)
         self.step_cost                = float(step_cost)
         self.uncaught_penalty         = float(uncaught_penalty)
@@ -474,6 +492,17 @@ class PursuitEnv(ParallelEnv):
         p_fp_c = min(max(self.p_FP, _eps), 1.0 - _eps)
         self._L_detect    = float(np.log(p_tp_c / p_fp_c))
         self._L_no_detect = float(np.log((1.0 - p_tp_c) / (1.0 - p_fp_c)))
+        # Per-channel versions (index 0 = enemy, 1 = obstacle) used by the
+        # belief update; the scalars above stay for the shared base pair.
+        tp_ch = np.array([self.p_TP_enemy, self.p_TP_obstacle], dtype=np.float64)
+        fp_ch = np.array([self.p_FP_enemy, self.p_FP_obstacle], dtype=np.float64)
+        tp_ch = np.clip(tp_ch, _eps, 1.0 - _eps)
+        fp_ch = np.clip(fp_ch, _eps, 1.0 - _eps)
+        self._p_TP_ch = tp_ch.astype(np.float32)
+        self._p_FP_ch = fp_ch.astype(np.float32)
+        self._L_detect_ch    = np.log(tp_ch / fp_ch).astype(np.float32)
+        self._L_no_detect_ch = np.log(
+            (1.0 - tp_ch) / (1.0 - fp_ch)).astype(np.float32)
 
         self._rng = np.random.default_rng(seed)
 
@@ -1830,14 +1859,14 @@ class PursuitEnv(ParallelEnv):
             uniforms  = self._rng.random((C, K)).astype(np.float32)
             p_detect  = np.where(
                 truth_vis > 0.5,
-                np.float32(self.p_TP),
-                np.float32(self.p_FP),
+                self._p_TP_ch[:C, None],
+                self._p_FP_ch[:C, None],
             )                                                  # (C, K)
             detected = uniforms < p_detect                     # (C, K) bool
             evidence = np.where(
                 detected,
-                np.float32(self._L_detect),
-                np.float32(self._L_no_detect),
+                self._L_detect_ch[:C, None],
+                self._L_no_detect_ch[:C, None],
             )                                                  # (C, K)
 
             # 4. Fuse this UAV's evidence into the SHARED map.
@@ -2070,7 +2099,7 @@ class PursuitEnv(ParallelEnv):
                 ok &= ~self._rays_occluded_by_obstacles(
                     self._blue_pos[b], red_act)
             if self.track_detection and ok.any():
-                ok &= self._rng.random(n_act) < self.p_TP
+                ok &= self._rng.random(n_act) < self.p_TP_enemy
             vis_mask |= ok
             best_rng = np.where(ok, np.minimum(best_rng, d), best_rng)
             detect[b, active] = ok
@@ -2296,7 +2325,7 @@ class PursuitEnv(ParallelEnv):
                 near = (opos - orad[:, None] * u).astype(np.float32)
                 ok &= ~self._rays_occluded_by_obstacles(bp, near)
             if self.track_detection and ok.any():
-                ok &= self._rng.random(placed) < self.p_TP
+                ok &= self._rng.random(placed) < self.p_TP_obstacle
             seen_mask |= ok
             best_rng = np.where(ok, np.minimum(best_rng, d), best_rng)
             odet[b, :placed] = ok
