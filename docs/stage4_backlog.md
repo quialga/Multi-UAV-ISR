@@ -519,6 +519,49 @@ when we actually want to study C2 loss (so probably alongside the
 `comms_radius` decoupling in §7 -- they're the "degraded network"
 pair).
 
+### 13c — The POSITION/VELOCITY asymmetry in the downlink  **[OPEN — recorded, not a bug]**
+
+Both track graphs (`_enemy_graph_from_tracks`,
+`_obstacle_graph_from_tracks`) implement the same split:
+
+- **POSITION** = the ONE shared command-layer track, delivered to *every*
+  blue regardless of whether it detected the target.  (Deliberate: a single
+  broadcast draw means all blues share one *correlated* error, so the GNN
+  cannot average independent per-blue draws and get accuracy for free as
+  team size grows.)
+- **VELOCITY** = own-sensor Doppler only, reported by a blue that actually
+  detected the target this scan; zero otherwise.
+
+The docstring justifies the split as *"Doppler is a first-person
+measurement that command cannot deliver to a UAV that lacks its own sensor
+lock."*  **That justification is the weak link.**  A real fused track is a
+tracker *state estimate* — position **and** velocity — and Link-16 / C2
+track messages carry both.  If command can downlink a fused position, it
+can downlink a fused velocity.
+
+**Why it is not filed as a bug:** the asymmetry is *conservative* — it
+gives the policy **less** information than a real fused picture would, so
+nothing is being over-claimed.  It also has a defensible reading as a
+deliberate modelling choice (velocity is the more perishable, more
+sensor-specific measurement), and the per-blue treatment is what makes
+"who can see this target right now" a learnable signal at all.
+
+**Why it belongs next to §13b:** both items are about *what the C2 downlink
+actually delivers*.  Whoever implements `command_link_visible` will be
+re-deciding the downlink contract anyway, and should settle at the same
+time whether a linked UAV receives (a) position only — today's model,
+(b) position + fused velocity — closest to real Link-16, or (c) a full
+fused track with covariance.  Picking (b) or (c) would make §18's track
+coasting a *command-layer* function rather than a per-UAV one, since
+command would be the thing propagating the estimate.
+
+**Do NOT change this in isolation:** handing the actor fused velocity for
+targets it cannot see would make perception *easier*, which would silently
+invalidate comparisons against every result recorded in
+`stage4_results.md`.  It is a deliberate part of the "how partial is the
+observability" contract, so move it only together with §13b and with a
+before/after run.
+
 ## 14. 3D environment
 
 **Motivation.**  The current arena is a 2D plane — UAVs move in
