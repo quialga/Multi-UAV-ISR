@@ -259,3 +259,40 @@ def test_full_step_runs_with_realistic_sensor():
     obs = env.structured_belief_observation()
     assert np.all(np.isfinite(obs["rb_edge_features"]))
     assert np.all(np.isfinite(obs["red_features"]))
+
+
+def test_obstacle_velocity_is_per_blue_not_shared():
+    """Obstacle Doppler must follow the SAME first-person rule as enemy
+    Doppler: only a blue that actually detected the obstacle reports its
+    velocity.  Previously the fused track velocity was copied onto EVERY
+    blue's ob edge, so a blue with no detection still 'measured' the sweep.
+    """
+    env = PursuitEnv(
+        n_blue=2, n_red=1, n_obstacles=1, arena_size=130.0, max_steps=60,
+        capture_radius=3.0, sensor_radius=40.0, use_belief_maps=True,
+        sensor_pos_noise_std=0.0, sensor_vel_noise_std=0.0,
+        moving_obstacle_fraction=1.0, obstacle_speed=2.0,
+        track_detection=False, track_conf_min=1.0,
+        sensor_noise_range_growth=0.0,
+        red_policy=stationary_red, seed=5,
+    )
+    env.reset(seed=5)
+    o = env._obstacle_pos[0].copy()
+    env._red_pos[0] = np.array([5.0, 5.0], dtype=np.float32)
+    r0 = float(env._obstacle_r[0])
+    # Clearly OUTSIDE the disk (radii are sampled in [5, 15]) but well
+    # inside sensor range, so this blue genuinely detects it.
+    env._blue_pos[0] = o + np.array([r0 + 8.0, 0.0], dtype=np.float32)
+    env._blue_pos[1] = np.array([125.0, 125.0], dtype=np.float32)    # far away
+
+    obs = env.structured_belief_observation()
+    assert env._last_obs_detect is not None
+    assert bool(env._last_obs_detect[0, 0]), "near blue should detect it"
+    assert not bool(env._last_obs_detect[1, 0]), "far blue should not"
+
+    # ob edges are (s outer, b inner) -> slot 0 gives edges [blue0, blue1].
+    ob = obs["ob_edge_features"]
+    v_near, v_far = ob[0][2:4], ob[1][2:4]
+    assert not np.allclose(v_near, 0.0), "detecting blue lost its Doppler"
+    assert np.allclose(v_far, 0.0), (
+        "non-detecting blue received obstacle velocity it never measured")
