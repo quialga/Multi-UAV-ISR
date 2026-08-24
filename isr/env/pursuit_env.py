@@ -701,9 +701,8 @@ class PursuitEnv(ParallelEnv):
         # 6. Reward.
         # 6a. TEAM (shared) component — see docs/design.md §3.7.
         catch_bonus = 10.0 * n_caught_this_step
-        action_cost = 0.01 * float(np.sum(blue_a ** 2))   # sum over UAVs and axes
         step_cost   = 0.05
-        r_team = catch_bonus - action_cost - step_cost
+        r_team = catch_bonus - step_cost
 
         # 6b. Blue-blue collisions (per-agent): any two blues within
         #     blue_collision_radius each take the ally-crash penalty.
@@ -723,6 +722,18 @@ class PursuitEnv(ParallelEnv):
         # diff these against the previous step's masks.
         self._last_obstacle_crash_mask = blue_obstacle_crash
         self._last_blue_crash_mask      = blue_ally_crash
+
+        # 6b'. Per-agent CONTROL EFFORT: r_action_i.  Control effort is a
+        #      first-person cost (your own actuators), so each blue pays for
+        #      its OWN action only — it used to be summed over the whole team
+        #      and charged to everyone via r_team, so ~81% of what an agent
+        #      "paid" was its teammates' manoeuvring.  The expected policy
+        #      gradient w.r.t. a_i is UNCHANGED (d/da_i of the teammates'
+        #      terms is 0), so this is pure variance reduction, not a change
+        #      of objective.  It also removes an n_blue dependence: the old
+        #      form scaled the penalty each agent felt with team size, which
+        #      fought the count-agnostic design.
+        action_cost = 0.01 * np.sum(blue_a ** 2, axis=1).astype(np.float32)
 
         # 6c. Per-agent crash shaping: r_crash_i (applied as a negative).
         r_crash = np.zeros(self.n_blue, dtype=np.float32)
@@ -784,12 +795,17 @@ class PursuitEnv(ParallelEnv):
         if self.use_belief_maps:
             self._update_belief_maps()
 
-        # 8. Pack the per-agent dicts.  r_i = r_team (shared) + r_crash_i +
-        #    r_clear_i (individual).  With crash penalties and clearance
-        #    weight off, both are 0 and every agent gets the identical shared
-        #    reward as before.
+        # 8. Pack the per-agent dicts:
+        #        r_i = r_team + r_crash_i + r_clear_i - action_cost_i
+        #    SHARED (r_team): catch bonus + step cost — the mission-level
+        #    terms that genuinely apply to the whole team.
+        #    INDIVIDUAL: crash, clearance, and control effort — all
+        #    first-person quantities.  Agents therefore differ whenever any
+        #    of them acts (control effort is never identically zero in
+        #    training), so consumers must NOT assume a shared scalar; take
+        #    the mean over agents for a team-level figure.
         rewards     = {
-            a: float(r_team + r_crash[i] + r_clear[i])
+            a: float(r_team + r_crash[i] + r_clear[i] - action_cost[i])
             for i, a in enumerate(self.possible_agents)
         }
         terminateds = {a: terminated for a in self.possible_agents}

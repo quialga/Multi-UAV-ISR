@@ -283,10 +283,13 @@ def main() -> None:
                 action_t, log_p_t, _, value_t = policy.get_action_and_value(obs_t)
             action_np = action_t.cpu().numpy().astype(np.float32)
             next_obs_np, reward_np, done_np, _ = vec_env.step(action_np)
-            # Vec env now returns per-agent rewards (n_envs, n_agents).
-            # Stage 1 uses shared team reward -> every agent is identical,
-            # so collapse to the per-env scalar the Stage 1 buffer expects.
-            reward_np = reward_np[:, 0]
+            # Vec env returns per-agent rewards (n_envs, n_agents).  Agents
+            # are NOT identical any more — control effort (and, if enabled,
+            # crash / clearance) is individual — so column 0 is one agent's
+            # reward, not the team's.  Stage 1 is a shared-reward learner and
+            # wants a per-env scalar: take the MEAN over agents, which is
+            # also how vec_env accumulates episode returns.
+            reward_np = reward_np.mean(axis=1)
             buffer.add(
                 obs       = obs_t,
                 actions   = action_t,

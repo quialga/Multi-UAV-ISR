@@ -39,14 +39,57 @@ def _env(**overrides):
 # ---------------------------------------------------------------------------
 
 def test_penalties_off_by_default_gives_shared_reward():
-    """With penalties at 0 the reward is byte-identical across agents
-    (the pre-crash shared-team-reward behaviour is preserved)."""
+    """With penalties at 0 AND zero actions, every agent sees the same
+    reward — only the shared team terms (catch bonus, step cost) remain.
+    Control effort is individual, so this holds only for equal actions;
+    see test_action_cost_is_individual."""
     env = _env()  # crash penalties default to 0.0
     env.reset(seed=3)
     acts = {a: np.zeros(2, dtype=np.float32) for a in env.possible_agents}
     _, rew, _, _, _ = env.step(acts)
     vals = list(rew.values())
     assert all(abs(v - vals[0]) < 1e-9 for v in vals), rew
+
+
+def test_action_cost_is_individual_not_shared():
+    """Control effort is first-person: a blue that manoeuvres hard must pay
+    for it ALONE.  Previously the cost was summed over the whole team and
+    charged to everyone, so ~81% of what an agent paid was its teammates'
+    effort — pure gradient noise."""
+    env = _env()                       # penalties off: isolate action cost
+    env.reset(seed=3)
+    agents = env.possible_agents
+    acts = {a: np.zeros(2, dtype=np.float32) for a in agents}
+    acts[agents[0]] = np.array([1.0, 1.0], dtype=np.float32)   # full effort
+    _, rew, _, _, _ = env.step(acts)
+
+    # The mover pays 0.01 * |a|^2 = 0.01 * 2 = 0.02; the others pay nothing.
+    assert np.isclose(rew[agents[1]] - rew[agents[0]], 0.02, atol=1e-6)
+    idle = [rew[a] for a in agents[1:]]
+    assert all(abs(v - idle[0]) < 1e-9 for v in idle), (
+        "idle agents must be unaffected by a teammate's manoeuvring")
+
+
+def test_action_cost_gradient_wrt_own_action_is_unchanged():
+    """The whole justification for the split: d/da_i of the teammates'
+    terms is 0, so moving to a per-agent cost is variance reduction, NOT a
+    change of objective.  Numerically, d(reward_i)/d(a_i) must still equal
+    the analytic -0.02 * a_i."""
+    env = _env()
+    env.reset(seed=3)
+    agents = env.possible_agents
+    a0, h = 0.6, 1e-4
+
+    def r0(x):
+        e = _env()
+        e.reset(seed=3)
+        acts = {a: np.zeros(2, dtype=np.float32) for a in agents}
+        acts[agents[0]] = np.array([x, 0.0], dtype=np.float32)
+        return e.step(acts)[1][agents[0]]
+
+    numeric = (r0(a0 + h) - r0(a0 - h)) / (2 * h)
+    assert np.isclose(numeric, -0.02 * a0, atol=1e-3), (
+        f"own-action gradient changed: {numeric} vs {-0.02 * a0}")
 
 
 def test_blue_blue_crash_penalises_only_offenders():
@@ -231,9 +274,11 @@ def test_vec_env_reward_is_per_agent_and_stage1_collapse_matches():
     ve.reset(seed=0)
     _, reward_np, _, _ = ve.step(np.zeros((4, 3, 2), dtype=np.float32))
     assert reward_np.shape == (4, 3)      # (n_envs, n_agents)
-    # Stage 1 (shared reward) collapses to per-env via column 0; since
-    # this env has crash penalties OFF, every agent's reward is equal,
-    # so the collapse loses nothing.
-    collapsed = reward_np[:, 0]
+    # Stage 1 is a shared-reward learner and collapses to a per-env scalar
+    # with the MEAN over agents (column 0 would be one agent's reward, not
+    # the team's, now that control effort is individual).  Actions are zero
+    # here and penalties are off, so every agent is still equal and the
+    # collapse is exact either way.
+    collapsed = reward_np.mean(axis=1)
     assert collapsed.shape == (4,)
     assert np.allclose(reward_np, reward_np[:, [0]])
