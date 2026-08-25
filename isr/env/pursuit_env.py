@@ -2239,7 +2239,20 @@ class PursuitEnv(ParallelEnv):
                 if peaks_conf[i] <= 0.0:
                     continue
                 track_pos[slot]  = peaks_pos[i]
-                track_conf[slot] = peaks_conf[i]
+                # Memory confidence is scaled into [0, track_conf_min) so a
+                # LIVE track (which floors at track_conf_min) always
+                # outranks a remembered one.  Both numbers land in the same
+                # feature slot AND gate the GNN messages via edge_vis, but
+                # they answer different questions: live conf is an SNR /
+                # accuracy proxy, peak conf is P(target in this cell).
+                # Measured, the gap is real — live tracks sit at ~1.8 m
+                # position error, memory peaks at ~19-40 m even when their
+                # raw conf reads >0.9 — so without this an unrescaled peak
+                # would out-shout a live contact.  Within-path ordering is
+                # preserved (peak conf does track its own error), and at
+                # track_conf_min = 1.0 this reduces to the old behaviour
+                # exactly (live 1.0, memory = raw peak conf).
+                track_conf[slot] = peaks_conf[i] * self.track_conf_min
                 track_red[slot]  = -1        # memory: never measured
                 slot += 1                    # vel/vcov stay at the prior
 
@@ -2474,7 +2487,8 @@ class PursuitEnv(ParallelEnv):
                 if peaks_conf[i] <= 0.0:
                     continue
                 obs_pos[slot]  = peaks_pos[i]
-                obs_conf[slot] = peaks_conf[i]     # memory track: vel stays 0
+                # Scaled below the live floor — see _build_enemy_tracks.
+                obs_conf[slot] = peaks_conf[i] * self.track_conf_min
                 obs_r[slot]    = radius_prior      # command prior (unknown exact)
                 slot += 1              # obs_idx -1, vel/vcov stay at prior
 

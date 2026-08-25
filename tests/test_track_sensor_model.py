@@ -327,3 +327,54 @@ def test_velocity_covariance_reports_what_is_known():
     assert min(c1[0], c1[1]) < 0.05 and max(c1[0], c1[1]) > 0.9
     # 2 non-collinear -> both directions collapse.
     assert c2[0] < 0.05 and c2[1] < 0.05
+
+
+def test_memory_conf_never_outranks_a_live_track():
+    """A LIVE radar track must always outrank a remembered one.
+
+    Both confidences land in the same feature slot AND gate the GNN
+    messages through edge_vis, but they answer different questions: live
+    conf is an SNR/accuracy proxy (floors at track_conf_min), peak conf is
+    P(target in this cell) and can saturate near 1.0.  Before the fix a
+    stale peak reading >0.9 out-shouted a live contact at 0.6 while being
+    ~10x worse positionally, so memory conf is scaled into
+    [0, track_conf_min).
+    """
+    env = PursuitEnv(
+        n_blue=2, n_red=1, n_obstacles=0, arena_size=130.0, max_steps=60,
+        capture_radius=3.0, sensor_radius=40.0, use_belief_maps=True,
+        sensor_pos_noise_std=0.0, track_conf_min=0.5, track_detection=False,
+        red_policy=stationary_red, seed=0)
+    env.reset(seed=0)
+    # Saturate the belief at the red's cell, then hide it from every blue so
+    # it must come back as a MEMORY track with maximal raw peak confidence.
+    env._red_pos[0] = np.array([65.0, 65.0], dtype=np.float32)
+    env._blue_pos[:] = np.array([5.0, 5.0], dtype=np.float32)
+    env._belief_maps[0] = -env.belief_clip
+    cs = env.belief_cell_size
+    env._belief_maps[0, int(65.0 / cs), int(65.0 / cs)] = env.belief_clip
+
+    _p, conf, red, _v, _c = env._build_enemy_tracks()
+    assert red[0] == -1, "should be a memory track"
+    assert 0.0 < conf[0] < env.track_conf_min, (
+        f"saturated memory peak {conf[0]} must stay below the live floor "
+        f"{env.track_conf_min}")
+
+
+def test_memory_conf_scaling_is_identity_at_conf_min_one():
+    """track_conf_min = 1.0 reproduces the pre-fix behaviour exactly:
+    live pinned at 1.0, memory = the raw peak confidence."""
+    env = PursuitEnv(
+        n_blue=2, n_red=1, n_obstacles=0, arena_size=130.0, max_steps=60,
+        capture_radius=3.0, sensor_radius=40.0, use_belief_maps=True,
+        sensor_pos_noise_std=0.0, track_conf_min=1.0, track_detection=False,
+        red_policy=stationary_red, seed=0)
+    env.reset(seed=0)
+    env._red_pos[0] = np.array([65.0, 65.0], dtype=np.float32)
+    env._blue_pos[:] = np.array([5.0, 5.0], dtype=np.float32)
+    env._belief_maps[0] = -env.belief_clip
+    cs = env.belief_cell_size
+    env._belief_maps[0, int(65.0 / cs), int(65.0 / cs)] = env.belief_clip
+    _p, conf, red, _v, _c = env._build_enemy_tracks()
+    assert red[0] == -1
+    assert conf[0] > 0.99, "unscaled saturated peak should stay near 1.0"
