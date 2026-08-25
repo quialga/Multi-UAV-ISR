@@ -13,6 +13,44 @@ from isr.configs.stage3_default import STAGE3_DEFAULTS
 STAGE4_DEFAULTS = {
     **STAGE3_DEFAULTS,
 
+    # ----- Arena scale-up (2026-08) --------------------------------------
+    # Motivation: at L=130 with R=40 and 5 blues the team's SENSOR COVERAGE
+    #     C = n_blue * pi * R^2 / L^2 = 1.49
+    # exceeds the arena — the team can blanket 149% of it, so search is
+    # trivial whenever they spread out and the belief map barely matters.
+    # (The measured 34% in-range fraction was a COORDINATION shortfall, not
+    # a sensor-reach limit.)  Scaling the arena to L=200 puts coverage at
+    # 0.63, making search a real problem and the memory/belief path the
+    # dominant information source.
+    #
+    # Why not just shrink sensor_radius (free, no extra compute)?  Because
+    # velocity fusion (§17) needs REDUNDANT coverage — two blues seeing the
+    # same target.  Blue spacing ~ L/sqrt(n_blue) vs 2R:
+    #     current   58 m vs 80 m -> overlap (18.7% multi-detector, measured)
+    #     R=23      58 m vs 46 m -> no overlap, fusion would collapse to
+    #                               radial-only forever
+    # Redundant coverage (for fusion) trades against efficient search
+    # coverage; L=200/R=40 keeps both viable.
+    #
+    # Speeds are deliberately UNCHANGED (blue 1.5 / red 1.0).  The RATIO is
+    # the task: pursuit/episode = L/(v_b - v_r)/max_steps stays ~1.3, i.e. a
+    # stern chase from max separation still does NOT fit in an episode, so
+    # cornering remains mandatory.  What does shift is the endgame share
+    # (37% -> 25% of the episode), which is exactly the intent: more of each
+    # episode spent searching and tracking.
+    #
+    # Compute scales ~O(L^3) (grid ops L^2, episode length L): ~3.6x.
+    #
+    # These four override STAGE1/STAGE3 for Stage 4 ONLY — the earlier
+    # stages keep their validated 130 m / 200-step setup.
+    "arena_size":     200.0,   # was 130 -> coverage 1.49 -> 0.63
+    "max_steps":      300,     # ~2.3 arena crossings, as at L=130
+    "rollout_steps":  320,     # >= max_steps: whole episodes per rollout
+    # step_cost * max_steps was 0.05*200 = 10 against a catch reward of 30.
+    # Holding that ratio at max_steps=300 needs 0.033; leaving it at 0.05
+    # would silently raise time pressure by half.
+    "step_cost":      0.033,
+
     # ----- Belief map (mission-command Bayesian tracker) -----------------
     # ONE belief map maintained at the MISSION COMMAND layer -- an
     # environment-level latent used for target tracking and evaluation,
@@ -23,11 +61,14 @@ STAGE4_DEFAULTS = {
     # The POLICY never sees the raw grid: the env extracts top-K peaks
     # per channel and reconstructs the typed GNN graph (rb_edges from
     # channel 0 = P(enemy); ob_edges from channel 1 = P(obstacle)).
-    # No CNN.  Grid at 26x26 (5 m cells): the earlier 2.5 m refinement
-    # was chasing a convergence problem that turned out to be
+    # No CNN.  Grid holds 5 m cells (40x40 at L=200): the earlier 2.5 m
+    # refinement was chasing a convergence problem that turned out to be
     # architectural, not resolution.
     "use_belief_maps":     True,
-    "belief_grid_size":    26,     # H = W (arena_size / cell_size = 130 / 5)
+    # H = W = arena_size / cell_size = 200 / 5.  Scaling this WITH the
+    # arena is essential: leaving it at 26 would give 7.7 m cells and make
+    # the motion-vs-resolution mismatch in backlog §20 materially worse.
+    "belief_grid_size":    40,
     # 2 channels: {P(enemy) Bayesian, P(obstacle) Bayesian}.  Ally/self
     # overlays are gone — those positions are precise and already flow
     # through the graph (blue_features / bb_edges).
@@ -46,10 +87,16 @@ STAGE4_DEFAULTS = {
     # CALIBRATED to red kinematics (v_max 1 m/s, dt 1 s, cell 5 m):
     # a red crosses at most ~0.2-0.28 cells/step, so p_move 0.2; the
     # original 0.4 implied ~2 m/s targets and made unobserved tracks
-    # go mushy within 3-4 steps.  decay 0.99 (confidence half-life ~69
-    # steps) suits 350-step episodes; 0.97 (~23 steps) was too
-    # forgetful.
-    "enemy_belief_decay":     0.99,
+    # go mushy within 3-4 steps.  (NOTE: p_move 0.2 injects 6x the
+    # physically admissible variance per step and grows as sqrt(t) rather
+    # than t -- see backlog 20; it is kept because no fixed kernel can do
+    # better at this resolution.)
+    # Half-life ln2/-ln(gamma): 0.99 gives ~69 steps, tuned against the
+    # old 87-step arena crossing.  At L=200 the crossing is 133 steps, so
+    # the half-life should be ~106 -> gamma = 0.5^(1/106).  Left at 0.99,
+    # tracks would fade faster than the arena timescale, making the belief
+    # map LESS useful exactly where the scale-up is meant to make it more.
+    "enemy_belief_decay":     0.9935,
     "enemy_belief_diffusion": 0.2,
 
     # Live-sensor position accuracy (m) for VISIBLE targets: a blue
@@ -97,7 +144,10 @@ STAGE4_DEFAULTS = {
     "ray_step_size":       2.5,
 
     # ----- Obstacles -----------------------------------------------------
-    "n_obstacles":            4,
+    # Held at the previous ~7% areal density: n*pi*r_bar^2/L^2 with
+    # r_bar = 10 m gives 9 obstacles at L=200 (was 4 at L=130).  Radii
+    # are physical and unchanged.
+    "n_obstacles":            9,
     "obstacle_radius_min":    5.0,
     "obstacle_radius_max":    15.0,
     "obstacle_spawn_clearance": 10.0,

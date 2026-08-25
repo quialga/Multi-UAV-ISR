@@ -350,4 +350,14 @@ def test_config_exposes_reward_shape():
     for k, v in (("catch_reward", 10.0), ("step_cost", 0.05),
                  ("uncaught_penalty", 5.0), ("action_cost_coef", 0.01)):
         assert STAGE1_DEFAULTS[k] == v
-        assert STAGE4_DEFAULTS[k] == v      # inherited
+    # Stage 4 inherits all but step_cost, which it deliberately overrides as
+    # part of the arena scale-up: step_cost * max_steps must stay ~1/3 of the
+    # available catch reward, so the longer episode gets a smaller per-step
+    # cost (0.033 * 300 = 9.9, matching the old 0.05 * 200 = 10).
+    for k in ("catch_reward", "uncaught_penalty", "action_cost_coef"):
+        assert STAGE4_DEFAULTS[k] == STAGE1_DEFAULTS[k]
+    assert STAGE4_DEFAULTS["step_cost"] == 0.033
+    ratio = STAGE4_DEFAULTS["step_cost"] * STAGE4_DEFAULTS["max_steps"]
+    old   = STAGE1_DEFAULTS["step_cost"] * STAGE1_DEFAULTS["max_steps"]
+    assert abs(ratio - old) < 0.5, (
+        f"time-pressure share drifted: {ratio} vs {old}")
