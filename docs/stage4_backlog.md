@@ -465,7 +465,17 @@ convolution) was added alongside as the second half of the Bayesian
 predict step; that was NOT in this backlog item, it emerged during
 Phase A design.  See `stage4_results.md` for both.
 
-## 12. Time-since-last-update channel  **[SUBSUMED by §11]**
+## 12. Time-since-last-update channel  **[REVIVED — see §20]**
+
+> **Un-subsumed (2026-08).**  This was closed as "decay already gives the
+> same signal".  True for CONFIDENCE, but not for the GROWTH LAW of
+> positional uncertainty.  A repeated fixed convolution spreads as √t by
+> the central limit theorem, whatever its weights; a target moving at
+> constant speed sweeps a reachable set growing as t.  Getting that right
+> needs the spread rate to depend on time-since-observation, i.e. a
+> per-cell age.  See §20 for the measurements.  The reasoning below is
+> still correct about confidence — it answers a different question.
+
 
 The "age" channel is no longer needed: Phase A's decay already
 provides the same functional signal in compressed form — an
@@ -985,6 +995,123 @@ predates the obstacle-radius node feature, so loading it now reinitialises
 encoder is RANDOM and the policy scores far below its logged 2.45/3.  Use
 the training-log det evals, or a checkpoint trained after the radius
 change, rather than re-evaluating that file.
+
+---
+
+## 20. Belief-map motion model: why the isotropic kernel is wrong
+
+**Investigation, 2026-08.**  Prompted by the proposal to replace the
+isotropic diffusion in `_predict_enemy_belief` with a velocity-conditioned
+kernel `b_{t+1}(x') = sum_x P(x'|x, v_k, a_max) b_t(x)`, using the fused
+velocity now available from §17.  The idea is sound in principle;
+measuring it showed why it does not pay HERE, and what the real defect is.
+Recorded in full so neither is re-proposed without the numbers.
+
+### Why velocity-conditioning does NOT pay (three independent reasons)
+
+1. **One-step reachability is sub-cell.**  With `cell = 5 m`, `dt = 1`,
+   red `v_max = 1`, `a_max = 1`: per-step displacement `v*dt = 1 m = 0.20
+   cells`; accel-induced spread `0.5*a*dt^2 = 0.5 m = 0.10 cells`.  ALL of
+   one step of true motion is sub-cell.  Building the kernel exactly as
+   proposed (sweep 16 accel directions x magnitudes 0/25/50/75/100%,
+   propagate the kinematics, splat bilinearly) gives `0.775` at centre and
+   `0.194` at +1 cell — the acceleration sweep cannot express itself, so
+   the kernel is almost pure translation.
+2. **Iterating a one-step kernel with frozen `v` IS ballistic
+   extrapolation.**  The formula is right for one step, but repeated
+   application reuses the stale `v` and never learns the target turned.
+   Measured: the reachability kernel and a plain ballistic shift produce
+   *identical* errors.
+3. **The reds manoeuvre far too hard for it.**  Measured heading change of
+   `run_from_nearest_uav` (n=2536): **median 0.315 rad/step**, p75 0.844,
+   p90 1.377; 64% of steps turn more than 0.15 rad.  Momentum decorrelates
+   in ~3 steps ~ 0.6 cells.
+
+   Belief-peak error (m) after 30 unobserved steps:
+
+   | turn (rad/step) | isotropic | velocity-conditioned |
+   |---|---|---|
+   | 0.00 (straight) | 30.0 | **0.0** |
+   | 0.05 | 27.3 | 21.8 |
+   | 0.15 | 10.4 | **37.9** |
+   | 0.315 (measured median) | 6.4 | **31.7** |
+
+   A large win for straight-runners; a large LOSS at the manoeuvre rate
+   these reds actually fly.
+
+*Corollary worth its own item:* a median 0.315 rad/step heading change is
+arguably unphysical for a vehicle.  `run_from_nearest_uav` emits a unit
+acceleration that re-aims instantly, with no TURN-RATE LIMIT, so the red
+pivots like a point mass — the same class of scripted-adversary artifact
+as the wall-pinning already fixed.  A turn-rate limit would make the task
+more honest AND make velocity prediction valuable; the two changes are
+coupled and neither is worth doing alone.
+
+### The real defect: the growth law is wrong in BOTH directions
+
+From the actual kernel weights (4 orthogonal at 5 m x 0.04, 4 diagonal at
+7.07 m x 0.01):
+
+```
+E[dx]   = 0
+Var[dx] = 4(0.04)(25) + 4(0.01)(50) = 6 m^2   ->  sigma = 2.45 m / step
+```
+
+True one-step motion is a 1 m displacement in some direction: variance
+**1 m^2**.  The kernel injects **6x the physically admissible variance per
+step** — mass teleports a full 5 m cell when the target can only slide
+1 m.  (The MEAN is defensible: 20% x 5 m = 1 m of expected drift.  The
+second moment is what is wrong.)
+
+Compounding — kernel variance `6t` vs ballistic reachable `t^2`:
+
+| staleness | behaviour |
+|---|---|
+| t < 6 steps | **over**-spreads (spurious cell-jump variance) |
+| t > 6 steps | **under**-spreads (sqrt(t) cannot keep up with a moving target) |
+
+Measured RMS spread: 2.45 m at t=1 (true 1 m), 13.4 m at t=30 (true
+reachable 30 m) — an exact `2.45*sqrt(t)` fit.  The long-horizon half
+explains the measured memory-track errors (19-40 m): the belief peak is
+*tight and wrong* rather than honestly broad.
+
+### What actually fixes it
+
+No kernel does.  The defect is a **resolution mismatch** — a 5 m grid
+cannot represent 1 m/step motion, and by the CLT ANY iterated fixed
+convolution gives sqrt(t), never t.  Options:
+
+1. **Finer grid** (~1-2 m cells) — 6-25x compute on the belief update,
+   already the env hot path.
+2. **Sub-cell state** — particles / Gaussian mixtures carrying `(x, v)`
+   (particle filter, DOGMa).
+3. **Take tracked targets out of the grid** — per-target Kalman coasting,
+   i.e. **§18**.
+
+**(3) is the architecturally correct answer, and it reframes §18.**  The
+division of labour should be:
+
+* the **grid's** job is COVERAGE — "where have I not looked" — which is
+  inherently coarse, and where sqrt(t) growth is harmless;
+* tracking a SPECIFIC target's position is the **track layer's** job, and
+  that layer already carries position, fused velocity, and its covariance
+  (§17).  It has exactly the state the grid is missing.
+
+The belief map is not failing at its job; it is being asked to do the
+track layer's job.  That is why memory tracks read 19-40 m while live
+tracks read 1.8 m.  §18 is therefore not a nice-to-have for missed
+detections — it is the structurally correct home for target motion
+prediction.
+
+**Successors:** §18 (per-target coasting — primary), §12 (per-cell age,
+if the grid itself must carry an honest uncertainty growth law), and the
+red turn-rate limit above.  §15b (learned belief kernel) is subsumed: a
+learned kernel is still a fixed convolution and inherits the same sqrt(t)
+ceiling.
+
+**Sequencing:** all of these are MEASURABLE improvements, not corrections,
+so they belong AFTER the from-scratch baseline, compared against it — not
+folded into it.
 
 ---
 
