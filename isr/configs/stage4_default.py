@@ -13,24 +13,29 @@ from isr.configs.stage3_default import STAGE3_DEFAULTS
 STAGE4_DEFAULTS = {
     **STAGE3_DEFAULTS,
 
-    # ----- Arena scale-up (2026-08) --------------------------------------
+    # ----- Arena scale-up + team size (2026-08) ---------------------------
     # Motivation: at L=130 with R=40 and 5 blues the team's SENSOR COVERAGE
     #     C = n_blue * pi * R^2 / L^2 = 1.49
     # exceeds the arena — the team can blanket 149% of it, so search is
     # trivial whenever they spread out and the belief map barely matters.
     # (The measured 34% in-range fraction was a COORDINATION shortfall, not
-    # a sensor-reach limit.)  Scaling the arena to L=200 puts coverage at
-    # 0.63, making search a real problem and the memory/belief path the
-    # dominant information source.
+    # a sensor-reach limit.)  L=200 with 7 blues puts coverage at 0.88 and
+    # the measured memory-track share at ~92%, so the belief/memory path
+    # becomes the dominant information source.
     #
     # Why not just shrink sensor_radius (free, no extra compute)?  Because
     # velocity fusion (§17) needs REDUNDANT coverage — two blues seeing the
-    # same target.  Blue spacing ~ L/sqrt(n_blue) vs 2R:
-    #     current   58 m vs 80 m -> overlap (18.7% multi-detector, measured)
-    #     R=23      58 m vs 46 m -> no overlap, fusion would collapse to
-    #                               radial-only forever
-    # Redundant coverage (for fusion) trades against efficient search
-    # coverage; L=200/R=40 keeps both viable.
+    # same target — and the fusion rate tracks blue-spacing/2R closely:
+    #     L=130 nb=5  spacing/2R 0.73 -> 8.1% of observations fused
+    #     L=200 nb=5  spacing/2R 1.12 -> 0.2%   (fusion effectively dead)
+    #     L=200 nb=7  spacing/2R 0.94 -> 1.7%
+    #     L=200 nb=8  spacing/2R 0.88 -> 5.1%
+    # Search difficulty and fusion are THE SAME QUANTITY with opposite
+    # signs: you cannot have low coverage (hard search) and high overlap
+    # (fusion) at once.  nb=7 is the chosen compromise — search stays hard
+    # (~92% memory) while fusion stays off the floor.  A trained team can do
+    # better than these random-blue numbers by deliberately pairing up when
+    # it wants a velocity fix; that choice is now a real strategic option.
     #
     # Speeds are deliberately UNCHANGED (blue 1.5 / red 1.0).  The RATIO is
     # the task: pursuit/episode = L/(v_b - v_r)/max_steps stays ~1.3, i.e. a
@@ -43,7 +48,17 @@ STAGE4_DEFAULTS = {
     #
     # These four override STAGE1/STAGE3 for Stage 4 ONLY — the earlier
     # stages keep their validated 130 m / 200-step setup.
-    "arena_size":     200.0,   # was 130 -> coverage 1.49 -> 0.63
+    "arena_size":     200.0,   # was 130; coverage 1.49 -> 0.88 at nb=7
+    # A bigger arena needs more UAVs to patrol it.  nb=7 also keeps
+    # blues-per-red at 1.75 with nr=4 (better than the old 5/3 = 1.67),
+    # which matters because cornering one fleeing red takes 2-3 blues.
+    "n_blue":         7,       # was 5 (STAGE3)
+    # nr=4 buys a richer early SEARCH phase and the most fusion events
+    # per episode (2.2 vs 1.8 at nr=3).  Note it does NOT make the
+    # belief map progressively more important as reds are caught: the
+    # memory share measured flat at ~90% for nr = 4/3/2/1, because it is
+    # set by blue coverage geometry, not by how many targets remain.
+    "n_red":          4,       # was 3 (STAGE3)
     "max_steps":      300,     # ~2.3 arena crossings, as at L=130
     "rollout_steps":  320,     # >= max_steps: whole episodes per rollout
     # step_cost * max_steps was 0.05*200 = 10 against a catch reward of 30.
