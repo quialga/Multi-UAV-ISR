@@ -93,16 +93,36 @@ def test_moving_obstacle_grid_tracks_motion():
 # ---------------------------------------------------------------------------
 
 def test_seen_moving_obstacle_track_carries_velocity():
+    """Velocity is command-FUSED from per-sensor RADIAL measurements: one
+    detector recovers only the component along its line of sight; two
+    non-collinear detectors recover the full 2-D vector."""
     env = _env(moving_obstacle_fraction=1.0, obstacle_speed=4.0,
                sensor_pos_noise_std=0.0)
     env.reset(seed=4)
     mov = 0
-    # Park a blue on top of the moving obstacle so it's a live track.
-    env._blue_pos[0] = env._obstacle_pos[mov].copy()
-    pos, vel, conf, _r, _i = env._build_obstacle_tracks()
-    i = int(np.linalg.norm(pos - env._obstacle_pos[mov], axis=1).argmin())
+    o = env._obstacle_pos[mov].copy()
+    v_true = env._obstacle_vel[mov].copy()
+    r0 = float(env._obstacle_r[mov])
+
+    # Exactly ONE detector, offset along +x (never on the centre, which is a
+    # degenerate line of sight); park every other blue far away.
+    env._blue_pos[:] = np.array([2.0, 2.0], dtype=np.float32)
+    env._blue_pos[0] = o + np.array([r0 + 8.0, 0.0], dtype=np.float32)
+    pos, vel, conf, _r, _i, _ovc = env._build_obstacle_tracks()
+    i = int(np.linalg.norm(pos - o, axis=1).argmin())
     assert conf[i] == 1.0
-    assert np.allclose(vel[i], env._obstacle_vel[mov])   # own-radar Doppler
+    d = o - env._blue_pos[0]
+    u = d / np.linalg.norm(d)
+    expect = float(v_true @ u) * u          # tangential is unobserved
+    assert np.allclose(vel[i], expect, atol=5e-2), (
+        f"1 detector should give the radial projection: {vel[i]} vs {expect}")
+
+    # Add a second detector at 90 deg -> full vector recoverable.
+    env._blue_pos[1] = o + np.array([0.0, r0 + 8.0], dtype=np.float32)
+    pos2, vel2, _c2, _r2, _i2, _o2 = env._build_obstacle_tracks()
+    j = int(np.linalg.norm(pos2 - o, axis=1).argmin())
+    assert np.allclose(vel2[j], v_true, atol=5e-2), (
+        f"two non-collinear radials should determine v: {vel2[j]} vs {v_true}")
 
 
 def test_unseen_obstacle_track_has_zero_velocity():
@@ -110,7 +130,7 @@ def test_unseen_obstacle_track_has_zero_velocity():
     env.reset(seed=4)
     env._blue_pos[:] = np.array([1.0, 1.0])   # far from every obstacle
     # (obstacles are spawned with wall clearance, so none sit at the corner)
-    _pos, vel, _conf, _r, _i = env._build_obstacle_tracks()
+    _pos, vel, _conf, _r, _i, _ovc = env._build_obstacle_tracks()
     assert np.allclose(vel, 0.0)              # memory tracks carry no Doppler
 
 

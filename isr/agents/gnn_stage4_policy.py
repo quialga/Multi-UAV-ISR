@@ -150,8 +150,8 @@ class GNNEncoder(nn.Module):
         n_red:          int,
         n_obs:          int,
         blue_feat_dim:  int = 8,
-        red_feat_dim:   int = 1,
-        obs_feat_dim:   int = 2,   # [placed/conf, radius/arena_size]
+        red_feat_dim:   int = 4,   # [conf, Sxx, Syy, Sxy]  (velocity cov)
+        obs_feat_dim:   int = 5,   # [placed/conf, radius/L, Sxx, Syy, Sxy]
         edge_feat_dim:  int = 7,
         d_hidden:       int = 64,
         n_msg_rounds:   int = 2,
@@ -288,8 +288,8 @@ class GNNStage4Policy(nn.Module):
         n_red:             int,
         n_obs:             int   = 0,
         blue_feat_dim:     int   = 8,
-        red_feat_dim:      int   = 1,
-        obs_feat_dim:      int   = 2,   # [placed/conf, radius/arena_size]
+        red_feat_dim:      int   = 4,   # [conf, Sxx, Syy, Sxy]  (velocity cov)
+        obs_feat_dim:      int   = 5,   # [placed/conf, radius/L, Sxx, Syy, Sxy]
         edge_feat_dim:     int   = 7,
         action_dim:        int   = 2,
         d_hidden:          int   = 64,

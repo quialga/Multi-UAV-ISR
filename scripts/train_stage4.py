@@ -506,8 +506,8 @@ def main() -> None:
         n_red             = vec_env.n_red,
         n_obs             = vec_env.n_obstacles,
         blue_feat_dim     = vec_env.blue_feat_dim,
-        red_feat_dim      = 1,
-        obs_feat_dim      = 2,   # [placed/conf, radius/arena_size]
+        red_feat_dim      = 4,   # [conf, Sxx, Syy, Sxy]  (velocity cov)
+        obs_feat_dim      = 5,   # [placed/conf, radius/L, Sxx, Syy, Sxy]
         edge_feat_dim     = vec_env.edge_feat_dim,
         action_dim        = action_dim,
         d_hidden          = args.d_hidden,

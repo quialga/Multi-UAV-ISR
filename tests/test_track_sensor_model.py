@@ -73,7 +73,7 @@ def test_no_live_track_through_an_obstacle():
     env = _hidden_geometry(_env(track_detection=False))   # isolate occlusion
     assert bool(env._rays_occluded_by_obstacles(
         env._blue_pos[0], env._red_pos[0][None, :])[0])
-    _pos, conf, red = env._build_enemy_tracks()
+    _pos, conf, red, _tv, _tc = env._build_enemy_tracks()
     assert red[0] == -1, "occluded red still produced a LIVE track"
     assert conf[0] < 1.0, "occluded red reported full confidence"
 
@@ -81,14 +81,14 @@ def test_no_live_track_through_an_obstacle():
 def test_pre_fix_sees_through_walls():
     """Escape hatch: the old range-only behaviour is reproducible."""
     env = _hidden_geometry(_env(track_occlusion=False, track_detection=False))
-    _pos, conf, red = env._build_enemy_tracks()
+    _pos, conf, red, _tv, _tc = env._build_enemy_tracks()
     assert red[0] == 0 and conf[0] == 1.0
 
 
 def test_clear_line_of_sight_still_tracks():
     """The occlusion gate must not suppress a red in the open."""
     env = _clear_geometry(_env(track_detection=False))
-    _pos, conf, red = env._build_enemy_tracks()
+    _pos, conf, red, _tv, _tc = env._build_enemy_tracks()
     assert red[0] == 0 and conf[0] > 0.0
 
 
@@ -111,7 +111,7 @@ def test_detection_miss_falls_back_to_memory_not_truth():
     env = _clear_geometry(_env(p_TP=0.5))
     saw_miss = False
     for _ in range(200):
-        _pos, _conf, red = env._build_enemy_tracks()
+        _pos, _conf, red, _tv, _tc = env._build_enemy_tracks()
         if red[0] == -1:
             saw_miss = True
             break
@@ -261,11 +261,12 @@ def test_full_step_runs_with_realistic_sensor():
     assert np.all(np.isfinite(obs["red_features"]))
 
 
-def test_obstacle_velocity_is_per_blue_not_shared():
-    """Obstacle Doppler must follow the SAME first-person rule as enemy
-    Doppler: only a blue that actually detected the obstacle reports its
-    velocity.  Previously the fused track velocity was copied onto EVERY
-    blue's ob edge, so a blue with no detection still 'measured' the sweep.
+def test_velocity_is_command_fused_and_shared():
+    """Velocity is now a COMMAND-LAYER product, shared with every blue
+    exactly like position — because it is genuinely derivable: each radar
+    measures only the radial component, but two non-collinear radials
+    determine the full 2-D vector.  What differs per blue is nothing; what
+    varies is how much is KNOWN, which travels in the covariance feature.
     """
     env = PursuitEnv(
         n_blue=2, n_red=1, n_obstacles=1, arena_size=130.0, max_steps=60,
@@ -278,103 +279,51 @@ def test_obstacle_velocity_is_per_blue_not_shared():
     )
     env.reset(seed=5)
     o = env._obstacle_pos[0].copy()
-    env._red_pos[0] = np.array([5.0, 5.0], dtype=np.float32)
     r0 = float(env._obstacle_r[0])
-    # Clearly OUTSIDE the disk (radii are sampled in [5, 15]) but well
-    # inside sensor range, so this blue genuinely detects it.
-    env._blue_pos[0] = o + np.array([r0 + 8.0, 0.0], dtype=np.float32)
-    env._blue_pos[1] = np.array([125.0, 125.0], dtype=np.float32)    # far away
+    env._red_pos[0] = np.array([5.0, 5.0], dtype=np.float32)
+    env._blue_pos[0] = o + np.array([r0 + 8.0, 0.0], dtype=np.float32)  # detects
+    env._blue_pos[1] = np.array([125.0, 125.0], dtype=np.float32)       # far
 
     obs = env.structured_belief_observation()
     assert env._last_obs_detect is not None
     assert bool(env._last_obs_detect[0, 0]), "near blue should detect it"
     assert not bool(env._last_obs_detect[1, 0]), "far blue should not"
 
-    # ob edges are (s outer, b inner) -> slot 0 gives edges [blue0, blue1].
+    # ob edges are (s outer, b inner) -> slot 0 gives [blue0, blue1].
     ob = obs["ob_edge_features"]
-    v_near, v_far = ob[0][2:4], ob[1][2:4]
-    assert not np.allclose(v_near, 0.0), "detecting blue lost its Doppler"
-    assert np.allclose(v_far, 0.0), (
-        "non-detecting blue received obstacle velocity it never measured")
+    # Both blues carry the SAME fused object velocity (rel_vel differs only
+    # by each blue's own motion, and both are stationary here).
+    assert np.allclose(ob[0][2:4], ob[1][2:4], atol=1e-6), (
+        "fused velocity is a shared command product")
 
 
-# --------------------------------------------------------------------- #
-#  Per-channel sensor quality (backlog §8)
-# --------------------------------------------------------------------- #
+def test_velocity_covariance_reports_what_is_known():
+    """The covariance is the informative half: with ONE detector it says the
+    tangential direction is unknown (~prior); with two non-collinear ones it
+    collapses.  A memory track sits at the prior in both directions."""
+    def cov(n_det):
+        env = PursuitEnv(
+            n_blue=3, n_red=1, n_obstacles=0, arena_size=130.0, max_steps=60,
+            capture_radius=3.0, sensor_radius=40.0, use_belief_maps=True,
+            sensor_pos_noise_std=0.0, sensor_vel_noise_std=0.05,
+            sensor_noise_range_growth=0.0, vel_prior_std=1.0,
+            track_detection=False, red_policy=stationary_red, seed=7)
+        env.reset(seed=7)
+        tgt = np.array([65.0, 65.0], dtype=np.float32)
+        env._red_pos[0] = tgt
+        env._red_vel[0] = np.array([0.7, -0.4], dtype=np.float32)
+        env._blue_pos[:] = np.array([5.0, 5.0], dtype=np.float32)   # far
+        if n_det >= 1:
+            env._blue_pos[0] = tgt + np.array([18.0, 0.0], dtype=np.float32)
+        if n_det >= 2:
+            env._blue_pos[1] = tgt + np.array([0.0, 18.0], dtype=np.float32)
+        _p, _c, _r, _v, vcov = env._build_enemy_tracks()
+        return vcov[0]
 
-def test_per_channel_defaults_fall_back_to_the_shared_pair():
-    """Passing only the base (p_TP, p_FP) sets BOTH channels — so every
-    caller/test that predates the split is byte-preserved."""
-    env = _env(p_TP=0.7, p_FP=0.2)
-    assert env.p_TP_enemy == env.p_TP_obstacle == 0.7
-    assert env.p_FP_enemy == env.p_FP_obstacle == 0.2
-
-
-def test_per_channel_override_is_independent():
-    """The obstacle channel can be set without touching the enemy channel."""
-    env = _env(p_TP=0.85, p_FP=0.15, p_TP_obstacle=0.95, p_FP_obstacle=0.05)
-    assert env.p_TP_enemy == 0.85 and env.p_FP_enemy == 0.15
-    assert env.p_TP_obstacle == 0.95 and env.p_FP_obstacle == 0.05
-
-
-def test_live_track_detection_uses_the_matching_channel():
-    """The enemy track draw uses p_TP_enemy and the obstacle track draw uses
-    p_TP_obstacle — the whole point of the split is that the two stay
-    coherent with the belief map they share a sensor with."""
-    env = _clear_geometry(_env(p_TP=0.5, p_TP_obstacle=1.0))
-    # Enemy: ~50% of scans (p_TP_enemy inherits the base 0.5).
-    hits = sum(int(env._build_enemy_tracks()[2][0] == 0) for _ in range(2000))
-    assert abs(hits / 2000 - 0.5) < 0.05
-
-    # Obstacle: p_TP_obstacle = 1.0 -> detected on every scan.  Park a blue
-    # right beside the obstacle so range/LOS are satisfied.
-    env2 = _env(p_TP=0.5, p_TP_obstacle=1.0)
-    o = env2._obstacle_pos[0].copy()
-    r0 = float(env2._obstacle_r[0])
-    env2._blue_pos[0] = o + np.array([r0 + 6.0, 0.0], dtype=np.float32)
-    for _ in range(50):
-        assert bool(env2._build_obstacle_tracks()[4][0] >= 0), (
-            "obstacle with p_TP_obstacle=1.0 must never drop out")
-
-
-def test_higher_obstacle_p_TP_reduces_live_track_dropout():
-    """The practical payoff: raising obstacle detection cuts the live-track
-    dropout that flickers an obstacle's perceived SURFACE (what clearance
-    shaping keys on)."""
-    def dropout(p_obs):
-        env = _env(p_TP=0.85, p_TP_obstacle=p_obs)
-        o = env._obstacle_pos[0].copy()
-        r0 = float(env._obstacle_r[0])
-        env._blue_pos[0] = o + np.array([r0 + 6.0, 0.0], dtype=np.float32)
-        miss = sum(int(env._build_obstacle_tracks()[4][0] < 0)
-                   for _ in range(2000))
-        return miss / 2000
-
-    assert dropout(0.95) < dropout(0.85), "0.95 should drop out less often"
-    assert abs(dropout(0.85) - 0.15) < 0.04
-    assert abs(dropout(0.95) - 0.05) < 0.03
-
-
-def test_belief_update_uses_per_channel_log_odds():
-    """Channel 1 (obstacle) accumulates stronger evidence per detection when
-    its sensor is better, so its log-odds separate from channel 0's."""
-    env = PursuitEnv(
-        n_blue=1, n_red=1, n_obstacles=1, arena_size=130.0, max_steps=50,
-        sensor_radius=40.0, use_belief_maps=True,
-        p_TP=0.85, p_FP=0.15, p_TP_obstacle=0.99, p_FP_obstacle=0.01,
-        red_policy=stationary_red, seed=0,
-    )
-    env.reset(seed=0)
-    # A better sensor => a larger |log-odds| step per detection.
-    assert env._L_detect_ch[1] > env._L_detect_ch[0]
-    assert env._L_no_detect_ch[1] < env._L_no_detect_ch[0]
-
-
-def test_config_sets_obstacle_channel_to_095():
-    from isr.configs.stage4_default import STAGE4_DEFAULTS
-    assert STAGE4_DEFAULTS["p_TP_obstacle"] == 0.95
-    assert STAGE4_DEFAULTS["p_FP_obstacle"] == 0.05
-    # Enemy deliberately unchanged — this is a correction, not a difficulty
-    # change.
-    assert STAGE4_DEFAULTS["p_TP"] == 0.85
-    assert STAGE4_DEFAULTS["p_FP"] == 0.15
+    c0, c1, c2 = cov(0), cov(1), cov(2)
+    # 0 detectors -> the prior in both directions (normalised to 1).
+    assert np.allclose(c0[:2], 1.0, atol=1e-3)
+    # 1 detector -> one direction measured, the other still at the prior.
+    assert min(c1[0], c1[1]) < 0.05 and max(c1[0], c1[1]) > 0.9
+    # 2 non-collinear -> both directions collapse.
+    assert c2[0] < 0.05 and c2[1] < 0.05

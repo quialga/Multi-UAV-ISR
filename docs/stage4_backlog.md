@@ -776,7 +776,46 @@ numpy↔torch issue — it reads the same obstacle geometry the crash check
 already uses).  #2 reuses the caught-red inactivation path.  #3 is a
 larger PPO change.  **Start with #1.**
 
-## 17. Radial / tangential Doppler decomposition
+## 17. Radial / tangential Doppler — ✅ LANDED (as command-layer fusion)
+
+> **Shipped, but NOT as sketched below.**  The original sketch said "give
+> each blue the radial component only", which is right *per sensor* and
+> wrong *per system*: it ignores that command, receiving radials from
+> several platforms, can SOLVE for the full vector.  Two non-collinear
+> lines of sight determine the 2-D velocity —
+> `[u_1^T; u_2^T] v = [r_1; r_2]` — which is standard netted/multistatic
+> radar.  So what landed is:
+>
+> * each detecting blue measures the RADIAL component only (physical),
+>   with its own range-scaled noise;
+> * command fuses by weighted least squares with a Gaussian speed prior
+>   (ridge): `Sigma = (U^T W U + I/vel_prior_std^2)^-1`, `v = Sigma U^T W r`;
+> * the fused velocity is SHARED with every blue exactly like position —
+>   which also **resolves §13c**, since velocity is now genuinely derivable
+>   rather than withheld by fiat;
+> * the **covariance** rides along as node features `[Sxx, Syy, Sxy]`
+>   (prior-normalised), so the policy is told WHICH DIRECTION it is
+>   ignorant about — the actionable half a scalar confidence would discard.
+>
+> Three things fall out for free: `W` already weights closer detectors more
+> (`sensor_noise_range_growth`); GDOP is emergent (near-collinear baselines
+> make `U^T W U` near-singular and the tangential variance grows on its
+> own); and the rank-deficient cases (one detector, collinear detectors)
+> need no special-casing because the prior fills the unobserved direction.
+> *Verified:* predicted sd tracks empirical error (ratio 0.77-0.89 across
+> geometries); 1 detector gives sd `[0.05 radial, 1.00 tangential]`.
+> *Measured in-env:* 18.7% of active-red observations have >=2 detectors
+> (median best-pair separation 148 deg, 96% above 30 deg), 15.3% have
+> exactly one, 66% are memory tracks.
+>
+> Node dims: red `1 -> 4`, obstacle `2 -> 5`; the critic's ground-truth
+> graphs pad the covariance slots with ZERO (truth carries no uncertainty).
+> New knob `vel_prior_std` (config, 1.0 ~ fastest entity v_max).
+> See `_fuse_radial_velocity`, `tests/test_track_sensor_model.py`.
+>
+> *Original sketch below, kept for provenance.*
+
+## 17-orig. Radial / tangential Doppler decomposition (superseded)
 
 **Motivation.**  The live-track sensor model now applies `p_TP` detection,
 line-of-sight gating, range-scaled position/Doppler noise, and range-based

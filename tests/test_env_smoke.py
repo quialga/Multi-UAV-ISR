@@ -747,11 +747,11 @@ def test_stage4_v6_obs_schema_with_obstacles():
     }
     assert set(obs.keys()) == expected
     assert obs["blue_features"].shape         == (5, 8)
-    assert obs["red_features"].shape          == (env.n_red, 1)
+    assert obs["red_features"].shape          == (env.n_red, 4)   # [conf, Sxx,Syy,Sxy]
     assert obs["rb_edge_features"].shape      == (n_rb, 7)
     assert obs["rb_edge_visible"].shape       == (n_rb,)
     assert obs["true_rb_edge_features"].shape == (n_rb, 7)
-    assert obs["obstacle_features"].shape     == (env.n_obstacles, 2)  # [conf, radius]
+    assert obs["obstacle_features"].shape     == (env.n_obstacles, 5)  # [conf, radius, Sxx,Syy,Sxy]
     assert obs["ob_edge_features"].shape      == (n_ob, 7)
     assert obs["ob_edge_visible"].shape       == (n_ob,)
     assert obs["true_ob_edge_features"].shape == (n_ob, 7)
@@ -799,15 +799,17 @@ def test_stage4_v6_rb_position_comes_from_belief_when_unseen():
 
 def test_stage4_shared_position_own_doppler_velocity():
     """
-    For a LIVE (detection-seeded) track, POSITION is the ONE
-    command-layer track position delivered to every blue; the only
-    per-blue difference is VELOCITY (own-sensor Doppler when the red
-    is visible, else 0).
-    - the blue that SEES the red gets the command track + own Doppler;
-    - a blue OUT of range gets the SAME command track position but
-      ZERO velocity (no own-sensor lock -> no Doppler).
-    With sigma=0 the command track equals the true red position
-    exactly, at sub-cell precision; neither blue uses the cell peak.
+    For a LIVE (detection-seeded) track BOTH position and velocity are
+    single command-layer products delivered to every blue.
+
+    Velocity used to be per-blue own-sensor Doppler, but a fused velocity
+    is genuinely DERIVABLE at command: each radar measures only the
+    RADIAL component, and two non-collinear radials determine the full
+    2-D vector.  So here, with only blue 0 detecting, the fused estimate
+    is the RADIAL PROJECTION of the true velocity onto blue 0's line of
+    sight — the tangential part is unobserved — and BOTH blues receive
+    that same estimate.  How much is actually known travels separately,
+    in the velocity-covariance node feature.
     """
     env = _stage4_env(n_obstacles=0, sensor_pos_noise_std=0.0)
     env.reset(seed=0)
@@ -834,13 +836,18 @@ def test_stage4_shared_position_own_doppler_velocity():
     assert np.allclose(rb[e1, :2], (env._blue_pos[1] - env._red_pos[0]) / L, atol=1e-4), (
         "out-of-range blue gets the same command track position"
     )
-    # Velocity is the ONLY difference: seeing blue = Doppler, other = 0.
-    # rel_vel = blue_vel - red_vel = -red_vel (blues stationary).
-    assert np.allclose(rb[e0, 2:4], (-env._red_vel[0]) / v_max, atol=1e-4), (
-        "seeing blue should get own-sensor Doppler velocity"
+    # Velocity is now ALSO shared: one command-fused estimate for both.
+    # Only blue 0 detected, so the estimate is the RADIAL projection of the
+    # true velocity onto blue 0's line of sight.
+    d = env._red_pos[0] - env._blue_pos[0]
+    u = d / np.linalg.norm(d)
+    v_radial = float(env._red_vel[0] @ u) * u        # tangential is unobserved
+    # rel_vel = blue_vel - v_fused = -v_fused (blues stationary).
+    assert np.allclose(rb[e0, 2:4], (-v_radial) / v_max, atol=1e-3), (
+        "fused velocity should be the radial projection (1 detector)"
     )
-    assert np.allclose(rb[e1, 2:4], 0.0, atol=1e-6), (
-        "out-of-range blue has no own Doppler -> zero velocity"
+    assert np.allclose(rb[e0, 2:4], rb[e1, 2:4], atol=1e-6), (
+        "velocity is a shared command product — both blues get the same"
     )
 
 
@@ -871,7 +878,9 @@ def test_stage4_v6_obstacle_edges_static_velocity():
     env._blue_vel[:] = 0.0
     obs = env.structured_belief_observation()
     ob = obs["ob_edge_features"]             # (n_ob, 7)
-    assert np.allclose(ob[:, 2:4], 0.0), (
+    # atol: the velocity fusion solves a linear system, so a truly static
+    # obstacle comes back as ~1e-7 rather than exactly 0.
+    assert np.allclose(ob[:, 2:4], 0.0, atol=1e-5), (
         "obstacle rel_vel should be 0 when blues are stationary "
         "(object velocity is 0)"
     )
@@ -1062,7 +1071,7 @@ def test_stage4_detection_seeded_two_close_visible_reds_split():
     env._red_pos[0] = np.array([64.0, 65.0], dtype=np.float32)
     env._red_pos[1] = np.array([68.0, 65.0], dtype=np.float32)
     env._blue_pos[0] = np.array([65.0, 60.0], dtype=np.float32)
-    track_pos, track_conf, track_red = env._build_enemy_tracks()
+    track_pos, track_conf, track_red, _tv, _tc = env._build_enemy_tracks()
     live = track_red[track_red >= 0]
     assert set(live.tolist()) == {0, 1}, (
         f"two close visible reds must be two live tracks, got {track_red}"
@@ -1085,7 +1094,7 @@ def test_stage4_detection_seed_beats_belief_lag():
     env._red_pos[0]  = np.array([65.0, 65.0], dtype=np.float32)
     env._blue_pos[0] = np.array([60.0, 60.0], dtype=np.float32)   # in range
     env._belief_maps[:] = -8.0        # belief has NOT tracked red 0 yet
-    track_pos, track_conf, track_red = env._build_enemy_tracks()
+    track_pos, track_conf, track_red, _tv, _tc = env._build_enemy_tracks()
     assert track_red[0] == 0, "visible red should be a live track despite belief lag"
     assert track_conf[0] == 1.0
 
@@ -1103,7 +1112,7 @@ def test_stage4_unseen_red_is_memory_track():
         env._blue_pos[b] = np.array([10.0, 10.0], dtype=np.float32)
     env._belief_maps[:] = -5.0
     env._belief_maps[0, 22, 22] = 6.0    # memory peak
-    track_pos, track_conf, track_red = env._build_enemy_tracks()
+    track_pos, track_conf, track_red, _tv, _tc = env._build_enemy_tracks()
     assert track_red[0] == -1, "unseen red must be a memory track"
     assert track_conf[0] > 0.5
     peak = np.array([(22 + 0.5) * cs, (22 + 0.5) * cs], dtype=np.float32)
@@ -1131,7 +1140,7 @@ def test_stage4_live_track_excludes_memory_duplicate():
     env._belief_maps[:] = -5.0
     env._belief_maps[0, 13, 13] = 9.0    # strong blob at the VISIBLE red's cell
     env._belief_maps[0, 22, 22] = 5.0    # weaker blob at the unseen red
-    track_pos, track_conf, track_red = env._build_enemy_tracks()
+    track_pos, track_conf, track_red, _tv, _tc = env._build_enemy_tracks()
     # Slot 0: live red 0.  Slot 1: memory, and it must be the (22,22)
     # peak, NOT the excluded (13,13) blob.
     assert track_red[0] == 0

@@ -269,6 +269,12 @@ class PursuitEnv(ParallelEnv):
         # 0.0 (default) = range-independent noise (pre-fix).  1.0 = noise
         # doubles at max sensor range.  Applies to BOTH position and Doppler.
         sensor_noise_range_growth: float = 0.0,
+        # Gaussian speed prior used as the ridge term in the command-layer
+        # velocity fusion (see _fuse_radial_velocity).  Physically "a target
+        # cannot outrun this speed", so it should be ~the fastest entity's
+        # v_max.  It makes the fusion solvable for ANY detector geometry and
+        # supplies the honest fallback in an unobserved direction.
+        vel_prior_std:            float = 1.0,
         # ----- Crash penalties (per-agent shaped reward) ------------------
         # Both default 0.0 (off) so the shared-team-reward behaviour is
         # byte-preserved unless enabled.  When > 0, a crashing blue takes
@@ -442,6 +448,8 @@ class PursuitEnv(ParallelEnv):
         self.sensor_vel_noise_std     = float(sensor_vel_noise_std)
         self.track_conf_min           = float(track_conf_min)
         self.sensor_noise_range_growth = float(sensor_noise_range_growth)
+        self.vel_prior_std             = float(vel_prior_std)
+        assert self.vel_prior_std > 0.0
         assert self.sensor_vel_noise_std >= 0.0
         assert self.sensor_noise_range_growth >= 0.0
         assert 0.0 < self.track_conf_min <= 1.0, (
@@ -2016,6 +2024,75 @@ class PursuitEnv(ParallelEnv):
             <= self.sensor_radius
         )
 
+    def _fuse_radial_velocity(
+        self,
+        target_pos: np.ndarray,          # (2,)
+        true_vel:   np.ndarray,          # (2,)
+        blue_idx:   np.ndarray,          # (M,) indices of DETECTING blues
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Command-layer velocity fusion from per-sensor RADIAL measurements.
+
+        Physics: a Doppler radar measures only the component of a target's
+        velocity ALONG its line of sight.  The tangential component is not
+        observable from one platform.  But command receives radials from
+        several platforms, and two NON-COLLINEAR lines of sight determine
+        the full 2-D vector:
+
+            [u_1^T; u_2^T] v = [r_1; r_2]        (netted / multistatic radar)
+
+        so a fused velocity IS derivable — which is why it can be shared
+        exactly like the fused position (see backlog §13c).
+
+        Weighted least squares with a Gaussian speed prior (ridge):
+
+            Sigma = (U^T W U + I / vel_prior_std^2)^-1     W = diag(1/sigma_b^2)
+            v_hat = Sigma U^T W r
+
+        * ``W`` weights each detector by its own measurement noise, which
+          already grows with range (``_noise_scale``) — closer platforms
+          count for more, automatically.
+        * The ridge term is the prior "a target cannot outrun
+          ``vel_prior_std``".  It makes the system solvable for ANY
+          geometry (one detector, or collinear ones) with no special case,
+          and it acts only where the measurements are uninformative: with
+          two good baselines it contributes a fraction of a percent.
+        * GDOP is emergent — near-collinear baselines make ``U^T W U``
+          near-singular and the tangential variance grows on its own.
+
+        Returns ``(v_hat (2,), Sigma (2, 2))``.  With no detectors the
+        answer is the prior: zero mean, ``vel_prior_std^2`` isotropic.
+        """
+        s_prior2 = max(self.vel_prior_std, 1e-6) ** 2
+        prior_prec = np.eye(2, dtype=np.float64) / s_prior2
+        if len(blue_idx) == 0:
+            return (np.zeros(2, dtype=np.float32),
+                    (np.linalg.inv(prior_prec)).astype(np.float32))
+
+        d = target_pos[None, :] - self._blue_pos[blue_idx]      # (M, 2)
+        rng_m = np.linalg.norm(d, axis=1)
+        u = d / np.maximum(rng_m, 1e-6)[:, None]                # unit LOS
+        # Per-detector radial measurement + its own noise (range-scaled).
+        sig = np.array(
+            [max(self.sensor_vel_noise_std * self._noise_scale(float(rm)), 1e-6)
+             for rm in rng_m], dtype=np.float64)
+        r_true = u @ np.asarray(true_vel, dtype=np.float64)
+        r_meas = r_true + self._rng.normal(0.0, sig)
+
+        W = np.diag(1.0 / sig ** 2)
+        Sigma = np.linalg.inv(u.T @ W @ u + prior_prec)
+        v_hat = Sigma @ u.T @ W @ r_meas
+        return v_hat.astype(np.float32), Sigma.astype(np.float32)
+
+    @staticmethod
+    def _cov_features(Sigma: np.ndarray, s_prior2: float) -> np.ndarray:
+        """Pack a 2x2 velocity covariance into the 3 unique entries the
+        policy sees, normalised by the prior variance so they land in
+        ~[-1, 1] (1 = "no better than the prior" in that direction)."""
+        return np.array(
+            [Sigma[0, 0] / s_prior2, Sigma[1, 1] / s_prior2,
+             Sigma[0, 1] / s_prior2], dtype=np.float32)
+
     def _measured_vel(self, true_vel: np.ndarray,
                       rng_m: float = float("inf")) -> np.ndarray:
         """Own-sensor Doppler measurement = true velocity + Gaussian noise,
@@ -2073,13 +2150,20 @@ class PursuitEnv(ParallelEnv):
           -1 for memory / padding (never measured).
         """
         K = self.n_red
+        s_prior2   = max(self.vel_prior_std, 1e-6) ** 2
         track_pos  = np.zeros((K, 2), dtype=np.float32)
         track_conf = np.zeros((K,),   dtype=np.float32)
         track_red  = np.full((K,), -1, dtype=np.int32)
+        track_vel  = np.zeros((K, 2), dtype=np.float32)
+        # Velocity covariance (3 unique entries, normalised by the prior
+        # variance).  A memory/padding slot carries the PRIOR: nothing is
+        # known beyond the speed bound -> [1, 1, 0].
+        track_vcov = np.tile(np.array([1.0, 1.0, 0.0], dtype=np.float32),
+                             (K, 1))
 
         active = np.where(self._red_active)[0]
         if len(active) == 0 or self._belief_maps is None:
-            return track_pos, track_conf, track_red
+            return track_pos, track_conf, track_red, track_vel, track_vcov
 
         # Which active reds does ANY blue currently DETECT?  One detection
         # chain, same statistics as the belief map: in range -> clear line of
@@ -2131,6 +2215,12 @@ class PursuitEnv(ParallelEnv):
             track_pos[slot]  = self._measured_pos(self._red_pos[r], float(rm))
             track_conf[slot] = float(c)
             track_red[slot]  = int(r)
+            # Command-layer velocity fusion from the RADIAL measurements of
+            # every blue that detected this red (see _fuse_radial_velocity).
+            v_hat, Sig = self._fuse_radial_velocity(
+                self._red_pos[r], self._red_vel[r], np.where(detect[:, r])[0])
+            track_vel[slot]  = v_hat
+            track_vcov[slot] = self._cov_features(Sig, s_prior2)
             slot += 1
 
         # 2. Memory tracks: belief peaks for the unseen reds, excluding
@@ -2151,15 +2241,17 @@ class PursuitEnv(ParallelEnv):
                 track_pos[slot]  = peaks_pos[i]
                 track_conf[slot] = peaks_conf[i]
                 track_red[slot]  = -1        # memory: never measured
-                slot += 1
+                slot += 1                    # vel/vcov stay at the prior
 
-        return track_pos, track_conf, track_red
+        return track_pos, track_conf, track_red, track_vel, track_vcov
 
     def _enemy_graph_from_tracks(
         self,
         track_pos:  np.ndarray,   # (K, 2)
         track_conf: np.ndarray,   # (K,)
         track_red:  np.ndarray,   # (K,) int; -1 = memory / pad
+        track_vel:  np.ndarray,   # (K, 2) command-FUSED velocity
+        track_vcov: np.ndarray,   # (K, 3) its covariance (prior-normalised)
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Build the actor-side enemy node + edge features from the K
@@ -2224,29 +2316,27 @@ class PursuitEnv(ParallelEnv):
         # network track, velocity is own-sensor -- with no second,
         # inconsistent position draw.
         for s in range(K):
-            r = int(track_red[s])
             for b in range(N):
                 e = s * N + b
                 src_pos[e] = track_pos[s]
+                # VELOCITY is now the command-FUSED estimate, shared with
+                # every blue exactly like POSITION.  A single radar measures
+                # only the radial component, but two non-collinear radials
+                # determine the full 2-D vector, so a fused velocity IS
+                # derivable at command (backlog §13c).  How much is actually
+                # known travels with it in the covariance node feature.
+                src_vel[e] = track_vel[s]
                 dst_pos[e] = self._blue_pos[b]
                 dst_vel[e] = self._blue_vel[b]
                 edge_vis[e] = track_conf[s]
-                if r >= 0 and self._blue_detected_red(b, r):
-                    # This blue DETECTED the backing red this scan -> its own
-                    # Doppler measurement (noisy, degrading with ITS range).
-                    # Gated by the same detection chain that produced the
-                    # track, so a blue can never report velocity for
-                    # something it did not detect.
-                    src_vel[e] = self._measured_vel(
-                        self._red_vel[r],
-                        float(np.linalg.norm(
-                            self._red_pos[r] - self._blue_pos[b])),
-                    )
-                # else: memory / undetected -> velocity stays 0.
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
         edge_feat[edge_vis <= 0.0] = 0.0     # zero padded/dead slots
-        node_feat = track_conf.reshape(K, 1).astype(np.float32)
+        # Node feature: [conf, Sxx, Syy, Sxy] — the velocity covariance tells
+        # the policy WHICH DIRECTION it is ignorant about (1 = no better than
+        # the speed prior), which a scalar confidence would discard.
+        node_feat = np.concatenate(
+            [track_conf.reshape(K, 1), track_vcov], axis=1).astype(np.float32)
         return node_feat, edge_feat, edge_vis
 
     def _build_obstacle_tracks(self):
@@ -2294,6 +2384,9 @@ class PursuitEnv(ParallelEnv):
         obs_conf = np.zeros((n_obs,),   dtype=np.float32)
         obs_r    = np.zeros((n_obs,),   dtype=np.float32)   # obstacle RADIUS
         obs_idx  = np.full((n_obs,), -1, dtype=np.int32)    # slot -> obstacle
+        s_prior2 = max(self.vel_prior_std, 1e-6) ** 2
+        obs_vcov = np.tile(np.array([1.0, 1.0, 0.0], dtype=np.float32),
+                           (n_obs, 1))                      # prior by default
         # Command's prior on obstacle size for memory tracks (unseen): the
         # belief peak has lost which physical obstacle it is, so use the
         # surveyed field's mean radius.  A live (seen) track overrides this
@@ -2301,7 +2394,7 @@ class PursuitEnv(ParallelEnv):
         radius_prior = 0.5 * (self.obstacle_radius_min + self.obstacle_radius_max)
         placed = 0 if self._obstacle_pos is None else len(self._obstacle_pos)
         if placed == 0:
-            return obs_pos, obs_vel, obs_conf, obs_r, obs_idx
+            return obs_pos, obs_vel, obs_conf, obs_r, obs_idx, obs_vcov
 
         # Which placed obstacles does ANY blue currently DETECT?  Same
         # detection chain as the enemy tracks / belief map: in range ->
@@ -2352,9 +2445,13 @@ class PursuitEnv(ParallelEnv):
                 break
             rm = float(best_rng[o])
             obs_pos[slot] = self._measured_pos(self._obstacle_pos[o], rm)
-            if self._obstacle_vel is not None:
-                # own-radar Doppler (noisy, degrading with range)
-                obs_vel[slot] = self._measured_vel(self._obstacle_vel[o], rm)
+            # Command-layer velocity fusion, same chain as the enemy tracks.
+            v_true = (self._obstacle_vel[o] if self._obstacle_vel is not None
+                      else np.zeros(2, dtype=np.float32))
+            v_hat, Sig = self._fuse_radial_velocity(
+                self._obstacle_pos[o], v_true, np.where(odet[:, o])[0])
+            obs_vel[slot]  = v_hat
+            obs_vcov[slot] = self._cov_features(Sig, s_prior2)
             obs_r[slot]    = self._obstacle_r[o]        # true measured radius
             obs_conf[slot] = float(o_conf[o])
             obs_idx[slot]  = int(o)                     # backing obstacle
@@ -2379,16 +2476,17 @@ class PursuitEnv(ParallelEnv):
                 obs_pos[slot]  = peaks_pos[i]
                 obs_conf[slot] = peaks_conf[i]     # memory track: vel stays 0
                 obs_r[slot]    = radius_prior      # command prior (unknown exact)
-                slot += 1                          # obs_idx stays -1 (memory)
+                slot += 1              # obs_idx -1, vel/vcov stay at prior
 
-        return obs_pos, obs_vel, obs_conf, obs_r, obs_idx
+        return obs_pos, obs_vel, obs_conf, obs_r, obs_idx, obs_vcov
 
     def _obstacle_graph_from_tracks(
         self,
         track_pos: np.ndarray,   # (K, 2) world coords (shared track picture)
-        track_idx: np.ndarray,   # (K,)   backing obstacle index; -1 = memory/pad
+        track_vel: np.ndarray,   # (K, 2) command-FUSED velocity
         conf:      np.ndarray,   # (K,)   track confidences
         track_r:   np.ndarray,   # (K,)   obstacle radius (true if seen, prior else)
+        track_vcov:np.ndarray,   # (K, 3) velocity covariance (prior-normalised)
     ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Actor-side OBSTACLE node + edge features from the obstacle tracks
@@ -2417,32 +2515,23 @@ class PursuitEnv(ParallelEnv):
         edge_vis = np.zeros((n_edges,), dtype=np.float32)
 
         for s in range(K):
-            o = int(track_idx[s])
             for b in range(N):
                 e = s * N + b
                 src_pos[e] = track_pos[s]
+                src_vel[e] = track_vel[s]      # command-fused, shared
                 dst_pos[e] = self._blue_pos[b]
                 dst_vel[e] = self._blue_vel[b]
                 edge_vis[e] = conf[s]
-                if (o >= 0 and self._obstacle_vel is not None
-                        and self._blue_detected_obstacle(b, o)):
-                    # PER-BLUE own-sensor Doppler, exactly as the enemy graph
-                    # does: velocity is a first-person measurement, so a blue
-                    # that did not detect this obstacle reports zero.
-                    src_vel[e] = self._measured_vel(
-                        self._obstacle_vel[o],
-                        float(np.linalg.norm(
-                            self._obstacle_pos[o] - self._blue_pos[b])),
-                    )
 
         edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
         edge_feat[edge_vis <= 0.0] = 0.0
         # Node feature: [conf, radius / arena_size].  conf stays at index 0
         # (used as the placed/active mask downstream).  Radius normalised by
         # the arena side to match the position scaling in the edges.
-        node_feat = np.stack(
-            [conf, track_r / self.arena_size], axis=-1,
-        ).astype(np.float32)
+        # [conf, radius/L, Sxx, Syy, Sxy]
+        node_feat = np.concatenate(
+            [np.stack([conf, track_r / self.arena_size], axis=-1), track_vcov],
+            axis=1).astype(np.float32)
         return node_feat, edge_feat, edge_vis
 
     def _true_obstacle_graph(self) -> Tuple[np.ndarray, np.ndarray]:
@@ -2459,7 +2548,9 @@ class PursuitEnv(ParallelEnv):
         N = self.n_blue
         placed = 0 if self._obstacle_pos is None else len(self._obstacle_pos)
 
-        node_feat = np.zeros((n_obs, 2), dtype=np.float32)   # [placed, radius]
+        # [placed, radius/L, Sxx, Syy, Sxy] — covariance slots stay 0: the
+        # critic sees ground truth, so its velocity is certain.
+        node_feat = np.zeros((n_obs, 5), dtype=np.float32)
         n_edges = n_obs * N
         src_pos = np.zeros((n_edges, 2), dtype=np.float32)
         src_vel = np.zeros((n_edges, 2), dtype=np.float32)   # true obstacle vel
@@ -2536,8 +2627,14 @@ class PursuitEnv(ParallelEnv):
             "blue_features":    base["blue_features"],
             "bb_edge_features": base["bb_edge_features"],
             "bb_edge_visible":  bb_vis,
-            # Critic ground truth (reds).
-            "true_red_features":     base["red_features"],
+            # Critic ground truth (reds).  The actor's red node feature is
+            # [conf, Sxx, Syy, Sxy]; the critic sees TRUTH, so its covariance
+            # slots are ZERO — no uncertainty — keeping both encoders at the
+            # same red_feat_dim.
+            "true_red_features": np.concatenate(
+                [base["red_features"],
+                 np.zeros((base["red_features"].shape[0], 3), dtype=np.float32)],
+                axis=1),
             "true_rb_edge_features": base["rb_edge_features"],
         }
 
@@ -2545,9 +2642,10 @@ class PursuitEnv(ParallelEnv):
         # Live tracks (visible reds) seeded directly from the sensor;
         # remaining slots filled from belief-map memory peaks.  See
         # _build_enemy_tracks.  Dead slots are conf-0 padded.
-        track_pos, track_conf, track_red = self._build_enemy_tracks()
+        (track_pos, track_conf, track_red,
+         track_vel, track_vcov) = self._build_enemy_tracks()
         red_node, rb_edge, rb_vis = self._enemy_graph_from_tracks(
-            track_pos, track_conf, track_red,
+            track_pos, track_conf, track_red, track_vel, track_vcov,
         )
         out["red_features"]    = red_node
         out["rb_edge_features"] = rb_edge
@@ -2558,10 +2656,10 @@ class PursuitEnv(ParallelEnv):
             # Live own-sensor position when a blue senses the obstacle,
             # else the belief-map peak (command memory).  See
             # _build_obstacle_tracks for the doctrine.
-            obs_pos, _obs_vel, obs_conf, obs_r, obs_idx = (
-                self._build_obstacle_tracks())
+            (obs_pos, obs_vel, obs_conf, obs_r,
+             _obs_idx, obs_vcov) = self._build_obstacle_tracks()
             ob_node, ob_edge, ob_vis = self._obstacle_graph_from_tracks(
-                obs_pos, obs_idx, obs_conf, obs_r,
+                obs_pos, obs_vel, obs_conf, obs_r, obs_vcov,
             )
             out["obstacle_features"] = ob_node
             out["ob_edge_features"]  = ob_edge

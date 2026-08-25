@@ -28,6 +28,10 @@ STAGE1_DEFAULTS = {
     "uncaught_penalty": 5.0,    # per red still alive at episode end (shared)
     "action_cost_coef": 0.01,   # * |a_i|^2, INDIVIDUAL: own control effort
 
+    # Gaussian speed prior for the command-layer velocity fusion (ridge
+    # term).  ~ the fastest entity's v_max (BLUE_UAV 1.5, RED_TARGET 1.0).
+    "vel_prior_std":    1.0,
+
     # ----- Vectorisation -------------------------------------------------
     # Rollout collection runs n_envs copies of the env in parallel.
     # At rollout time we see (n_envs * rollout_steps * n_agents) samples,
