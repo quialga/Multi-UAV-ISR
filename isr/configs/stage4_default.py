@@ -249,7 +249,14 @@ STAGE4_DEFAULTS = {
     # baseline stalls in the first ~100 rollouts, drop aux_hidden_coef toward
     # 0 (or set this to None for an honest cold start) before suspecting
     # anything else.
-    "warm_start_critic": "runs/stage1/scaling_gnn/best.pt",
+    # BASELINE DEFAULT = None (honest cold start).  The Stage 1 checkpoint is
+    # structurally incompatible (see above) AND lives under a gitignored
+    # runs/ dir, so a fresh clone silently cold-starts anyway with only a
+    # WARN line.  Depending on it made behaviour differ between laptop and
+    # cloud.  The right warm start for run 2 is run 1's OWN checkpoint via
+    # --warm-start-full, which transfers 77/77 tensors (verified) because it
+    # is the same architecture.
+    "warm_start_critic": None,
 
     # ----- PPO (pinned to Stage 3's WINNING recipe) ----------------------
     # The Stage 4 v6 runs regressed because they dropped three coupled
@@ -259,11 +266,17 @@ STAGE4_DEFAULTS = {
     # lr 3e-4 / ent 0.018, which Stage 3 overrode on the CLI).
     "lr":                1e-4,
     "ent_coef":          0.008,
-    # aux 0.2 ONLY helps with the warm-started critic: the target is
-    # critic_h_blue.detach(), so a cold/random critic makes aux a
-    # garbage target (this is why aux 0.02 hurt in the cold-start
-    # experiment).  Warm start + aux 0.2 is the proven Stage 3 combo.
-    "aux_hidden_coef":   0.2,
+    # aux 0.2 ONLY helps when critic_h_blue (its .detach()ed target) is
+    # MEANINGFUL.  A cold critic gives a target that is arbitrary AND
+    # MOVING -- worse than a frozen random projection, because the actor
+    # chases a representation drifting for reasons unrelated to its task.
+    # (Hence aux 0.02 hurt in the cold-start experiment.)
+    # BASELINE DEFAULT = 0.0 to match warm_start_critic=None above.
+    # Turn it back to 0.2 for run 2, warm-started --warm-start-full from
+    # run 1: that critic is converged, same-architecture and same-
+    # distribution, which is the condition aux 0.2 was validated under and
+    # the first time it is genuinely protected in this architecture.
+    "aux_hidden_coef":   0.0,
     "use_hidden_in_gnn": True,      # Stage 3 opt-1 hidden-in-GNN kept on
     # n_msg_rounds inherited = 2 (Stage 3); do NOT run with 1.
 }
