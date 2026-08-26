@@ -138,9 +138,8 @@ Multi-UAV-ISR/
 │   ├── train_stage1.py             # Stage 1 (MLP) / Stage 2 (GNN) training entry
 │   ├── train_stage4.py             # Stage 3–4 training entry (belief GNN)
 │   ├── eval_stage4_counts.py       # entity-count generalisation sweep
-│   ├── evaluate_trained.py         # evaluate a checkpoint → docs/stageN_results.md
-│   ├── render_demo.py              # render one episode (random or trained)
-│   └── diag_scripted_pursuit.py    # scripted-baseline diagnostics
+│   ├── evaluate_trained.py         # evaluate a checkpoint → <run>/eval_results.md
+│   └── render_demo.py              # render one episode (random or trained)
 ├── tests/                          # env contract + per-extension test suites
 └── docs/
     ├── design.md                   # full curriculum + stage-by-stage spec

@@ -213,9 +213,18 @@ actual logged args before concluding an architectural fault.
 - `belief_track_error()` (`trk=` in the log) — mean distance from each
   extracted enemy peak to the nearest true red; measures whether the
   belief map is tracking or lagging, independent of the policy.
-- `scripts/diag_scripted_pursuit.py` — a hand-coded controller on the
-  real obs (captures 3/3), proving the observation is *sufficient* to
-  solve the task, so any policy shortfall is a learning problem.
+- *Scripted-pursuit sufficiency check* (was
+  `scripts/diag_scripted_pursuit.py`, removed 2026-08) — a hand-coded
+  controller driven only by the real `rb_edge_features` captured 3/3 on the
+  L=130 / 5v3 / no-obstacle config, proving the observation was
+  *sufficient* to solve that task and that any policy shortfall there was a
+  learning problem, not an observability one.  The script was deleted
+  because it monkey-patched the private `_build_enemy_tracks` (broken by the
+  velocity-fusion signature change), hardcoded the retired config, and
+  A/B'd against a cell-centre-peak path that no longer exists.  **The
+  question is worth re-asking on the L=200 / 7v4 baseline**, where ~92% of
+  observations are memory tracks — but that needs a fresh check against the
+  current obs, not a repair of this one.
 
 ---
 
