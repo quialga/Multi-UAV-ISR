@@ -40,7 +40,8 @@ from isr.agents.heuristics import (
     run_from_nearest_uav, stationary_red, random_red,
 )
 from isr.agents.policy_loader import (
-    TrainedBlueAgent, build_trained_agent, load_policy,
+    TrainedBlueAgent, build_trained_agent, env_kwargs_from_checkpoint,
+    load_policy,
 )
 from isr.env.pursuit_env import PursuitEnv
 from isr.utils.render import animate_episode
@@ -246,7 +247,8 @@ def main() -> None:
     p.add_argument("--fps",        type=int, default=10)
     p.add_argument("--results-md", default=None,
                    help="output markdown writeup path.  Defaults to "
-                        "docs/stage2_results.md.")
+                        "<checkpoint dir>/eval_results.md, alongside the "
+                        "JSON and GIFs.")
     args = p.parse_args()
 
     device = torch.device(args.device)
@@ -256,17 +258,11 @@ def main() -> None:
     # ---- Load policy + reconstruct env config from saved args -----------
     ckpt_meta = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     train_args = ckpt_meta["args"]
-    env_kwargs = dict(
-        n_blue         = train_args["n_blue"],
-        n_red          = train_args["n_red"],
-        arena_size     = train_args["arena_size"],
-        max_steps      = train_args["max_steps"],
-        capture_radius = train_args["capture_radius"],
-    )
-    # Propagate sensor_radius if the checkpoint carries one, so the
-    # trained policy sees the same observability regime it trained on.
-    if train_args.get("sensor_radius") is not None:
-        env_kwargs["sensor_radius"] = train_args["sensor_radius"]
+    # Rebuild the env the checkpoint was trained under.  For a Stage 4
+    # checkpoint this includes belief maps, obstacles and the whole sensor
+    # model; older checkpoints get pre-feature defaults so they evaluate in
+    # the regime they actually trained in.
+    env_kwargs = env_kwargs_from_checkpoint(train_args)
 
     policy = load_policy(ckpt_path, device)
     policy_type = train_args.get("policy_type", "gnn")
@@ -364,8 +360,13 @@ def main() -> None:
         }, f, indent=2)
     print(f"\nResults JSON: {results_json_path}")
 
-    md_path = Path(args.results_md or "docs/stage2_results.md").resolve()
-    stage_label = "Stage 2"
+    # Default the write-up NEXT TO THE CHECKPOINT, like the JSON and GIFs.
+    # It used to fall back to docs/stage2_results.md, a TRACKED file, so any
+    # eval silently overwrote the Stage 2 results doc.
+    md_path = Path(args.results_md or (ckpt_path.parent / "eval_results.md")
+                   ).resolve()
+    stage_label = ("Stage 4" if train_args.get("policy_type") == "gnn_stage4_v6"
+                   else "Stage 2")
     bar_label = "1.20 × GreedyPursuer"
     write_results_md(
         out_path        = md_path,
