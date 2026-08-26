@@ -50,19 +50,6 @@ STAGE3_DEFAULTS = {
     # experiment (Phase 3.5).  See docs/stage3_design.md follow-up.
     "aux_hidden_coef": 0.0,
 
-    # When True, freezes the entire CTDE critic (encoder + trunk + head)
-    # at the warm-started Stage 2 weights.  Aux target becomes a stable
-    # Stage 2 oracle rather than a drifting one.  Set via --freeze-critic
-    # on the CLI.  Requires warm_start_critic to be a valid path.
-    #
-    # Empirical note (Phase 3.5, 2026-07): option A (freeze_critic=True)
-    # converged rapidly to ~2.9 catches then DEGRADED as the policy
-    # drifted OOD from the frozen critic's V estimates.  Option C
-    # (freeze_critic=False, aux on live critic) is the current
-    # recommended config.  See docs/stage3_results.md for full
-    # comparison and diagnosis.
-    "freeze_critic": False,
-
     # ----- Phase 3.6 option 1: cross-blue hidden state sharing ---------
     # When True, prepend the previous per-blue GRU hidden state to the
     # blue node features fed into the actor's GNN encoder.  The GNN's
@@ -94,5 +81,4 @@ STAGE3_DEFAULTS = {
     # ----- Warm start ---------------------------------------------------
     # Path to the Stage 2 checkpoint whose GNN + critic head we copy
     # into the CTDE critic path at init.  Set to None to skip warm-start.
-    "warm_start_critic": "runs/stage1/scaling_gnn/best.pt",
 }

@@ -224,13 +224,31 @@ STAGE4_DEFAULTS = {
     # unbounded within the arena, matching the TDL doctrine).
 
     # ----- Warm start ----------------------------------------------------
-    # v6.3: warm-start the CRITIC from the Stage 1 single-encoder GNN,
-    # exactly as Stage 3 did (its encoder MLPs + critic trunk/head map
-    # onto our critic for n_obstacles=0).  A pre-trained critic gives
-    # meaningful advantages from rollout 0 -- the stabiliser Stage 3
-    # relied on and the Stage 4 cold-start dropped.  Set None to
-    # cold-start.  With obstacles the trunk widens, so only the encoder
-    # warm-starts (shape-matched copy).
+    # v6.3 warm-started the CRITIC from the Stage 1 single-encoder GNN,
+    # which historically mattered: dropping it was one of three coupled
+    # stabilisers whose loss caused the v6 regression.
+    #
+    # MEASURE IT BEFORE TRUSTING IT (2026-08).  The Stage 1 checkpoint now
+    # transfers only 28 of 38 critic tensors into the current policy, and
+    # the ones that FAIL are every INPUT layer:
+    #     red_input_mlp.0.weight  (64,4)   red node feature grew 1 -> 4
+    #                                      (velocity covariance, §17)
+    #     obs_input_mlp.* (4 tensors)      obstacle features 1 -> 5, and
+    #                                      Stage 1 had no obstacles at all
+    #     critic_trunk.0.weight   (64,194) masked-mean pool changed the width
+    # What still transfers is the INTERIOR (message/update/edge MLPs, trunk
+    # layer 2, head) — i.e. weights that now receive randomly-projected
+    # inputs.  So the "meaningful advantages from rollout 0" claim no longer
+    # holds at this transfer level; treat the warm start as neutral rather
+    # than as a stabiliser.
+    #
+    # KNOCK-ON RISK: aux_hidden_coef below is explicitly coupled to having a
+    # MEANINGFUL critic (its target is critic_h_blue.detach()).  With the
+    # critic's input layers random, that target is noisy early — exactly the
+    # regime where aux 0.2 was previously found to HURT.  If the from-scratch
+    # baseline stalls in the first ~100 rollouts, drop aux_hidden_coef toward
+    # 0 (or set this to None for an honest cold start) before suspecting
+    # anything else.
     "warm_start_critic": "runs/stage1/scaling_gnn/best.pt",
 
     # ----- PPO (pinned to Stage 3's WINNING recipe) ----------------------
@@ -246,7 +264,6 @@ STAGE4_DEFAULTS = {
     # garbage target (this is why aux 0.02 hurt in the cold-start
     # experiment).  Warm start + aux 0.2 is the proven Stage 3 combo.
     "aux_hidden_coef":   0.2,
-    "freeze_critic":     False,     # not supported in v6 (cold start)
     "use_hidden_in_gnn": True,      # Stage 3 opt-1 hidden-in-GNN kept on
     # n_msg_rounds inherited = 2 (Stage 3); do NOT run with 1.
 }
