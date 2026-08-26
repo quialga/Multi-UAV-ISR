@@ -40,8 +40,7 @@ from isr.agents.heuristics import (
     run_from_nearest_uav, stationary_red, random_red,
 )
 from isr.agents.policy_loader import (
-    TrainedBlueAgent, build_trained_agent, env_kwargs_from_checkpoint,
-    load_policy,
+    build_trained_agent, env_kwargs_from_checkpoint, load_policy,
 )
 from isr.env.pursuit_env import PursuitEnv
 from isr.utils.render import animate_episode
@@ -277,7 +276,7 @@ def main() -> None:
         "Random":  lambda: RandomAgent(seed=0),
         "Greedy":  lambda: GreedyPursuer(),
         # ``build_trained_agent`` picks the right adapter (Stage 1/2
-        # TrainedBlueAgent) from the loaded policy's class.
+        # adapter) from the loaded policy's class.
         "Trained": lambda: build_trained_agent(policy, device, deterministic=True),
     }
     red_factories = {

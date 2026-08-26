@@ -1,23 +1,26 @@
 """
-isr/agents/policy_loader.py — Load a trained GNN checkpoint + adapt it
+isr/agents/policy_loader.py — Load a trained Stage 4 checkpoint + adapt it
 to the HeuristicBlueAgent interface so it can be dropped into the
 rendering / evaluation scripts that already accept heuristic policies.
 
-Two entry points:
+Three entry points:
 
-- ``load_policy(path, device)``: load a checkpoint dict written by
-  ``scripts/train_stage1.py`` and return a constructed
-  ``GNNActorCritic`` on the requested device.
+- ``load_policy(path, device)``: load a checkpoint written by
+  ``scripts/train_stage4.py`` and return a constructed
+  ``GNNStage4Policy`` on the requested device.
 
-- ``TrainedBlueAgent(policy, device, deterministic=True)``: wraps a
-  loaded policy as a blue agent with ``act(obs, env, agent) -> action``,
-  matching ``HeuristicBlueAgent``.  Use ``deterministic=True`` (default)
-  for evaluation — sample distribution mean, no exploration noise.
+- ``env_kwargs_from_checkpoint(train_args)``: rebuild the env config the
+  checkpoint was trained under, so an evaluation reproduces that regime.
 
-The MLP-loading path was removed in the July-2026 cleanup after the
-Stage 2 scaling experiment (see docs/stage2_results.md).  Pre-Stage-2
-MLP checkpoints raise a clear error at load time — their eval numbers
-are preserved in docs/stage1_results.md and docs/stage1_analysis.md.
+- ``build_trained_agent(policy, device, deterministic=True)``: wrap it as
+  a blue agent with ``act(obs, env, agent) -> action``, matching
+  ``HeuristicBlueAgent``.  ``deterministic=True`` (default) takes the
+  distribution mean — no exploration noise.
+
+The Stage 1/2 (``GNNActorCritic``) and pre-Stage-2 MLP read paths were
+removed in the 2026-08 cleanup along with their trainer; their results are
+preserved in docs/stage1_results.md, docs/stage1_analysis.md and
+docs/stage2_results.md.
 """
 from __future__ import annotations
 
@@ -28,9 +31,8 @@ import numpy as np
 import torch
 
 from isr.agents.heuristics import HeuristicBlueAgent
-from isr.agents.gnn_policy import GNNActorCritic
 from isr.agents.gnn_stage4_policy import GNNStage4Policy, split_stage4_obs
-from isr.configs.stage1_default import STAGE1_DEFAULTS
+from isr.configs.stage4_default import STAGE4_DEFAULTS
 from isr.env.pursuit_env import PursuitEnv
 
 
@@ -47,32 +49,16 @@ def load_policy(
     """
     Load a checkpoint and return a constructed + loaded policy.
 
-    Dispatches on ``args['policy_type']``:
-      - ``'gnn'``            -> ``GNNActorCritic``  (Stage 1/2 fully-obs)
-      - ``'gnn_stage4_v6'``  -> ``GNNStage4Policy`` (belief-map CTDE)
-
-    (The Stage 3 ``'gnn_ctde'`` path was retired with the Stage 3
-    pipeline.)  Pre-Stage-2 MLP checkpoints raise a clear error at load
-    time.
+    Only ``policy_type == 'gnn_stage4_v6'`` is supported.  Stage 1/2
+    (``'gnn'``), Stage 3 (``'gnn_ctde'``) and pre-Stage-2 MLP checkpoints
+    raise a clear error — their trainers no longer exist.
     """
     path = Path(path)
     ckpt = torch.load(path, map_location=device, weights_only=False)
     args = ckpt["args"]
     policy_type = args.get("policy_type", "mlp")
 
-    if policy_type == "gnn":
-        policy = GNNActorCritic(
-            n_blue        = int(args["n_blue"]),
-            n_red         = int(args["n_red"]),
-            blue_feat_dim = 8,
-            red_feat_dim  = 1,
-            edge_feat_dim = 7,
-            action_dim    = 2,
-            d_hidden      = int(args.get("d_hidden", 64)),
-            n_msg_rounds  = int(args.get("n_msg_rounds", 2)),
-            init_log_std  = STAGE1_DEFAULTS["init_log_std"],
-        ).to(device)
-    elif policy_type == "gnn_stage4_v6":
+    if policy_type == "gnn_stage4_v6":
         policy = GNNStage4Policy(
             n_blue            = int(args["n_blue"]),
             n_red             = int(args["n_red"]),
@@ -80,14 +66,15 @@ def load_policy(
             action_dim        = 2,
             d_hidden          = int(args.get("d_hidden", 64)),
             n_msg_rounds      = int(args.get("n_msg_rounds", 2)),
-            init_log_std      = STAGE1_DEFAULTS["init_log_std"],
+            init_log_std      = STAGE4_DEFAULTS["init_log_std"],
             use_hidden_in_gnn = bool(args.get("share_hidden_via_gnn", True)),
         ).to(device)
     else:
         raise RuntimeError(
-            f"Checkpoint at {path} has policy_type={policy_type!r}; "
-            f"supported: 'gnn' (Stage 1/2), 'gnn_stage4_v6' (Stage 4).  "
-            f"Stage 3 ('gnn_ctde') was retired."
+            f"Checkpoint at {path} has policy_type={policy_type!r}; only "
+            f"'gnn_stage4_v6' is supported.  The Stage 1/2 ('gnn'), Stage 3 "
+            f"('gnn_ctde') and MLP read paths were removed with their "
+            f"trainers in the 2026-08 cleanup."
         )
 
     policy.load_state_dict(ckpt["policy_state"])
@@ -105,8 +92,6 @@ def build_trained_agent(
     loaded policy — dispatches on the policy's class rather than
     forcing the caller to know.
     """
-    if isinstance(policy, GNNActorCritic):
-        return TrainedBlueAgent(policy, device, deterministic)
     if isinstance(policy, GNNStage4Policy):
         return TrainedStage4BlueAgent(policy, device, deterministic)
     raise TypeError(f"Unsupported policy class: {type(policy).__name__}")
@@ -177,44 +162,6 @@ def env_kwargs_from_checkpoint(train_args: dict) -> dict:
         action_cost_coef         = g("action_cost_coef", 0.01),
     )
     return kw
-
-
-class TrainedBlueAgent(HeuristicBlueAgent):
-    """
-    Adapter that lets a trained ``GNNActorCritic`` be used wherever a
-    ``HeuristicBlueAgent`` is expected (renderer, eval table, etc.).
-
-    Per-agent calls run a tiny single-sample forward pass on the graph
-    obs — fine for evaluation but not for vectorised rollouts (the
-    trainer uses batched forwards directly).
-    """
-
-    def __init__(
-        self,
-        policy:        GNNActorCritic,
-        device:        torch.device,
-        deterministic: bool = True,
-    ) -> None:
-        self.policy        = policy
-        self.device        = device
-        self.deterministic = deterministic
-
-    def act(self, obs: np.ndarray, env: PursuitEnv, agent: str) -> np.ndarray:
-        # Grab the whole graph and identify the acting agent's index.
-        s = env.structured_observation()
-        obs_dict = {
-            k: torch.from_numpy(v).float().unsqueeze(0).to(self.device)
-            for k, v in s.items()
-        }
-        with torch.no_grad():
-            if self.deterministic:
-                action_t = self.policy.act_deterministic(obs_dict)
-            else:
-                action_t, _, _, _ = self.policy.get_action_and_value(obs_dict)
-        # action_t: (1, N_blue, 2).  Pick out the acting agent.
-        idx = env.possible_agents.index(agent)
-        a = action_t[0, idx].cpu().numpy().astype(np.float32)
-        return np.clip(a, -1.0, 1.0)
 
 
 class TrainedStage4BlueAgent(HeuristicBlueAgent):

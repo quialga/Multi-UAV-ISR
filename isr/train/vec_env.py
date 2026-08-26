@@ -61,7 +61,8 @@ class VectorPursuitEnv:
             (or the env default = run_from_nearest_uav) for every
             episode.
 
-            v2 default in scripts/train_stage1.py is
+            The trainer default (``--red-policy-mix`` in
+            scripts/train_stage4.py) is
             ``[('stationary', 1), ('random', 1), ('run', 1)]`` — uniform
             mix — to eliminate the OOD failure documented in
             docs/stage1_analysis.md §3 (Failure mode 1).

@@ -1,17 +1,85 @@
 """
-isr/configs/stage4_default.py — Stage 4 hyperparameters.
+isr/configs/stage4_default.py — the single hyperparameter config.
 
-Mirrors docs/stage4_design.md §8.  Extends STAGE3_DEFAULTS with the
-belief-map / obstacle / sensor-noise knobs.  Override via CLI flags
-in scripts/train_stage4.py rather than editing this file.
+Formerly the tail of a stage1 -> stage3 -> stage4 inheritance chain.  The
+chain was flattened in the 2026-08 cleanup: Stage 3 had no runnable trainer
+and Stage 1's was removed, so the two upstream files were a config layer for
+stages that no longer exist.  Every key is now declared here explicitly —
+one file, no inheritance, nothing shadowed.
+
+Override individual fields via CLI flags in scripts/train_stage4.py rather
+than editing this file.
 """
 from __future__ import annotations
 
-from isr.configs.stage3_default import STAGE3_DEFAULTS
-
 
 STAGE4_DEFAULTS = {
-    **STAGE3_DEFAULTS,
+    # ===== Base knobs =====================================================
+    # These came from the old STAGE1/STAGE3 layers and are unchanged in
+    # value; only their home moved.
+
+    # ----- Environment ----------------------------------------------------
+    "capture_radius": 3.0,
+    "dt":             1.0,
+    "sensor_radius":  40.0,    # ~20% of the L=200 arena side
+
+    # ----- Reward shape (env-level) ---------------------------------------
+    #   r_i    = r_team + r_crash_i + r_clear_i - action_cost_i
+    #   r_team = catch_reward * n_caught - step_cost
+    #            [- uncaught_penalty * n_uncaught at episode end]
+    # SHARED terms are mission-level; control effort is INDIVIDUAL.
+    # (step_cost is overridden below with the arena scale-up.)
+    "catch_reward":     10.0,   # per red caught (shared: a team success)
+    "uncaught_penalty": 5.0,    # per red still alive at the end (shared)
+    "action_cost_coef": 0.01,   # * |a_i|^2, INDIVIDUAL: own control effort
+
+    # Gaussian speed prior for the command-layer velocity fusion (ridge
+    # term).  ~ the fastest entity's v_max (BLUE_UAV 1.5, RED_TARGET 1.0).
+    "vel_prior_std":    1.0,
+
+    # ----- Vectorisation --------------------------------------------------
+    # Rollout collection runs n_envs copies of the env in parallel; a
+    # rollout yields n_envs * rollout_steps * n_agents samples.
+    "n_envs":         16,
+
+    # ----- PPO ------------------------------------------------------------
+    "n_rollouts":     1000,        # total PPO updates
+    "n_epochs":       10,          # PPO epochs per rollout
+    "mb_size":        512,         # minibatch size
+    "clip_eps":       0.2,
+    "vf_coef":        0.5,
+    "max_grad_norm":  0.5,
+    "gamma":          0.99,
+    "gae_lambda":     0.95,
+    "value_clip":     True,        # clip value updates by clip_eps too
+    "normalize_adv":  True,        # standardise advantages per-minibatch
+    "target_kl":      0.03,        # per-epoch early stop (None disables)
+
+    # LR schedule — with a constant LR at low entropy, gradient steps have
+    # disproportionate behavioural effect; linear decay dampens that.
+    "lr_schedule":    "linear",    # or "constant"
+    "lr_min_frac":    0.1,         # anneals lr -> lr * lr_min_frac
+
+    # ----- Network --------------------------------------------------------
+    "d_hidden":       64,
+    "n_msg_rounds":   2,           # do NOT run with 1 (see PPO note below)
+    "init_log_std":   0.0,         # std = e^0 = 1 at init; the action box
+                                   # is [-1,1], so clipping is heavy early
+                                   # and the policy shrinks std rapidly.
+
+    # ----- Logging / eval / checkpointing ---------------------------------
+    "log_interval":   1,
+    "eval_interval":  50,
+    "eval_episodes":  20,
+    "save_interval":  100,
+    # Save best.pt whenever the tracked metric beats the previous best by
+    # min_delta.  See the det_composite note in scripts/train_stage4.py:
+    # mean_return MIS-SELECTS on crash-penalty runs.
+    "best_ckpt_metric":       "mean_return",
+    "best_ckpt_min_delta":    0.05,
+    "best_ckpt_min_episodes": 32,
+
+    # ===== Stage 4 =========================================================
 
     # ----- Arena scale-up + team size (2026-08) ---------------------------
     # Motivation: at L=130 with R=40 and 5 blues the team's SENSOR COVERAGE

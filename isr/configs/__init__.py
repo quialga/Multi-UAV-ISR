@@ -1,1 +1,1 @@
-"""Hyperparameter configs per stage.  Stage 1: stage1_default.py."""
+"""Hyperparameter config.  Single source: stage4_default.py."""

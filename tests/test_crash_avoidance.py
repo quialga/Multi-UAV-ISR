@@ -344,20 +344,33 @@ def test_catch_reward_and_uncaught_penalty_take_effect():
 
 
 def test_config_exposes_reward_shape():
-    """The four constants live in the config chain (stage1 -> 3 -> 4)."""
-    from isr.configs.stage1_default import STAGE1_DEFAULTS
-    from isr.configs.stage4_default import STAGE4_DEFAULTS
-    for k, v in (("catch_reward", 10.0), ("step_cost", 0.05),
-                 ("uncaught_penalty", 5.0), ("action_cost_coef", 0.01)):
-        assert STAGE1_DEFAULTS[k] == v
-    # Stage 4 inherits all but step_cost, which it deliberately overrides as
-    # part of the arena scale-up: step_cost * max_steps must stay ~1/3 of the
-    # available catch reward, so the longer episode gets a smaller per-step
-    # cost (0.033 * 300 = 9.9, matching the old 0.05 * 200 = 10).
-    for k in ("catch_reward", "uncaught_penalty", "action_cost_coef"):
-        assert STAGE4_DEFAULTS[k] == STAGE1_DEFAULTS[k]
-    assert STAGE4_DEFAULTS["step_cost"] == 0.033
-    ratio = STAGE4_DEFAULTS["step_cost"] * STAGE4_DEFAULTS["max_steps"]
-    old   = STAGE1_DEFAULTS["step_cost"] * STAGE1_DEFAULTS["max_steps"]
-    assert abs(ratio - old) < 0.5, (
-        f"time-pressure share drifted: {ratio} vs {old}")
+    """The reward constants are declared in the single config file, and the
+    time-pressure share is preserved across the arena scale-up."""
+    from isr.configs.stage4_default import STAGE4_DEFAULTS as D
+    for k, v in (("catch_reward", 10.0), ("uncaught_penalty", 5.0),
+                 ("action_cost_coef", 0.01)):
+        assert D[k] == v, f"{k} drifted from its historical value"
+    # step_cost is deliberately scaled with max_steps so that
+    # step_cost * max_steps stays ~1/3 of the available catch reward.
+    # Historical reference: 0.05 * 200 = 10 at L=130.
+    assert D["step_cost"] == 0.033
+    assert abs(D["step_cost"] * D["max_steps"] - 0.05 * 200) < 0.5, (
+        "time-pressure share drifted from the L=130 baseline")
+
+
+def test_config_is_a_single_flat_source():
+    """The stage1 -> stage3 -> stage4 inheritance chain was flattened; the
+    upstream modules are gone and nothing shadows anything."""
+    import importlib
+    from isr.configs.stage4_default import STAGE4_DEFAULTS as D
+    for gone in ("isr.configs.stage1_default", "isr.configs.stage3_default"):
+        try:
+            importlib.import_module(gone)
+        except ModuleNotFoundError:
+            pass
+        else:
+            raise AssertionError(f"{gone} should have been removed")
+    # A few keys from each former layer must still resolve.
+    for k in ("capture_radius", "gamma", "d_hidden", "sensor_radius",
+              "arena_size", "n_blue", "belief_grid_size"):
+        assert k in D, f"{k} lost in the flatten"
