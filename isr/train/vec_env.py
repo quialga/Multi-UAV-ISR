@@ -38,11 +38,28 @@ from isr.agents.heuristics import (
 )
 
 
-class VectorPursuitEnv:
+class Stage4VectorPursuitEnv:
     """
-    Vectorised ``PursuitEnv`` with per-episode red-policy mixing and
-    structured (graph) obs.  See module docstring.
+    Vectorised ``PursuitEnv`` with per-episode red-policy mixing, emitting
+    the v6 typed-graph obs from ``structured_belief_observation()``:
+    belief-derived actor node/edge features plus ground-truth ``true_*``
+    critic features (and obstacle variants when configured).
+
+    The big ``belief_maps`` / ``true_occupancy`` diagnostic tensors are NOT
+    batched -- the policy consumes only the reconstructed graph, and storing
+    full belief grids per step would blow up memory.
+
+    Requires ``env_kwargs`` to set ``sensor_radius`` (the sensor step needs a
+    defined disk) and ``use_belief_maps=True`` (the log-odds tensor feeds the
+    peak extractor).
+
+    Was a ``Stage4VectorPursuitEnv(VectorPursuitEnv)`` pair until the 2026-08
+    cleanup; the fully-observable base had no remaining users once
+    train_stage1.py was removed, so the two were collapsed into one class.
     """
+
+    #: obs keys that stay inside the env (not fed to the policy/buffer).
+    _EXCLUDE = ("belief_maps", "true_occupancy")
 
     def __init__(
         self,
@@ -67,6 +84,16 @@ class VectorPursuitEnv:
             mix — to eliminate the OOD failure documented in
             docs/stage1_analysis.md §3 (Failure mode 1).
         """
+        if env_kwargs.get("sensor_radius", None) is None:
+            raise ValueError(
+                "Stage4VectorPursuitEnv requires env_kwargs['sensor_radius'] "
+                "to be set (belief update needs a defined sensor disk)."
+            )
+        if not env_kwargs.get("use_belief_maps", False):
+            raise ValueError(
+                "Stage4VectorPursuitEnv requires "
+                "env_kwargs['use_belief_maps']=True."
+            )
         self.n_envs = int(n_envs)
 
         # Distinct seeds so rollouts cover varied initial states.
@@ -97,7 +124,7 @@ class VectorPursuitEnv:
         self.possible_agents = list(e0.possible_agents)
         self.arena_size = e0.arena_size
         self.max_steps  = e0.max_steps
-        # Graph-obs sizing, exposed for GraphRolloutBuffer construction.
+        # Graph-obs sizing, read by the trainer when it builds the policy.
         self.blue_feat_dim = e0.blue_feat_dim
         self.red_feat_dim  = e0.red_feat_dim
         self.edge_feat_dim = e0.edge_feat_dim
@@ -105,6 +132,7 @@ class VectorPursuitEnv:
         self.n_rb_edges    = e0.n_rb_edges
         self.n_blue        = e0.n_blue
         self.n_red         = e0.n_red
+        self.n_obstacles   = e0.n_obstacles
 
         # Per-env episode-tracking state.
         self._ep_return = np.zeros(self.n_envs, dtype=np.float32)
@@ -118,6 +146,14 @@ class VectorPursuitEnv:
         self.episode_caught:  Deque[int]   = deque(maxlen=episode_buffer_size)
         self.episode_obs_crashes:  Deque[int] = deque(maxlen=episode_buffer_size)
         self.episode_blue_crashes: Deque[int] = deque(maxlen=episode_buffer_size)
+
+        # Discover the graph-obs schema from one sample observation so the
+        # obstacle keys appear only when obstacles are configured.
+        e0.reset(seed=base_seed)
+        sample = e0.structured_belief_observation()
+        self._graph_keys = [k for k in sample if k not in self._EXCLUDE]
+        self._graph_shapes = {k: tuple(sample[k].shape)
+                              for k in self._graph_keys}
 
     # ------------------------------------------------------------------ #
     #  Red-policy mixing                                                   #
@@ -148,25 +184,16 @@ class VectorPursuitEnv:
 
     def _empty_batch(self) -> Dict[str, np.ndarray]:
         return {
-            "blue_features":     np.zeros((self.n_envs, self.n_blue,
-                                           self.blue_feat_dim),
-                                          dtype=np.float32),
-            "red_features":      np.zeros((self.n_envs, self.n_red,
-                                           self.red_feat_dim),
-                                          dtype=np.float32),
-            "bb_edge_features":  np.zeros((self.n_envs, self.n_bb_edges,
-                                           self.edge_feat_dim),
-                                          dtype=np.float32),
-            "rb_edge_features":  np.zeros((self.n_envs, self.n_rb_edges,
-                                           self.edge_feat_dim),
-                                          dtype=np.float32),
+            k: np.zeros((self.n_envs,) + shp, dtype=np.float32)
+            for k, shp in self._graph_shapes.items()
         }
 
     def _fill_row(
         self, batch: Dict[str, np.ndarray], idx: int, env: PursuitEnv,
     ) -> None:
-        for k, arr in env.structured_observation().items():
-            batch[k][idx] = arr
+        obs = env.structured_belief_observation()
+        for k in self._graph_keys:
+            batch[k][idx] = obs[k]
 
     # ------------------------------------------------------------------ #
     #  Reset / step                                                        #
@@ -297,84 +324,3 @@ class VectorPursuitEnv:
     def close(self) -> None:
         for env in self.envs:
             env.close()
-
-
-# ---------------------------------------------------------------------------
-# Stage 3: partial-obs variant
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
-# Stage 4: belief-map variant
-# ---------------------------------------------------------------------------
-
-class Stage4VectorPursuitEnv(VectorPursuitEnv):
-    """
-    Stage 4 (v6) vectorised env.  The obs dict is the v6 typed-graph
-    schema from ``structured_belief_observation()``: belief-derived
-    actor node/edge features + ground-truth ``true_*`` critic features
-    (+ obstacle variants when configured).
-
-    The big ``belief_maps`` / ``true_occupancy`` diagnostic tensors are
-    NOT batched — the v6 policy consumes only the reconstructed graph,
-    and storing full belief grids per step would blow up memory.
-
-    Requires ``env_kwargs`` to have both ``sensor_radius`` set (so the
-    sensor step has a defined disk) and ``use_belief_maps=True`` (so the
-    log-odds tensor that feeds the peak extractor is maintained).
-    """
-
-    #: obs keys that stay inside the env (not fed to the policy/buffer).
-    _EXCLUDE = ("belief_maps", "true_occupancy")
-
-    def __init__(
-        self,
-        n_envs:              int,
-        env_kwargs:          Dict[str, Any],
-        base_seed:           int = 0,
-        episode_buffer_size: int = 128,
-        red_policy_mix:      Optional[Sequence[Tuple[str, float]]] = None,
-    ) -> None:
-        if env_kwargs.get("sensor_radius", None) is None:
-            raise ValueError(
-                "Stage4VectorPursuitEnv requires env_kwargs['sensor_radius'] "
-                "to be set (belief update needs a defined sensor disk)."
-            )
-        if not env_kwargs.get("use_belief_maps", False):
-            raise ValueError(
-                "Stage4VectorPursuitEnv requires "
-                "env_kwargs['use_belief_maps']=True."
-            )
-        super().__init__(
-            n_envs               = n_envs,
-            env_kwargs           = env_kwargs,
-            base_seed            = base_seed,
-            episode_buffer_size  = episode_buffer_size,
-            red_policy_mix       = red_policy_mix,
-        )
-        e0 = self.envs[0]
-        self.n_red       = e0.n_red
-        self.n_obstacles = e0.n_obstacles
-
-        # Discover the graph-obs schema from one sample observation so
-        # obstacle keys appear only when configured.
-        e0.reset(seed=base_seed)
-        sample = e0.structured_belief_observation()
-        self._graph_keys = [k for k in sample if k not in self._EXCLUDE]
-        self._graph_shapes = {k: tuple(sample[k].shape) for k in self._graph_keys}
-
-    # ------------------------------------------------------------------ #
-    #  Structured-obs override (generic over the v6 graph schema)          #
-    # ------------------------------------------------------------------ #
-
-    def _empty_batch(self) -> Dict[str, np.ndarray]:  # type: ignore[override]
-        return {
-            k: np.zeros((self.n_envs,) + shp, dtype=np.float32)
-            for k, shp in self._graph_shapes.items()
-        }
-
-    def _fill_row(  # type: ignore[override]
-        self, batch: Dict[str, np.ndarray], idx: int, env: PursuitEnv,
-    ) -> None:
-        obs = env.structured_belief_observation()
-        for k in self._graph_keys:
-            batch[k][idx] = obs[k]

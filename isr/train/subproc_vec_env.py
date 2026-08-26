@@ -231,7 +231,7 @@ class SubprocStage4VecEnv:
 
     def recent_episode_stats(self) -> Dict[str, float]:
         """Aggregate the per-worker episode windows; same keys/semantics
-        as ``VectorPursuitEnv.recent_episode_stats``."""
+        as ``Stage4VectorPursuitEnv.recent_episode_stats``."""
         raws = self._broadcast_gather(
             "stats_raw", [None] * self.n_workers)
         returns      = [x for r in raws for x in r["returns"]]
