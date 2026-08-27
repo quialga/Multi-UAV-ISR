@@ -14,7 +14,7 @@ observation, action, reward, hyperparameters, acceptance criterion).
 """
 from __future__ import annotations
 
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 from gymnasium import spaces
@@ -885,6 +885,87 @@ class PursuitEnv(ParallelEnv):
 
     def close(self):
         pass
+
+    # ------------------------------------------------------------------ #
+    #  Raw sensor returns (identity-free) — input to a real tracker       #
+    # ------------------------------------------------------------------ #
+
+    def raw_detections(self) -> List[Dict[str, Any]]:
+        """
+        This step's sensor returns, WITHOUT target identity.
+
+        Why this exists: ``_build_enemy_tracks`` currently loops over TRUE red
+        indices, measures ``self._red_pos[r]``, and groups returns for fusion
+        by ``detect[:, r]``.  That means the simulator hands the policy a
+        perfect data association — which detection belongs to which target,
+        and a slot->target mapping that is stable across steps.  Real radar
+        gives none of that: a return is a position and a Doppler, with no
+        label.  Establishing identity IS the tracking problem.
+
+        This method emits exactly what a real sensor would, so an actual
+        tracker (association + filtering) can be built and measured against
+        ground truth.  It runs the SAME detection chain as the track builder
+        (range gate -> line of sight -> p_TP draw) and applies the same
+        range-scaled measurement noise, so the two are directly comparable.
+
+        Each detection is a dict:
+            blue        int   — the observing UAV (known: it is ours)
+            z_pos       (2,)  — measured position (true + range-scaled noise)
+            z_range     float — measured range to the observer
+            z_radial    float — radial (Doppler) speed along the LOS, noisy
+            los         (2,)  — unit line of sight, observer -> detection
+            sigma_pos   float — 1-sigma position noise for THIS return
+            sigma_radial float — 1-sigma Doppler noise for THIS return
+            truth_id    int   — TRUE target index.  For EVALUATION ONLY
+                                (MOT metrics / association scoring).  A
+                                tracker must never read this.
+
+        Note: clutter (false returns from ``p_FP``) is not emitted yet — the
+        belief map models it but the track path never did.  Association is
+        much harder with clutter, so add it before claiming the tracker
+        works; see the tracking module's notes.
+        """
+        out: List[Dict[str, Any]] = []
+        if self._red_pos is None:
+            return out
+        active = np.where(self._red_active)[0]
+        if len(active) == 0:
+            return out
+        red_act = self._red_pos[active]
+
+        for b in range(self.n_blue):
+            bp = self._blue_pos[b]
+            d = np.linalg.norm(red_act - bp[None, :], axis=1)
+            ok = (np.ones(len(active), dtype=bool) if self.sensor_radius is None
+                  else d <= self.sensor_radius)
+            if self.track_occlusion and ok.any():
+                ok &= ~self._rays_occluded_by_obstacles(bp, red_act)
+            if self.track_detection and ok.any():
+                ok &= self._rng.random(len(active)) < self.p_TP_enemy
+            for j in np.where(ok)[0]:
+                r = int(active[j])
+                rng_m = float(d[j])
+                scale = self._noise_scale(rng_m)
+                s_pos = self.sensor_pos_noise_std * scale
+                s_rad = self.sensor_vel_noise_std * scale
+                z_pos = self._measured_pos(self._red_pos[r], rng_m)
+                delta = self._red_pos[r] - bp
+                nrm = float(np.linalg.norm(delta))
+                los = (delta / nrm) if nrm > 1e-6 else np.zeros(2, np.float32)
+                z_rad = float(self._red_vel[r] @ los)
+                if s_rad > 0.0:
+                    z_rad += float(self._rng.normal(0.0, s_rad))
+                out.append({
+                    "blue": b,
+                    "z_pos": np.asarray(z_pos, dtype=np.float32),
+                    "z_range": float(np.linalg.norm(z_pos - bp)),
+                    "z_radial": z_rad,
+                    "los": los.astype(np.float32),
+                    "sigma_pos": float(s_pos),
+                    "sigma_radial": float(s_rad),
+                    "truth_id": r,          # EVALUATION ONLY
+                })
+        return out
 
     # ------------------------------------------------------------------ #
     #  Inspector / helpers                                                #
