@@ -456,8 +456,9 @@ class PursuitEnv(ParallelEnv):
             "track_conf_min must be in (0, 1]; 0 is reserved for dead/padded "
             "track slots")
         # Per-(blue, target) detection masks for THIS step, set by the track
-        # builders and consumed by the graph builders so a blue supplies
-        # own-sensor Doppler exactly when it actually detected the target.
+        # builders and read by _fuse_radial_velocity to pick which platforms
+        # contribute a radial measurement.  Also the diagnostic the sensor
+        # tests assert on to check the occlusion / p_TP gating.
         self._last_red_detect: Optional[np.ndarray] = None   # (n_blue, n_red)
         self._last_obs_detect: Optional[np.ndarray] = None   # (n_blue, n_obs)
         # Phase A prediction-step knobs (enemy channel only).
@@ -1984,19 +1985,6 @@ class PursuitEnv(ParallelEnv):
 
         return peak_pos, conf
 
-    def _blue_detected_red(self, b: int, r: int) -> bool:
-        """Did blue ``b`` detect red ``r`` on this step's scan?  Falls back
-        to the plain range test when no detection mask has been built yet
-        (e.g. a caller that skipped ``_build_enemy_tracks``)."""
-        m = self._last_red_detect
-        if m is not None:
-            return bool(m[b, r])
-        return bool(
-            self.sensor_radius is None
-            or np.linalg.norm(self._red_pos[r] - self._blue_pos[b])
-            <= self.sensor_radius
-        )
-
     def _noise_scale(self, rng_m: float) -> float:
         """Measurement-noise multiplier at measurement range ``rng_m``.
 
@@ -2010,19 +1998,6 @@ class PursuitEnv(ParallelEnv):
             return 1.0
         x = float(np.clip(rng_m / self.sensor_radius, 0.0, 1.0))
         return 1.0 + g * x * x
-
-    def _blue_detected_obstacle(self, b: int, o: int) -> bool:
-        """Did blue ``b`` detect obstacle ``o`` on this step's scan?  Mirrors
-        ``_blue_detected_red``; falls back to the plain range test when no
-        mask has been built yet."""
-        m = self._last_obs_detect
-        if m is not None:
-            return bool(m[b, o])
-        return bool(
-            self.sensor_radius is None
-            or np.linalg.norm(self._obstacle_pos[o] - self._blue_pos[b])
-            <= self.sensor_radius
-        )
 
     def _fuse_radial_velocity(
         self,
