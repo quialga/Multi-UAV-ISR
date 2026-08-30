@@ -328,3 +328,25 @@ def test_single_blue_crossing_geometry_is_unobservable():
                    det(b1, p2, v, blue=1, rng=rng2)])
     assert abs(trk2.tracks[0].vel[0] - v[0]) < 0.35, (
         "two non-collinear observers should recover the tangential velocity")
+
+
+def test_Q_matches_the_closed_form_DWNA():
+    """Pin Q against the literature form, so it cannot drift:
+
+        Q = sigma_a^2 [[dt^4/4,  0,       dt^3/2,  0     ],
+                       [0,       dt^4/4,  0,       dt^3/2],
+                       [dt^3/2,  0,       dt^2,    0     ],
+                       [0,       dt^3/2,  0,       dt^2  ]]
+
+    Two independent scalar accelerations, one per axis — NOT one shared.
+    """
+    from isr.tracking.tracker import _dwna_Q
+    for dt in (0.5, 1.0, 2.0):
+        for sa in (0.3, 1.0 / np.sqrt(2.0), 1.0):
+            expected = sa ** 2 * np.array([
+                [dt ** 4 / 4, 0, dt ** 3 / 2, 0],
+                [0, dt ** 4 / 4, 0, dt ** 3 / 2],
+                [dt ** 3 / 2, 0, dt ** 2, 0],
+                [0, dt ** 3 / 2, 0, dt ** 2],
+            ])
+            assert np.allclose(_dwna_Q(dt, sa), expected), (dt, sa)
