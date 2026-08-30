@@ -123,7 +123,19 @@ class MultiTargetTracker:
         confirm_window: int = 3,
         max_misses: int = 5,
         birth_cluster_dist: float = 6.0,
+        oracle_association: bool = False,
+        motion_model=None,
     ) -> None:
+        # Plug point for a LEARNED transition model.  A callable
+        # (x, P) -> (x_pred, P_pred); None uses the constant-velocity F/Q.
+        # Swapping it is the whole migration path: gating, association,
+        # lifecycle and metrics stay untouched.
+        self.motion_model = motion_model
+        # EVALUATION ONLY.  Reads det["truth_id"] to associate perfectly,
+        # which isolates FILTER quality from ASSOCIATION quality: the gap
+        # between oracle and real association IS the cost of associating.
+        # Never enable it for anything a policy consumes.
+        self.oracle_association = bool(oracle_association)
         self.dt = float(dt)
         # sigma_a is a STANDARD DEVIATION, not a bound.  For this red the
         # acceleration is always at full magnitude with a varying direction,
@@ -147,6 +159,8 @@ class MultiTargetTracker:
 
         self.tracks: List[Track] = []
         self.t = 0
+        self.last_nis: List[float] = []      # NIS of this step's updates
+        self._oracle_map: Dict[int, int] = {}   # truth_id -> track id
 
     # ---------------- Kalman primitives ---------------- #
 
@@ -162,12 +176,14 @@ class MultiTargetTracker:
         """
         y = np.atleast_1d(z) - H @ x
         S = H @ P @ H.T + R
-        K = P @ H.T @ np.linalg.inv(S)
+        Si = np.linalg.inv(S)
+        nis = float(y @ Si @ y)
+        K = P @ H.T @ Si
         x_new = x + K @ y
         A = np.eye(4) - K @ H
         P_new = A @ P @ A.T + K @ R @ K.T
         P_new = 0.5 * (P_new + P_new.T)          # kill drift in symmetry
-        return x_new, P_new
+        return x_new, P_new, nis
 
     def _gate_pos(self, tr: Track, det: Dict):
         """Mahalanobis d^2 and the NLL cost of pairing a track with a
@@ -231,11 +247,15 @@ class MultiTargetTracker:
 
     def step(self, detections: Sequence[Dict]) -> None:
         self.t += 1
+        self.last_nis = []
 
         # 1. PREDICT ------------------------------------------------------
         for tr in self.tracks:
-            tr.x = self.F @ tr.x
-            tr.P = self.F @ tr.P @ self.F.T + self.Q
+            if self.motion_model is None:
+                tr.x = self.F @ tr.x
+                tr.P = self.F @ tr.P @ self.F.T + self.Q
+            else:
+                tr.x, tr.P = self.motion_model(tr.x, tr.P)
 
         dets = list(detections)
         assigned_det = set()
@@ -248,35 +268,47 @@ class MultiTargetTracker:
             by_blue.setdefault(int(d["blue"]), []).append(k)
 
         assignments: List[tuple] = []      # (track_idx, det_idx)
-        for _blue, idxs in sorted(by_blue.items()):
-            if not self.tracks:
-                break
-            n, m = len(self.tracks), len(idxs)
-            cost = np.zeros((n, m))
-            gate = np.zeros((n, m), dtype=bool)
-            for i, tr in enumerate(self.tracks):
-                for j, k in enumerate(idxs):
-                    d2, c = self._gate_pos(tr, dets[k])
-                    cost[i, j] = c
-                    gate[i, j] = d2 <= self.gate_chi2
-            for i, j in solve_gated(cost, gate):
-                assignments.append((i, idxs[j]))
+        if self.oracle_association:
+            # EVALUATION ONLY — associate straight from the labels, so the
+            # gap against real association measures exactly what associating
+            # costs.
+            by_id = {tr.id: i for i, tr in enumerate(self.tracks)}
+            for k, d in enumerate(dets):
+                tid = self._oracle_map.get(int(d["truth_id"]))
+                if tid is not None and tid in by_id:
+                    assignments.append((by_id[tid], k))
+        else:
+            for _blue, idxs in sorted(by_blue.items()):
+                if not self.tracks:
+                    break
+                n, m = len(self.tracks), len(idxs)
+                cost = np.zeros((n, m))
+                gate = np.zeros((n, m), dtype=bool)
+                for i, tr in enumerate(self.tracks):
+                    for j, k in enumerate(idxs):
+                        d2, c = self._gate_pos(tr, dets[k])
+                        cost[i, j] = c
+                        gate[i, j] = d2 <= self.gate_chi2
+                for i, j in solve_gated(cost, gate):
+                    assignments.append((i, idxs[j]))
 
         # 4. UPDATE — sequential, position then Doppler, Joseph form.
         for i, k in assignments:
             tr = self.tracks[i]
             d = dets[k]
             R_p = np.eye(2) * d["sigma_pos"] ** 2
-            tr.x, tr.P = self._update(tr.x, tr.P, self.H_pos, R_p,
-                                      d["z_pos"].astype(np.float64))
+            tr.x, tr.P, nis = self._update(tr.x, tr.P, self.H_pos, R_p,
+                                           d["z_pos"].astype(np.float64))
+            self.last_nis.append(nis)
             # Doppler is LINEAR in the state once the line of sight is
             # known: h(x) = [0, 0, ux, uy] x.  No EKF needed.
             u = np.asarray(d["los"], dtype=np.float64)
             if np.linalg.norm(u) > 1e-6 and d["sigma_radial"] > 0.0:
                 H_d = np.array([[0.0, 0.0, u[0], u[1]]])
                 R_d = np.array([[d["sigma_radial"] ** 2]])
-                tr.x, tr.P = self._update(tr.x, tr.P, H_d, R_d,
-                                          np.array([d["z_radial"]]))
+                tr.x, tr.P, nis = self._update(tr.x, tr.P, H_d, R_d,
+                                               np.array([d["z_radial"]]))
+                self.last_nis.append(nis)
             assigned_det.add(k)
             hit_tracks.add(i)
 
@@ -285,7 +317,10 @@ class MultiTargetTracker:
         leftovers = [dets[k] for k in range(len(dets)) if k not in assigned_det]
         for group in self._cluster(leftovers, self.birth_cluster_dist):
             x, P = self._fuse_birth(group)
-            self.tracks.append(Track(x, P, self.t))
+            tr = Track(x, P, self.t)
+            self.tracks.append(tr)
+            if self.oracle_association:
+                self._oracle_map[int(group[0]["truth_id"])] = tr.id
 
         # 6. COAST / DIE / PROMOTE.
         survivors: List[Track] = []
