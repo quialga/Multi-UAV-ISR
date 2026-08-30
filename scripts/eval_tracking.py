@@ -68,14 +68,18 @@ def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900):
                     for a in e.agents})
 
             active = np.where(e._red_active)[0]
-            gt_ids = [int(r) for r in active]
+            # GT ids must be unique ACROSS episodes: the red index repeats
+            # every episode, so using it directly merges 8 different
+            # trajectories into one and corrupts IDF1 / MT / ML / Frag, and
+            # counts a bogus ID switch at every episode boundary.
+            gt_ids = [f"e{ep}_r{int(r)}" for r in active]
             gt_pos = e._red_pos[active] if len(active) else np.zeros((0, 2))
 
             # --- 1. what the policy sees today: the belief track slots ----
             tp, tc, tr_id, _tv, _tvc = e._build_enemy_tracks()
             real_slots = [s for s in range(len(tc)) if tc[s] > 0]
             acc["belief"].update(gt_ids, gt_pos,
-                                 [f"slot{s}" for s in real_slots],
+                                 [f"e{ep}_slot{s}" for s in real_slots],
                                  tp[real_slots] if real_slots else np.zeros((0, 2)))
             n_tracks["belief"].append(len(real_slots))
 
@@ -121,7 +125,7 @@ def main() -> None:
               "oracle": "KF + ORACLE assoc",
               "real":   "KF + real assoc"}
     keys = ("belief", "oracle", "real")
-    cols = ("MOTA", "MOTP", "IDF1", "recall", "IDSW", "FP", "FN", "MT", "ML")
+    cols = ("MOTA", "MOTP", "IDF1", "recall", "IDSW", "Frag", "FP", "FN", "MT", "ML")
 
     print(f"\n{a.episodes} episodes x {a.steps} steps, match gate "
           f"{a.match_dist} m\n")
