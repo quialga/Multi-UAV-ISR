@@ -49,9 +49,11 @@ def _env(seed: int, **kw):
 
 
 def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900):
-    acc = {k: MOTAccumulator(match_dist) for k in ("belief", "oracle", "real")}
+    keys = ("raw", "belief", "oracle", "real")
+    acc = {k: MOTAccumulator(match_dist) for k in keys}
     cons = {k: ConsistencyAccumulator() for k in ("oracle", "real")}
-    n_tracks = {k: [] for k in ("belief", "oracle", "real")}
+    n_tracks = {k: [] for k in keys}
+    detectable = []          # the ceiling nothing can beat without PREDICTING
 
     for ep in range(episodes):
         e = _env(seed_base + ep)
@@ -75,6 +77,23 @@ def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900):
             gt_ids = [f"e{ep}_r{int(r)}" for r in active]
             gt_pos = e._red_pos[active] if len(active) else np.zeros((0, 2))
 
+            # --- 0. references that make the numbers interpretable -------
+            # (a) the detectability ceiling: no tracker can exceed the
+            #     fraction of targets currently in sensor range unless it
+            #     PREDICTS through the gaps.
+            if len(active):
+                dd = np.linalg.norm(e._red_pos[active][:, None, :]
+                                    - e._blue_pos[None, :, :], axis=-1)
+                detectable.append(float((dd.min(axis=1) <= e.sensor_radius).mean()))
+            # (b) the naive floor: report every raw return as a hypothesis,
+            #     no filtering, no association, no memory.
+            raw = e.raw_detections()
+            acc["raw"].update(gt_ids, gt_pos,
+                              [f"e{ep}_d{i}" for i in range(len(raw))],
+                              np.array([d["z_pos"] for d in raw]) if raw
+                              else np.zeros((0, 2)))
+            n_tracks["raw"].append(len(raw))
+
             # --- 1. what the policy sees today: the belief track slots ----
             tp, tc, tr_id, _tv, _tvc = e._build_enemy_tracks()
             real_slots = [s for s in range(len(tc)) if tc[s] > 0]
@@ -84,7 +103,7 @@ def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900):
             n_tracks["belief"].append(len(real_slots))
 
             # --- 2 & 3. the tracker -------------------------------------
-            dets = e.raw_detections()
+            dets = raw
             for key in ("oracle", "real"):
                 trk[key].step(dets)
                 cons[key].add_nis(trk[key].last_nis)
@@ -107,7 +126,7 @@ def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900):
                         x_true = np.concatenate([e._red_pos[r], e._red_vel[r]])
                         cons[key].add_nees(t.x, t.P, x_true)
 
-    return acc, cons, n_tracks
+    return acc, cons, n_tracks, float(np.mean(detectable))
 
 
 def main() -> None:
@@ -119,12 +138,13 @@ def main() -> None:
                    help="max distance for a hypothesis to count as a match")
     a = p.parse_args()
 
-    acc, cons, ntr = run(a.episodes, a.steps, a.match_dist)
+    acc, cons, ntr, ceiling = run(a.episodes, a.steps, a.match_dist)
 
-    labels = {"belief": "belief peaks (today)",
+    labels = {"raw": "raw detections (floor)",
+              "belief": "belief peaks (today)",
               "oracle": "KF + ORACLE assoc",
               "real":   "KF + real assoc"}
-    keys = ("belief", "oracle", "real")
+    keys = ("raw", "belief", "oracle", "real")
     cols = ("MOTA", "MOTP", "IDF1", "recall", "IDSW", "Frag", "FP", "FN", "MT", "ML")
 
     print(f"\n{a.episodes} episodes x {a.steps} steps, match gate "
@@ -149,9 +169,17 @@ def main() -> None:
             print(f"  {labels[k]:<22} NEES {c.get('NEES', float('nan')):6.2f}"
                   f"   NIS {c.get('NIS', float('nan')):6.2f}")
 
-    print("\nMOTP is the localisation error in metres over MATCHED pairs.")
+    print(f"\nDETECTABILITY CEILING = {ceiling:.2f} — the fraction of active")
+    print("targets inside sensor_radius.  Recall cannot exceed this without")
+    print("PREDICTING through the gaps, so judge recall against it, not 1.0.")
+
+    print("\nMOTP is the localisation error in metres over MATCHED pairs, so")
+    print("it is CONDITIONAL on matching: the belief map's peaks that sit")
+    print("19-40 m out are counted as FP/FN and never enter its MOTP.")
     print("The belief row's IDF1/IDSW are not meaningful: its slot identity")
     print("comes from the simulator, not from association.")
+    print("\nMOTA is ~degenerate here: FN is >95% of its loss, so MOTA ~ recall")
+    print("and carries no information the recall column does not.")
 
 
 if __name__ == "__main__":
