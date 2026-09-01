@@ -137,13 +137,32 @@ class MultiTargetTracker:
         # Never enable it for anything a policy consumes.
         self.oracle_association = bool(oracle_association)
         self.dt = float(dt)
-        # sigma_a is a STANDARD DEVIATION, not a bound.  For this red the
-        # acceleration is always at full magnitude with a varying direction,
-        # so per axis a_i = a_max*cos(theta) and Var = a_max^2 / 2 —
-        # measured 0.704 against a_max/sqrt(2) = 0.707.  (a_max/sqrt(3)
-        # would be the value for a UNIFORM magnitude, which this is not.)
-        # Treat it as a starting point and tune it by NIS/NEES consistency.
-        self.sigma_a = float(a_max / np.sqrt(2.0)) if sigma_a is None \
+        # sigma_a is a STANDARD DEVIATION, not a bound.
+        #
+        # Step 1 — the white-noise value.  This red normalises its
+        # acceleration to unit magnitude, so only the DIRECTION varies:
+        # a_i = a_max*cos(theta), hence Var[a_i] = a_max^2/2 and
+        # sigma_white = a_max/sqrt(2) = 0.707.  Measured 0.704.  (The
+        # a_max/sqrt(3) of a UNIFORM magnitude does not apply here.)
+        #
+        # Step 2 — the correlation correction.  DWNA assumes WHITE noise,
+        # and this acceleration is not: measured lag-1 rho = 0.546 (per
+        # track; a naive estimate that concatenates tracks is meaningless).
+        # For an AR(1)-like acceleration the variance of the sum of N
+        # increments is
+        #     Var = N s^2 (1 + 2 sum_{k=1..N-1} (1 - k/N) rho^k)
+        # against N s^2 for white noise, i.e. an inflation of 2.4-3.1 over
+        # 5-20 step horizons, so sigma_a should be scaled by 1.55-1.77.
+        # An independent NEES sweep put the optimum at ~2x the white-noise
+        # value.  Theory and measurement agree within ~15%, so:
+        #
+        #     sigma_a = a_max * sqrt(2)   (= 2x the white-noise value)
+        #
+        # NEES 5.29 -> 4.91 against a target of 4.0.  Note this does NOT
+        # change recall (a Q sweep over 16x moved it 0.30-0.31): Q scales
+        # the covariance, not the predicted MEAN.  It buys calibration and
+        # fewer false positives, nothing more.
+        self.sigma_a = float(a_max * np.sqrt(2.0)) if sigma_a is None \
             else float(sigma_a)
         self.vel_prior_std = float(vel_prior_std)
         self.gate_chi2 = float(gate_chi2)

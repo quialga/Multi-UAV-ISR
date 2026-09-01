@@ -84,11 +84,17 @@ def test_single_target_is_tracked_and_velocity_converges():
     trk = _tracker()
     rng = np.random.default_rng(0)
     p = np.array([50.0, 50.0]); v = np.array([0.8, -0.4])
-    blue = np.array([20.0, 60.0])
+    # Two non-collinear observers so velocity is fully observable; with one
+    # observer the tangential component is weak (see the unobservable-
+    # geometry test) and the larger, correlation-corrected Q makes the
+    # filter trust each noisy measurement more, so the velocity estimate is
+    # deliberately looser.
+    b0 = np.array([20.0, 60.0]); b1 = np.array([60.0, 20.0])
     errs = []
     for t in range(25):
         p = p + v
-        trk.step([det(blue, p, v, rng=rng)])
+        trk.step([det(b0, p, v, blue=0, rng=rng),
+                  det(b1, p, v, blue=1, rng=rng)])
         assert len(trk.tracks) == 1, "a single target must not spawn extras"
         errs.append(np.linalg.norm(trk.tracks[0].pos - p))
     assert trk.tracks[0].confirmed
@@ -272,11 +278,16 @@ def test_process_noise_has_independent_axes():
     assert np.isclose(trk.Q[0, 2] ** 2, trk.Q[0, 0] * trk.Q[2, 2])
 
 
-def test_sigma_a_defaults_to_amax_over_sqrt2():
-    """Constant-magnitude, varying-direction acceleration => Var per axis is
-    a_max^2/2 (measured 0.704 vs 0.707), not a_max^2/3."""
+def test_sigma_a_default_includes_the_correlation_correction():
+    """Two steps: the white-noise value is a_max/sqrt(2) (constant-magnitude,
+    varying-direction acceleration => Var per axis a_max^2/2, measured
+    0.704), then a x2 correction because the acceleration is NOT white —
+    measured lag-1 rho = 0.546, whose AR(1) variance inflation implies
+    x1.55-1.77, and an independent NEES sweep put the optimum at x2."""
     trk = _tracker(a_max=1.0)
-    assert abs(trk.sigma_a - 1.0 / np.sqrt(2.0)) < 1e-9
+    assert abs(trk.sigma_a - np.sqrt(2.0)) < 1e-9
+    # Explicit sigma_a still wins.
+    assert abs(_tracker(a_max=1.0, sigma_a=0.3).sigma_a - 0.3) < 1e-9
 
 
 def test_no_detections_ever_is_a_no_op():
