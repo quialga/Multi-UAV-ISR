@@ -659,6 +659,13 @@ class PursuitEnv(ParallelEnv):
         self._last_n_caught = 0
         self.agents = list(self.possible_agents)
 
+        # A STATEFUL red policy (e.g. StochasticRed, whose noise is
+        # temporally correlated and whose side-commitments persist across
+        # steps) must not carry that state into the next episode.  Duck-typed
+        # so plain function policies are untouched.
+        if hasattr(self.red_policy, "reset"):
+            self.red_policy.reset(self.n_red)
+
         # Stage 4: zero the command-layer fused belief map (C, H, W).
         if self.use_belief_maps:
             self._belief_maps = np.zeros(

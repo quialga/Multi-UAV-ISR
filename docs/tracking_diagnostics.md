@@ -150,6 +150,62 @@ targets. This is the honest number the §1 headline table did not have
 non-zero rate and, if this collapse matters in practice, tighten
 `birth_cluster_dist` / `confirm_hits` against it specifically.
 
+## 7. The red is now STOCHASTIC (a scope decision)
+
+Everything from here assumes a stochastic evader — a deterministic one is
+convenient but not what a real adversary does, and it distorts the whole
+downstream design (a predictor trained against it has no aleatoric
+uncertainty to represent, so a mixture model has nothing to earn).
+
+`isr/agents/stochastic_red.py::StochasticRed` wraps the deterministic
+heuristic with three independent, separately-tunable sources. All default
+to off, so with no arguments it is byte-identical to
+`run_from_nearest_uav`.
+
+Measured (same start, same blue actions, re-rolled noise; `scratch/check_stoch_red.py`):
+
+| config | divergence @30 steps | rho lag-1 | aleatoric bimodality |
+|---|---|---|---|
+| deterministic (before) | 0.0 m | 0.662 | 0% |
+| iid (`rho = 0`) | **1.6 m** (0.3 cells) | **0.536** ↓ | 0% |
+| AR(1) correlated | 2.5 m | 0.669 | 0% |
+| AR(1) + committed side | **9.0 m** | 0.639 | **20%** (80° apart) |
+
+Three conclusions, each of which shaped the design:
+
+1. **iid noise is nearly invisible.** 1.6 m over 30 steps is 0.3 belief
+   cells — below the grid's resolution, and any predictor averages it out.
+   It adds variance to the training target while changing no behaviour
+   worth predicting.
+2. **iid noise also WHITENS the natural correlation** (rho 0.662 → 0.536),
+   destroying the very structure that §4's `sigma_a` correction is built
+   on. Correlated (AR(1)) noise preserves it (0.669).
+3. **Only the committed side choice produces ALEATORIC bimodality.**
+   Measured with the state held EXACTLY fixed and only the policy's own
+   noise re-rolled, so the 20% is not our belief uncertainty leaking in.
+   This is the justification for a mixture/particle predictor rather than
+   a single Gaussian.
+
+The AR(1) innovation is scaled by `sqrt(1 - rho^2)` so the marginal std
+stays `heading_noise_std` whatever `rho` is — otherwise turning correlation
+up would silently turn the noise amount down, confounding two knobs.
+
+**Consequence for step (b).** There are now TWO sources of multimodality:
+
+* **epistemic** — our uncertainty over `s` pushed through the policy's
+  "nearest blue" discontinuity. Measured at **45% bimodal even at
+  sigma = 1 m**, rising to 78% at sigma = 20 m, modes 115-142° apart. This
+  one needs no mixture *output*: sampling `s ~ N(x, P)` and evaluating a
+  DETERMINISTIC regressor reproduces it for free.
+* **aleatoric** — the evader's own committed choices (20%, above). This
+  one does need a mixture output, or explicit noise sampling.
+
+Either way, **collapsing the predicted mixture to moments is wrong**: with
+modes ~115° apart the mean lands between them, which is the one heading the
+evader will not fly. The `motion_model` plug point's `(x, P) -> (x-, P-)`
+signature must therefore widen to carry particles or mixture components;
+that is a real change to the tracker, not just a swapped function.
+
 ## Reproduce
 
 ```
