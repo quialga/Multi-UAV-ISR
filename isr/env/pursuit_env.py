@@ -275,6 +275,16 @@ class PursuitEnv(ParallelEnv):
         # v_max.  It makes the fusion solvable for ANY detector geometry and
         # supplies the honest fallback in an unobserved direction.
         vel_prior_std:            float = 1.0,
+        # False returns (clutter) in raw_detections(), for the TRACK path
+        # only.  Modelled at the PLOT level, not the cell level: the belief
+        # map's per-cell p_FP would inject ~one false return per resolution
+        # cell (~200 in a 40 m disk), but a real radar's plot extractor
+        # (CFAR + clustering) already suppresses most cell-level false
+        # alarms, so plot clutter is far sparser.  Poisson mean per blue per
+        # scan; each false plot is uniform in that blue's sensor disk (and
+        # occlusion-gated, like a real return) with a meaningless Doppler.
+        # 0.0 (default) = no clutter, so raw_detections stays byte-identical.
+        clutter_rate:             float = 0.0,
         # ----- Crash penalties (per-agent shaped reward) ------------------
         # Both default 0.0 (off) so the shared-team-reward behaviour is
         # byte-preserved unless enabled.  When > 0, a crashing blue takes
@@ -449,7 +459,9 @@ class PursuitEnv(ParallelEnv):
         self.track_conf_min           = float(track_conf_min)
         self.sensor_noise_range_growth = float(sensor_noise_range_growth)
         self.vel_prior_std             = float(vel_prior_std)
+        self.clutter_rate              = float(clutter_rate)
         assert self.vel_prior_std > 0.0
+        assert self.clutter_rate >= 0.0
         assert self.sensor_vel_noise_std >= 0.0
         assert self.sensor_noise_range_growth >= 0.0
         assert 0.0 < self.track_conf_min <= 1.0, (
@@ -916,56 +928,93 @@ class PursuitEnv(ParallelEnv):
             los         (2,)  — unit line of sight, observer -> detection
             sigma_pos   float — 1-sigma position noise for THIS return
             sigma_radial float — 1-sigma Doppler noise for THIS return
-            truth_id    int   — TRUE target index.  For EVALUATION ONLY
+            truth_id    int   — TRUE target index for a real return; -1 for a
+                                CLUTTER (false) return.  For EVALUATION ONLY
                                 (MOT metrics / association scoring).  A
                                 tracker must never read this.
 
-        Note: clutter (false returns from ``p_FP``) is not emitted yet — the
-        belief map models it but the track path never did.  Association is
-        much harder with clutter, so add it before claiming the tracker
-        works; see the tracking module's notes.
+        Clutter: when ``clutter_rate > 0``, each blue also emits Poisson-many
+        FALSE returns per scan, uniform in its sensor disk, occlusion-gated
+        like a real return, carrying a meaningless (random) Doppler.  These
+        make association HARD — without them every return belongs to some
+        real target and the matcher barely errs, so the gate / M-of-N /
+        birth logic looks better than it is.  Clutter is at the PLOT level,
+        not the belief map's per-cell level (see ``clutter_rate``).
         """
         out: List[Dict[str, Any]] = []
         if self._red_pos is None:
             return out
+
         active = np.where(self._red_active)[0]
-        if len(active) == 0:
-            return out
-        red_act = self._red_pos[active]
+        red_act = self._red_pos[active] if len(active) else np.zeros((0, 2))
 
         for b in range(self.n_blue):
             bp = self._blue_pos[b]
-            d = np.linalg.norm(red_act - bp[None, :], axis=1)
-            ok = (np.ones(len(active), dtype=bool) if self.sensor_radius is None
-                  else d <= self.sensor_radius)
-            if self.track_occlusion and ok.any():
-                ok &= ~self._rays_occluded_by_obstacles(bp, red_act)
-            if self.track_detection and ok.any():
-                ok &= self._rng.random(len(active)) < self.p_TP_enemy
-            for j in np.where(ok)[0]:
-                r = int(active[j])
-                rng_m = float(d[j])
-                scale = self._noise_scale(rng_m)
-                s_pos = self.sensor_pos_noise_std * scale
-                s_rad = self.sensor_vel_noise_std * scale
-                z_pos = self._measured_pos(self._red_pos[r], rng_m)
-                delta = self._red_pos[r] - bp
-                nrm = float(np.linalg.norm(delta))
-                los = (delta / nrm) if nrm > 1e-6 else np.zeros(2, np.float32)
-                z_rad = float(self._red_vel[r] @ los)
-                if s_rad > 0.0:
-                    z_rad += float(self._rng.normal(0.0, s_rad))
-                out.append({
-                    "blue": b,
-                    "z_pos": np.asarray(z_pos, dtype=np.float32),
-                    "z_range": float(np.linalg.norm(z_pos - bp)),
-                    "z_radial": z_rad,
-                    "los": los.astype(np.float32),
-                    "sigma_pos": float(s_pos),
-                    "sigma_radial": float(s_rad),
-                    "truth_id": r,          # EVALUATION ONLY
-                })
+
+            # --- real returns -------------------------------------------
+            if len(active):
+                d = np.linalg.norm(red_act - bp[None, :], axis=1)
+                ok = (np.ones(len(active), dtype=bool)
+                      if self.sensor_radius is None else d <= self.sensor_radius)
+                if self.track_occlusion and ok.any():
+                    ok &= ~self._rays_occluded_by_obstacles(bp, red_act)
+                if self.track_detection and ok.any():
+                    ok &= self._rng.random(len(active)) < self.p_TP_enemy
+                for j in np.where(ok)[0]:
+                    r = int(active[j])
+                    rng_m = float(d[j])
+                    z_pos = self._measured_pos(self._red_pos[r], rng_m)
+                    delta = self._red_pos[r] - bp
+                    nrm = float(np.linalg.norm(delta))
+                    los = (delta / nrm) if nrm > 1e-6 else np.zeros(2, np.float32)
+                    z_rad = float(self._red_vel[r] @ los)
+                    s_rad = self.sensor_vel_noise_std * self._noise_scale(rng_m)
+                    if s_rad > 0.0:
+                        z_rad += float(self._rng.normal(0.0, s_rad))
+                    out.append(self._make_return(
+                        b, bp, z_pos, los, z_rad,
+                        self.sensor_pos_noise_std * self._noise_scale(rng_m),
+                        s_rad, truth_id=r))
+
+            # --- clutter (false returns) --------------------------------
+            if self.clutter_rate > 0.0 and self.sensor_radius is not None:
+                n_c = int(self._rng.poisson(self.clutter_rate))
+                for _ in range(n_c):
+                    # Uniform in the disk: r ~ R*sqrt(u), theta ~ U[0, 2pi).
+                    rad = self.sensor_radius * np.sqrt(self._rng.random())
+                    th = self._rng.random() * 2.0 * np.pi
+                    pt = bp + rad * np.array([np.cos(th), np.sin(th)],
+                                             dtype=np.float32)
+                    if np.any(pt < 0.0) or np.any(pt > self.arena_size):
+                        continue                     # off the arena
+                    if self.track_occlusion and bool(
+                            self._rays_occluded_by_obstacles(bp, pt[None, :])[0]):
+                        continue                     # a false alarm needs LOS too
+                    delta = pt - bp
+                    nrm = float(np.linalg.norm(delta))
+                    los = (delta / nrm) if nrm > 1e-6 else np.zeros(2, np.float32)
+                    scale = self._noise_scale(float(nrm))
+                    # A false alarm is a threshold crossing in a range-Doppler
+                    # cell, so it carries a MEANINGLESS Doppler, not none.
+                    z_rad = float(self._rng.uniform(-self.vel_prior_std,
+                                                    self.vel_prior_std))
+                    out.append(self._make_return(
+                        b, bp, pt, los, z_rad,
+                        self.sensor_pos_noise_std * scale,
+                        self.sensor_vel_noise_std * scale, truth_id=-1))
         return out
+
+    def _make_return(self, b, bp, z_pos, los, z_rad, s_pos, s_rad, truth_id):
+        return {
+            "blue": int(b),
+            "z_pos": np.asarray(z_pos, dtype=np.float32),
+            "z_range": float(np.linalg.norm(np.asarray(z_pos) - bp)),
+            "z_radial": float(z_rad),
+            "los": np.asarray(los, dtype=np.float32),
+            "sigma_pos": float(s_pos),
+            "sigma_radial": float(s_rad),
+            "truth_id": int(truth_id),          # EVALUATION ONLY; -1 = clutter
+        }
 
     # ------------------------------------------------------------------ #
     #  Inspector / helpers                                                #

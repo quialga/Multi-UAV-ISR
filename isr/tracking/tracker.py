@@ -290,9 +290,14 @@ class MultiTargetTracker:
         if self.oracle_association:
             # EVALUATION ONLY — associate straight from the labels, so the
             # gap against real association measures exactly what associating
-            # costs.
+            # costs.  Perfect association also means perfect CLUTTER
+            # REJECTION (truth_id < 0): telling a false alarm from a target
+            # is part of the association problem, so the oracle gets it
+            # right by construction and the real tracker has to earn it.
             by_id = {tr.id: i for i, tr in enumerate(self.tracks)}
             for k, d in enumerate(dets):
+                if int(d["truth_id"]) < 0:
+                    continue
                 tid = self._oracle_map.get(int(d["truth_id"]))
                 if tid is not None and tid in by_id:
                     assignments.append((by_id[tid], k))
@@ -334,6 +339,9 @@ class MultiTargetTracker:
         # 5. BIRTH — after ALL blues, so one new target does not spawn one
         # track per observing blue.
         leftovers = [dets[k] for k in range(len(dets)) if k not in assigned_det]
+        if self.oracle_association:
+            # Perfect association never births a track on clutter.
+            leftovers = [d for d in leftovers if int(d["truth_id"]) >= 0]
         for group in self._cluster(leftovers, self.birth_cluster_dist):
             x, P = self._fuse_birth(group)
             tr = Track(x, P, self.t)

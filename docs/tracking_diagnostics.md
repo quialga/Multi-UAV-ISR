@@ -118,6 +118,38 @@ The remaining 0.36 at stage 2 are targets **never detected**, so no track
 is even born — unfixable by any filter; it needs SEARCH (the grid as birth
 intensity, and the planner).
 
+## 6. Clutter (`clutter_rate`) — the real cost of association
+
+Added `clutter_rate` to `raw_detections()`: Poisson-mean false plots per
+blue per scan, uniform in the sensor disk, occlusion-gated like a real
+return, with a meaningless (random) Doppler. Modelled at the PLOT level,
+not the belief map's per-cell `p_FP` — a per-cell rate would inject ~one
+false return per resolution cell (~200 in a 40 m disk), which is not what
+a real plot extractor (CFAR + clustering) leaves behind.
+
+Why it matters: without clutter every return belongs to some real target,
+so the matcher barely errs and the gate / M-of-N / birth logic look better
+than they are. Oracle association rejects clutter by construction
+(`truth_id < 0` is never assigned or used to birth a track), so the gap
+between oracle and real IS the cost of associating under clutter:
+
+| clutter / blue / scan | assoc | MOTA | recall | FP | tracks |
+|---|---|---|---|---|---|
+| 0.0 | oracle | 0.27 | 0.30 | 55 | 0.97 |
+| 0.0 | real | 0.25 | 0.30 | 105 | 1.02 |
+| 0.3 | oracle | 0.27 | 0.30 | 58 | 0.97 |
+| 0.3 | real | **−0.22** | 0.30 | 1356 | 2.41 |
+| 1.0 | oracle | 0.28 | 0.31 | 45 | 0.97 |
+| 1.0 | real | **−2.52** | 0.29 | 7548 | 9.27 |
+
+The oracle line is flat regardless of clutter (as it must be); the real
+line collapses because clutter that survives one scan's gate becomes a
+tentative track, and enough clutter births more tracks than there are
+targets. This is the honest number the §1 headline table did not have
+(it was measured at `clutter_rate = 0`); a follow-up should re-run it at a
+non-zero rate and, if this collapse matters in practice, tighten
+`birth_cluster_dist` / `confirm_hits` against it specifically.
+
 ## Reproduce
 
 ```
@@ -125,4 +157,5 @@ python scripts/eval_tracking.py --episodes 8 --steps 150
 ```
 
 Scratch scripts (`scratch/`, not committed): `diag_gap.py` (§2),
-`sweep_q.py` (§3), `autocorr.py` (§4). NEES/NIS are in the eval output.
+`sweep_q.py` (§3), `autocorr.py` (§4), `clutter_impact.py` (§6). NEES/NIS
+are in the eval output.

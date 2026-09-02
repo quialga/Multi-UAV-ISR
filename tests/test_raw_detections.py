@@ -164,3 +164,91 @@ def test_runs_over_a_full_episode():
             assert np.all(np.isfinite(d["z_pos"]))
             assert env._red_active[d["truth_id"]], "return from a dead red"
     assert total > 0, "no detections at all over an episode"
+
+
+# ---- Clutter (false returns) ---------------------------------------------
+
+def test_no_clutter_by_default():
+    """clutter_rate = 0 keeps raw_detections byte-identical to before."""
+    env = _clear(_env(track_detection=False))
+    for _ in range(50):
+        assert all(d["truth_id"] >= 0 for d in env.raw_detections())
+
+
+def test_clutter_rate_is_the_poisson_mean_per_blue():
+    """Each blue emits Poisson(clutter_rate) false plots per scan."""
+    rate = 2.0
+    env = _env(n_blue=3, n_obstacles=0, track_detection=False,
+               clutter_rate=rate)
+    env._red_active[:] = False                 # isolate: no real returns
+    env._blue_pos[:] = np.array([65.0, 65.0], dtype=np.float32)
+    counts = []
+    for _ in range(400):
+        dets = env.raw_detections()
+        assert all(d["truth_id"] == -1 for d in dets)
+        counts.append(len(dets))
+    # 3 blues x rate each; sampling is in-disk and arena-clipped, so the
+    # observed mean is a slight under-count.
+    assert 0.8 * 3 * rate < np.mean(counts) <= 3 * rate * 1.05
+
+
+def test_clutter_is_a_well_formed_return():
+    """A false plot must be indistinguishable from a real one to a tracker:
+    same fields, unit LOS, positive sigmas, position on the arena."""
+    env = _env(n_blue=1, n_obstacles=0, track_detection=False,
+               clutter_rate=8.0)
+    env._red_active[:] = False
+    env._blue_pos[0] = np.array([65.0, 65.0], dtype=np.float32)
+    dets = env.raw_detections()
+    assert dets, "expected clutter"
+    for d in dets:
+        assert set(d) == {"blue", "z_pos", "z_range", "z_radial", "los",
+                          "sigma_pos", "sigma_radial", "truth_id"}
+        assert np.isclose(np.linalg.norm(d["los"]), 1.0, atol=1e-5)
+        assert d["sigma_pos"] > 0.0
+        assert 0.0 <= d["z_pos"][0] <= env.arena_size
+        assert 0.0 <= d["z_pos"][1] <= env.arena_size
+        assert d["z_range"] <= env.sensor_radius * 1.2
+
+
+def test_clutter_lies_inside_the_sensor_disk():
+    env = _env(n_blue=1, n_obstacles=0, track_detection=False,
+               clutter_rate=6.0)
+    env._red_active[:] = False
+    bp = np.array([65.0, 65.0], dtype=np.float32)
+    env._blue_pos[0] = bp
+    for _ in range(40):
+        for d in env.raw_detections():
+            assert np.linalg.norm(d["z_pos"] - bp) <= env.sensor_radius + 1e-4
+
+
+def test_clutter_respects_occlusion():
+    """A false alarm still needs line of sight — it is a threshold crossing
+    in a real beam, not a ghost that sees through walls."""
+    env = _env(n_blue=1, n_obstacles=1, track_detection=False,
+               clutter_rate=40.0, sensor_radius=40.0)
+    env._red_active[:] = False
+    env._obstacle_pos = np.array([[65.0, 65.0]], dtype=np.float32)
+    env._obstacle_r = np.array([14.0], dtype=np.float32)
+    env._recompute_obstacle_grid()
+    bp = np.array([40.0, 65.0], dtype=np.float32)
+    env._blue_pos[0] = bp
+    n = 0
+    for _ in range(40):
+        for d in env.raw_detections():
+            n += 1
+            assert not bool(env._rays_occluded_by_obstacles(
+                bp, d["z_pos"][None, :])[0]), "clutter behind an obstacle"
+    assert n > 0
+
+
+def test_clutter_doppler_is_meaningless_but_present():
+    """A false alarm carries a Doppler (it IS a range-Doppler cell crossing),
+    it just means nothing — so it must not be a constant zero."""
+    env = _env(n_blue=1, n_obstacles=0, track_detection=False,
+               clutter_rate=10.0)
+    env._red_active[:] = False
+    env._blue_pos[0] = np.array([65.0, 65.0], dtype=np.float32)
+    vals = [d["z_radial"] for _ in range(30) for d in env.raw_detections()]
+    assert len(vals) > 20
+    assert np.std(vals) > 0.1, "clutter Doppler is degenerate"
