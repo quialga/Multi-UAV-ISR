@@ -2,13 +2,20 @@
 tests/test_stochastic_red.py — the scripted evader's randomness.
 
 The point of these is that the noise has to be the RIGHT KIND, not merely
-present.  Measured: per-step iid jitter moves the red 1.6 m over 30 steps
-(0.3 belief cells — sub-cell, so invisible to the map and averaged out by
-any predictor) AND it whitens the natural acceleration correlation
-(rho 0.66 -> 0.54).  Correlated drift plus a committed side choice moves it
+present. Measured for HEADING: per-step iid jitter moves the red 1.6 m over
+30 steps (0.3 belief cells — sub-cell, so invisible to the map and averaged
+out by any predictor) AND it whitens the natural acceleration correlation
+(rho 0.66 -> 0.54). Correlated drift plus a committed side choice moves it
 9.0 m, keeps rho at 0.64, and is the only variant that produces genuine
 ALEATORIC bimodality (20% of instants, 80 deg apart) — which is the whole
 justification for a mixture/particle predictor.
+
+The first cut of MAGNITUDE noise (a plain multiplicative iid jitter,
+``speed_jitter``) repeated the exact same mistake: measured 0.58 m
+divergence over 30 steps and rho=0.02 (indistinguishable from white noise).
+Magnitude is now modelled with a THREAT-based deterministic ramp (distance
+to the nearest blue) plus correlated AR(1) noise on top — the same
+construction as heading, not pure noise around a fixed ceiling.
 
 Run:
     pytest tests/test_stochastic_red.py -v
@@ -45,7 +52,7 @@ def test_defaults_are_the_deterministic_policy():
 def test_output_stays_a_bounded_acceleration():
     blue, red, act, opos, orad, L = _scene()
     p = StochasticRed(heading_noise_std=0.6, commit_prob=1.0,
-                      speed_jitter=0.3, seed=1)
+                      min_effort=0.2, magnitude_noise_std=0.3, seed=1)
     p.reset(len(red))
     for _ in range(50):
         a = p(blue, red, act, opos, orad, L)
@@ -71,10 +78,10 @@ def test_ar1_phase_is_stationary_at_the_requested_std():
         p.reset(1)
         phases = []
         for _ in range(20000):
-            p._phase[0] = (rho * p._phase[0]
-                           + np.sqrt(1.0 - rho ** 2)
-                           * p._rng.normal(0.0, 0.4))
-            phases.append(p._phase[0])
+            p._heading_phase[0] = (rho * p._heading_phase[0]
+                                   + np.sqrt(1.0 - rho ** 2)
+                                   * p._rng.normal(0.0, 0.4))
+            phases.append(p._heading_phase[0])
         assert abs(np.std(phases) - 0.4) < 0.03, f"rho={rho}"
 
 
@@ -85,9 +92,9 @@ def test_heading_noise_is_temporally_correlated():
     p.reset(1)
     ph = []
     for _ in range(4000):
-        p._phase[0] = (0.9 * p._phase[0]
-                       + np.sqrt(1 - 0.81) * p._rng.normal(0.0, 0.4))
-        ph.append(p._phase[0])
+        p._heading_phase[0] = (0.9 * p._heading_phase[0]
+                               + np.sqrt(1 - 0.81) * p._rng.normal(0.0, 0.4))
+        ph.append(p._heading_phase[0])
     ph = np.array(ph) - np.mean(ph)
     rho1 = float(np.sum(ph[:-1] * ph[1:]) / np.sum(ph * ph))
     assert rho1 > 0.8
@@ -134,9 +141,9 @@ def test_reset_clears_state_between_episodes():
     p = StochasticRed(heading_noise_std=0.5, commit_prob=1.0, seed=8)
     p.reset(1)
     p(blue, red, act, opos, orad, L)
-    assert p._left[0] > 0 or p._phase[0] != 0.0
+    assert p._left[0] > 0 or p._heading_phase[0] != 0.0
     p.reset(1)
-    assert p._left[0] == 0 and p._side[0] == 0 and p._phase[0] == 0.0
+    assert p._left[0] == 0 and p._side[0] == 0 and p._heading_phase[0] == 0.0
 
 
 def test_env_resets_a_stateful_policy():
@@ -154,7 +161,7 @@ def test_env_resets_a_stateful_policy():
         env.step({a: rng.uniform(-1, 1, 2).astype(np.float32)
                   for a in env.agents})
     env.reset(seed=1)
-    assert np.all(red._phase == 0.0) and np.all(red._left == 0)
+    assert np.all(red._heading_phase == 0.0) and np.all(red._left == 0)
 
 
 def test_stochastic_red_changes_trajectories():
@@ -212,3 +219,98 @@ def test_iid_noise_is_much_weaker_than_correlated():
     iid = diverge(heading_noise_std=0.35, heading_rho=0.0)
     corr = diverge(heading_noise_std=0.35, heading_rho=0.85, commit_prob=0.6)
     assert corr > 1.5 * iid, f"correlated {corr:.1f} vs iid {iid:.1f}"
+
+
+# --------------------------------------------------------------------- #
+#  Threat-modulated magnitude
+# --------------------------------------------------------------------- #
+
+def test_default_magnitude_is_always_full_effort():
+    """min_effort=1.0 (default) must make the threat ramp identically 1.0
+    regardless of distance -- the no-op that keeps defaults byte-identical
+    to run_from_nearest_uav."""
+    blue, red, act, opos, orad, L = _scene(n_red=1)
+    red[0] = blue[0] + np.array([1.0, 0.0], dtype=np.float32)   # close, not ON it
+    near = StochasticRed(seed=20)
+    near.reset(1)
+    a_near = near(blue, red, act, opos, orad, L)[0]
+
+    red[0] = np.array([2.0, 2.0], dtype=np.float32)   # far from every blue
+    far = StochasticRed(seed=21)
+    far.reset(1)
+    a_far = far(blue, red, act, opos, orad, L)[0]
+    assert np.isclose(np.linalg.norm(a_near), 1.0, atol=1e-5)
+    assert np.isclose(np.linalg.norm(a_far), 1.0, atol=1e-5)
+
+
+def test_threat_ramp_reduces_magnitude_when_safe():
+    """min_effort < 1 must actually lower |a| far from any blue, and leave
+    it near 1.0 close to one."""
+    blue, red, act, opos, orad, L = _scene(n_red=1, n_obs=0)
+    blue[:] = np.array([65.0, 65.0], dtype=np.float32)
+
+    p_close = StochasticRed(threat_range=25.0, min_effort=0.2, seed=22)
+    p_close.reset(1)
+    red[0] = np.array([66.0, 65.0], dtype=np.float32)      # 1 m away
+    a_close = p_close(blue, red, act, opos, orad, L)[0]
+
+    p_far = StochasticRed(threat_range=25.0, min_effort=0.2, seed=23)
+    p_far.reset(1)
+    red[0] = np.array([5.0, 5.0], dtype=np.float32)        # far beyond range
+    a_far = p_far(blue, red, act, opos, orad, L)[0]
+
+    assert np.linalg.norm(a_close) > 0.9
+    assert np.linalg.norm(a_far) < 0.3
+
+
+def test_magnitude_noise_is_stationary_and_correlated():
+    """Same AR(1) property as heading, now for magnitude: marginal std
+    matches magnitude_noise_std, and rho > 0 gives autocorrelated phase."""
+    p = StochasticRed(magnitude_noise_std=0.3, magnitude_rho=0.9, seed=24)
+    p.reset(1)
+    ph = []
+    for _ in range(20000):
+        p._mag_phase[0] = (0.9 * p._mag_phase[0]
+                          + np.sqrt(1 - 0.81) * p._rng.normal(0.0, 0.3))
+        ph.append(p._mag_phase[0])
+    ph = np.array(ph)
+    assert abs(np.std(ph) - 0.3) < 0.03
+    c = ph - ph.mean()
+    rho1 = float(np.sum(c[:-1] * c[1:]) / np.sum(c * c))
+    assert rho1 > 0.8
+
+
+def test_iid_magnitude_noise_would_be_nearly_invisible():
+    """Pins the regression this design avoided: a plain iid multiplicative
+    jitter (the old speed_jitter) measured 0.58 m divergence over 30 steps
+    and rho=0.02 -- reproduced here directly (rho=0 recovers iid) to keep
+    the comparison point alive without keeping the flawed knob itself."""
+    def diverge(**kw):
+        ends = []
+        for s in (100, 200):
+            red = StochasticRed(seed=s, **kw)
+            env = PursuitEnv(n_blue=5, n_red=3, n_obstacles=4,
+                             arena_size=130.0, max_steps=100,
+                             capture_radius=3.0, sensor_radius=40.0,
+                             use_belief_maps=True, red_policy=red, seed=5)
+            env.reset(seed=5)
+            rng = np.random.default_rng(5)
+            for _ in range(30):
+                if not env.agents:
+                    break
+                env.step({a: rng.uniform(-1, 1, 2).astype(np.float32)
+                          for a in env.agents})
+            ends.append(env._red_pos.copy())
+        return float(np.linalg.norm(ends[0] - ends[1], axis=1).mean())
+
+    iid = diverge(min_effort=0.3, magnitude_noise_std=0.3, magnitude_rho=0.0)
+    corr = diverge(min_effort=0.3, magnitude_noise_std=0.3, magnitude_rho=0.9)
+    assert corr > iid, f"correlated {corr:.2f} should exceed iid {iid:.2f}"
+
+
+def test_magnitude_reset_clears_state():
+    p = StochasticRed(magnitude_noise_std=0.3, min_effort=0.2, seed=25)
+    p.reset(1)
+    p._mag_phase[0] = 0.5
+    p.reset(1)
+    assert p._mag_phase[0] == 0.0

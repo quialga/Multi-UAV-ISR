@@ -199,6 +199,33 @@ The AR(1) innovation is scaled by `sqrt(1 - rho^2)` so the marginal std
 stays `heading_noise_std` whatever `rho` is — otherwise turning correlation
 up would silently turn the noise amount down, confounding two knobs.
 
+**Magnitude was assumed constant here, and that assumption did not
+survive.** `run_from_nearest_uav` always renormalises to `|a| = 1.0` — a
+scripted-heuristic artefact (the same class as the missing turn-rate
+limit), not a physical law. The first cut of magnitude noise repeated
+§7's own iid mistake: a plain multiplicative `speed_jitter` measured
+**0.58 m divergence over 30 steps and lag-1 rho = 0.02** — indistinguishable
+from white noise, i.e. exactly as invisible as iid heading noise was.
+Retired and replaced with the same construction as heading: a
+**deterministic threat ramp** (`min_effort` at range `>= threat_range`,
+rising linearly to full effort as the nearest blue closes to zero range —
+`threat_range` is the evader's OWN danger perception, deliberately
+independent of our `sensor_radius`) **plus correlated AR(1) noise** on top
+(`magnitude_noise_std` / `magnitude_rho`). Measured:
+
+| magnitude source | divergence @30 steps | lag-1 rho of \|a\| |
+|---|---|---|
+| old `speed_jitter` (iid, retired) | 0.58 m | 0.02 |
+| threat ramp alone (no noise) | 0.00 m | — |
+| threat ramp + AR(1) noise | **2.71 m** | **0.765** |
+
+The ramp alone gives exactly 0 divergence under re-rolled noise, as it
+must — it is a deterministic function of state, so two seeds with
+identical blue actions produce identical magnitude trajectories. The
+combined rho (0.765) exceeds heading's natural 0.546 because the
+deterministic ramp is ITSELF smooth in time (distance to the nearest blue
+changes gradually), stacking with the AR(1) noise's own correlation.
+
 **Consequence for step (b).** There are now TWO sources of multimodality:
 
 * **epistemic** — our uncertainty over `s` pushed through the policy's
@@ -310,24 +337,50 @@ Three conclusions:
    deterministic policy (3.13) — heading noise blurs epistemic modes
    together rather than multiplying them. Better than feared.
 
-### 8.4 The action space is 1-D, so use a categorical, not a 2-D mixture
+### 8.4 The action space: discretised (heading, magnitude), not heading-only
 
-The red's acceleration has CONSTANT magnitude (`|a| = 1.000`, measured std
-`0.000`; `StochasticRed`'s rotations preserve this). **The action lives on
-the unit circle — it is one angle, not a 2-vector.** A learned model should
-therefore output a categorical distribution over discretised heading bins
-(e.g. 36 bins of 10 deg), not a 2-D (logistic) mixture density:
+An earlier pass at this section argued the action is 1-D — heading only —
+because the deterministic `run_from_nearest_uav` always has `|a| = 1.000`.
+**That assumption does not survive §7's magnitude fix**: constant-max
+magnitude was itself a scripted-heuristic artefact (§7), not a property to
+bake into the model's architecture. A realistic evader modulates effort
+by assessed threat, so the learned model's action space should be the
+full discretised grid: **heading bins x magnitude bins** (e.g. 36 headings
+of 10 deg x 5 magnitudes at 0/25/50/75/100%), a single softmax over the
+joint grid — matching the proposal made much earlier for the belief-map
+reachability kernel (a sweep over discretised acceleration directions and
+magnitudes). That kernel did not work as a FIXED, non-learned belief-map
+update (§5/§20: it degenerates to ballistic extrapolation with a frozen
+`v`, which loses badly once the evader turns at the measured 0.315 rad/step
+median). Applied instead as the OUTPUT of a per-step LEARNED classifier —
+where a real turn is a new categorical draw, not a frozen prediction
+carried forward — it is exactly the right discretisation. The original
+idea was not wrong; it was aimed at the wrong layer.
 
-- Bimodality is native to a categorical (two peaks in a softmax) — no
-  component count `K` to choose, no mode collapse, no `logsumexp` mixture
-  machinery.
+A single joint categorical over the `H x M` grid (still only ~180 classes
+for 36x5) is preferred over a factored `P(heading) x P(magnitude)`:
+
+- It represents ANY joint distribution over the discretised grid —
+  including "sharp turn implies reduced forward effort" — without an
+  explicit mixture-of-components structure: each grid cell IS a possible
+  mode, and bimodality (§8.3) is just two grid cells holding mass, natively,
+  with no component count `K` to choose, no mode collapse, no `logsumexp`
+  mixture machinery.
+- If the true behaviour turns out to be constant-max-magnitude after all,
+  the network simply learns to put ~all magnitude-mass on the top bin, at
+  negligible extra cost over the heading-only design.
+- Discretise the ACTION (2-D: heading x magnitude), not the STATE (4-D) —
+  a 4-D state grid is the cost already rejected in §5/§20.
 - WaveNet-style discretised logistic mixtures earn their keep on a LARGE
-  output alphabet (65536 for 16-bit audio) where a plain categorical would
-  have too many classes. With 36 heading bins, plain categorical (with
-  neighbour label-smoothing, since a heading is circular and 10 deg away
-  is not really a different class) is the simpler, sufficient choice.
-- Discretise the ACTION (1-D), not the STATE (4-D) — a 4-D state grid is
-  the cost we rejected in §5/§20 (the belief-map kernel investigation).
+  output alphabet (65536 for 16-bit audio); 180 classes is nowhere near
+  that scale, so a plain categorical (with neighbour label-smoothing on
+  the circular heading axis) is the simpler, sufficient choice.
+
+This changes nothing about the Gaussian-Sum tracker (§8.5): `motion_model`
+already accepts arbitrary `(weight, x_pred, P_pred)` branches, and does not
+care whether they came from a 1-D heading-only categorical or a 2-D
+heading x magnitude one — the extra dimension is confined entirely to the
+not-yet-built learned-model layer.
 
 ### 8.5 Multiple hypotheses per track: Gaussian Sum, not particles
 
@@ -343,7 +396,8 @@ of weighted `_Component`s (`w, x, P`), not a single `(x, P)`:
 
 - **PREDICT**: each component is propagated through `motion_model(x, P) ->
   [(rel_weight, x_pred, P_pred), ...]` (a learned model would emit one
-  branch per significant heading bin, per §8.4); branch weight = parent
+  branch per significant (heading, magnitude) grid cell, per §8.4); branch
+  weight = parent
   weight x `rel_weight`.
 - **REDUCE (mandatory after every predict, not only after update)**: drop
   negligible weights, merge near-duplicate components (moment-matched,
