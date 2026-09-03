@@ -486,6 +486,7 @@ class PursuitEnv(ParallelEnv):
         # tests assert on to check the occlusion / p_TP gating.
         self._last_red_detect: Optional[np.ndarray] = None   # (n_blue, n_red)
         self._last_obs_detect: Optional[np.ndarray] = None   # (n_blue, n_obs)
+        self._last_red_action: Optional[np.ndarray] = None    # (n_red, 2)
         # Phase A prediction-step knobs (enemy channel only).
         self.enemy_belief_decay       = float(enemy_belief_decay)
         self.enemy_belief_diffusion   = float(enemy_belief_diffusion)
@@ -725,6 +726,14 @@ class PursuitEnv(ParallelEnv):
         )
         red_a = np.clip(red_a.astype(np.float32), -1.0, 1.0)
         red_a[~self._red_active] = 0.0  # defensive
+        # Exposed for dataset collection (the red-motion-model training
+        # target): calling red_policy a SECOND time to recover this would
+        # double-advance a STATEFUL policy's internals (StochasticRed's
+        # AR(1) phases, commitment counters), and backing it out from the
+        # velocity DELTA instead would be biased wherever v clips at
+        # v_max — exactly the aggressive-manoeuvre samples that matter
+        # most.  Read this right after step(), before the next one.
+        self._last_red_action = red_a.copy()
 
         # 2.5. Advance patrolling obstacles first (they respond to no one),
         #    so blue/red collision checks below run against the updated

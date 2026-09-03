@@ -623,6 +623,71 @@ track; a second, non-collinear blue prevents it. Identical failure mode,
 and identical fix, to the red tracker's
 `test_single_blue_crossing_geometry_is_unobservable` (§ tracker.py).
 
+## 10. Red-motion dataset collector
+
+**Implementation, 2026-09.** `scripts/collect_red_motion_dataset.py`
+collects the one-step transitions `(s_t, c_t) -> a_t` the learned motion
+model (§8) will be trained on. Full design reasoning lives in the script's
+own module docstring (kept there, not duplicated here, since it is what an
+implementer reads first); summarised:
+
+**Red policies — per-red domain randomisation, not one fixed adversary.**
+"The red" is a proxy for an unknown real evader, so each red gets an
+independently sampled `StochasticRed` configuration
+(`MixedStochasticRed`, since one `StochasticRed` instance applies the same
+parameters to every red it drives): 15% fully deterministic (every knob
+off, a clean baseline + regression check), the rest sampled from ranges
+CENTRED ON §7's already-validated values (not picked arbitrarily), with
+per-episode jitter so the dataset does not key on one exact repeated
+value. Verified exact (not an approximation): `run_from_nearest_uav` never
+reads another red's position or active flag, so driving each
+`StochasticRed` sub-instance with a single-red slice is bit-identical to
+the batched call restricted to that index.
+
+**Blue policies — scripted, no trained checkpoint needed.** `GreedyPursuer`
+(already in the codebase, no training) mixed per-blue with `RandomAgent`
+(independent per blue, per-episode `p_greedy`), plus team-size variation
+(`n_blue`/`n_red`/`n_obstacles` sampled per episode). The dataset only
+needs a good SPREAD of approach geometries, not the exact deployed blue
+policy — flagged for later, not a blocker now: once the paused from-scratch
+checkpoint exists, check whether trained-blue rollouts induce a
+meaningfully different geometry distribution (cheap to check by comparing
+held-out prediction error), rather than assuming either way.
+
+**Getting a_t without corrupting stateful red policies.** `red_policy` is
+a pure function from the tracker's perspective, but `StochasticRed` is
+NOT stateless — it advances an AR(1) phase and commitment counters on
+every call. Re-invoking it a second time just to log its own output would
+double-advance that state (and backing the acceleration out from the
+velocity DELTA instead is biased wherever v clips at `v_max` — exactly the
+aggressive-manoeuvre samples that matter most). Fixed with a one-line,
+additive hook: `PursuitEnv.step()` now stores `self._last_red_action`
+right after computing it — the same pattern already used for
+`_last_red_detect`.
+
+**Schema and scope.** Ego-centric (relative to the red), arena/speed-
+normalised context — blue and obstacle relative position/velocity (+
+obstacle radius), wall distances — matching `_build_obs`'s existing
+convention (`wall_distances = (x, L-x, y, L-y) / L`). Fixed-capacity
+padding + boolean masks for the variable obstacle count (mirrors the env's
+own `_red_active`-style convention); blues need no mask since their count
+is fixed within an episode, only varied across episodes. `.npz` shards, no
+new dependency. Training uses PRIVILEGED (ground-truth) state throughout
+— matching §8.1's CTDE-style argument that the belief-derived,
+uncertainty-marginalised context is an INFERENCE-time concern, not a
+data-collection one. Explicitly deferred to training time, not the
+collector's job: input augmentation (perturbing `s_t`/`c_t` by belief-
+scale noise) and discretising `a_t` into the (heading, magnitude) grid
+(§8.4).
+
+**Verified**: `MixedStochasticRed`'s per-slot slicing is bit-identical to
+a direct single-red call; different reds in one episode get genuinely
+different parameters; padding/masks are exact; `accel` matches
+`_last_red_action` (not a re-derived or re-invoked value); same-seed runs
+are reproducible. Throughput: ~1600 samples/s, ~7.7 episodes/s on CPU (a
+150-step episode with ~3 active reds yields ~450 samples) — a
+million-sample dataset costs on the order of ten minutes, no GPU.
+
 ## Reproduce
 
 ```

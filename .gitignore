@@ -24,6 +24,9 @@ checkpoints/
 # Render outputs (regenerate via scripts/render_demo.py)
 out/
 
+# Collected datasets (regenerate via scripts/collect_red_motion_dataset.py)
+data/
+
 # Misc
 .DS_Store
 Thumbs.db
