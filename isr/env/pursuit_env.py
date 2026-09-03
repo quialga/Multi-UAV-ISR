@@ -285,6 +285,17 @@ class PursuitEnv(ParallelEnv):
         # occlusion-gated, like a real return) with a meaningless Doppler.
         # 0.0 (default) = no clutter, so raw_detections stays byte-identical.
         clutter_rate:             float = 0.0,
+        # Obstacle RADIUS measurement noise in raw_obstacle_detections(),
+        # for the TRACK path only.  _build_obstacle_tracks (what the policy
+        # observes) reports the TRUE radius when an obstacle is seen — no
+        # noise at all — so this does not touch it; it exists purely so an
+        # obstacle Kalman tracker's radius estimate has something to average
+        # OUT across repeated sightings (like position), rather than being
+        # exact from the first one.  Range-scaled by the same SNR falloff as
+        # position/Doppler.  0.0 (default) = exact radius (pre-existing
+        # behaviour), so raw_obstacle_detections stays noiseless unless
+        # asked.
+        obstacle_radius_noise_std: float = 0.0,
         # ----- Crash penalties (per-agent shaped reward) ------------------
         # Both default 0.0 (off) so the shared-team-reward behaviour is
         # byte-preserved unless enabled.  When > 0, a crashing blue takes
@@ -460,8 +471,10 @@ class PursuitEnv(ParallelEnv):
         self.sensor_noise_range_growth = float(sensor_noise_range_growth)
         self.vel_prior_std             = float(vel_prior_std)
         self.clutter_rate              = float(clutter_rate)
+        self.obstacle_radius_noise_std  = float(obstacle_radius_noise_std)
         assert self.vel_prior_std > 0.0
         assert self.clutter_rate >= 0.0
+        assert self.obstacle_radius_noise_std >= 0.0
         assert self.sensor_vel_noise_std >= 0.0
         assert self.sensor_noise_range_growth >= 0.0
         assert 0.0 < self.track_conf_min <= 1.0, (
@@ -1022,6 +1035,92 @@ class PursuitEnv(ParallelEnv):
             "sigma_radial": float(s_rad),
             "truth_id": int(truth_id),          # EVALUATION ONLY; -1 = clutter
         }
+
+    def raw_obstacle_detections(self) -> List[Dict[str, Any]]:
+        """
+        This step's sensor returns for OBSTACLES, without identity — the
+        obstacle-side counterpart to ``raw_detections()``.
+
+        Why this exists: ``_build_obstacle_tracks`` loops over TRUE
+        obstacle indices and reports the exact RADIUS when seen — no
+        measurement noise at all — on top of the same perfect association
+        ``raw_detections()`` already fixed for reds.  This method emits what
+        a real sensor would: a position (true + range-scaled noise, exactly
+        like a red return), a RADIUS measurement (optionally noisy — see
+        ``obstacle_radius_noise_std``; 0.0 default keeps it exact, matching
+        pre-existing behaviour), and a Doppler return along the OBSERVER's
+        own line of sight — near-zero (noisy) for a static obstacle,
+        non-zero for a moving (patrolling) one — with NO target label.
+
+        Runs the SAME detection chain ``_build_obstacle_tracks`` uses:
+        range gate -> near-surface occlusion test (casts to the boundary
+        point nearest the observer, since a disk would otherwise always
+        occlude itself) -> the ``p_TP_obstacle`` draw.
+
+        Each detection is a dict:
+            blue         int   — the observing UAV
+            z_pos        (2,)  — measured centre position
+            z_range      float
+            z_radius     float — measured radius (true + noise)
+            z_radial     float — radial (Doppler) speed along the LOS
+            los          (2,)  — unit line of sight, observer -> detection
+            sigma_pos    float
+            sigma_radius float
+            sigma_radial float
+            truth_id     int   — TRUE obstacle index.  EVALUATION ONLY —
+                                a tracker must never read this.
+
+        Note: no clutter model exists here yet (unlike ``raw_detections``) —
+        add one before treating obstacle association as fully validated.
+        """
+        out: List[Dict[str, Any]] = []
+        placed = 0 if self._obstacle_pos is None else len(self._obstacle_pos)
+        if placed == 0:
+            return out
+        opos = self._obstacle_pos[:placed]
+        orad = self._obstacle_r[:placed]
+        ovel = (self._obstacle_vel[:placed] if self._obstacle_vel is not None
+                else np.zeros((placed, 2), dtype=np.float32))
+
+        for b in range(self.n_blue):
+            bp = self._blue_pos[b]
+            d = np.linalg.norm(opos - bp[None, :], axis=1)
+            ok = (np.ones(placed, dtype=bool) if self.sensor_radius is None
+                  else d <= self.sensor_radius)
+            if self.track_occlusion and ok.any():
+                u = (opos - bp[None, :]) / np.maximum(d, 1e-6)[:, None]
+                near = (opos - orad[:, None] * u).astype(np.float32)
+                ok &= ~self._rays_occluded_by_obstacles(bp, near)
+            if self.track_detection and ok.any():
+                ok &= self._rng.random(placed) < self.p_TP_obstacle
+            for o in np.where(ok)[0]:
+                rng_m = float(d[o])
+                scale = self._noise_scale(rng_m)
+                z_pos = self._measured_pos(opos[o], rng_m)
+                z_r = float(orad[o])
+                if self.obstacle_radius_noise_std > 0.0:
+                    z_r += float(self._rng.normal(
+                        0.0, self.obstacle_radius_noise_std * scale))
+                delta = opos[o] - bp
+                nrm = float(np.linalg.norm(delta))
+                los = (delta / nrm) if nrm > 1e-6 else np.zeros(2, np.float32)
+                s_rad = self.sensor_vel_noise_std * scale
+                z_rad = float(ovel[o] @ los)
+                if s_rad > 0.0:
+                    z_rad += float(self._rng.normal(0.0, s_rad))
+                out.append({
+                    "blue": int(b),
+                    "z_pos": np.asarray(z_pos, dtype=np.float32),
+                    "z_range": float(np.linalg.norm(np.asarray(z_pos) - bp)),
+                    "z_radius": z_r,
+                    "z_radial": z_rad,
+                    "los": los.astype(np.float32),
+                    "sigma_pos": float(self.sensor_pos_noise_std * scale),
+                    "sigma_radius": float(self.obstacle_radius_noise_std * scale),
+                    "sigma_radial": float(s_rad),
+                    "truth_id": int(o),           # EVALUATION ONLY
+                })
+        return out
 
     # ------------------------------------------------------------------ #
     #  Inspector / helpers                                                #

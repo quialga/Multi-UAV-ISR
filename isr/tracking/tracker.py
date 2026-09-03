@@ -78,6 +78,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 from isr.tracking.assignment import solve_gated
+from isr.tracking.kalman import joseph_update
 
 # Chi-square 99% quantiles.
 CHI2_99 = {1: 6.635, 2: 9.210, 4: 13.277}
@@ -332,13 +333,10 @@ class MultiTargetTracker:
 
     @staticmethod
     def _update(x, P, H, R, z):
-        """Joseph-form Kalman update for ONE component.
-
-        P = (I-KH) P (I-KH)^T + K R K^T rather than (I-KH)P: the short form
-        is only valid for the optimal gain in exact arithmetic, and loses
-        symmetry / positive-definiteness under the many sequential updates
-        this tracker performs (up to n_blue x 2 per step, for hundreds of
-        steps).  Joseph costs one extra product and is stable for any K.
+        """Joseph-form Kalman update for ONE component — see
+        ``isr.tracking.kalman.joseph_update`` (shared with the obstacle
+        tracker; this is a thin, byte-identical wrapper kept so every
+        internal call site here stays unchanged).
 
         Also returns the innovation's log-likelihood, needed to
         Bayes-reweight a track's components (Note 5 above).  For a
@@ -346,20 +344,7 @@ class MultiTargetTracker:
         the softmax reweight of one term is `exp(0)/exp(0) = 1` — so it is
         numerically inert for the default (non-branching) motion model.
         """
-        y = np.atleast_1d(z) - H @ x
-        S = H @ P @ H.T + R
-        Si = np.linalg.inv(S)
-        nis = float(y @ Si @ y)
-        sign, logdet = np.linalg.slogdet(S)
-        k = y.shape[0]
-        loglik = -0.5 * (nis + (logdet if sign > 0 else 0.0)
-                         + k * np.log(2.0 * np.pi))
-        K = P @ H.T @ Si
-        x_new = x + K @ y
-        A = np.eye(4) - K @ H
-        P_new = A @ P @ A.T + K @ R @ K.T
-        P_new = 0.5 * (P_new + P_new.T)          # kill drift in symmetry
-        return x_new, P_new, nis, loglik
+        return joseph_update(x, P, H, R, z)
 
     # ---------------- Gaussian-Sum reduce (prune + merge + cap) -------- #
 

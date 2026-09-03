@@ -461,6 +461,168 @@ placeholders, sized from §8.3's measurements but not yet tuned against a
 real branching model's actual mode separations. Both are inert until a
 branching `motion_model` is supplied.
 
+## 9. Obstacle tracking: a Kalman filter, deliberately simpler than the red's
+
+**Design discussion, 2026-09.** Prompted by two threads meeting: (1) the
+red's learned motion model needs `p(c_t^obs)` — our uncertainty over
+obstacle context — to marginalise over (§8.1), and today that uncertainty
+is only ~14% resolved when it actually matters (the red is inside an
+obstacle's influence band but no blue currently senses it: measured 17% of
+instants in-band, only 14% of THOSE sensed — see the "two questions" scratch
+investigation); and (2) a future FAST, SMALL interceptor obstacle
+("simulate a missile launched at an ally" — explicitly deferred, not built
+here) will need the same identity-preserving, occlusion-robust tracking the
+red already has. Both point at the same missing piece: obstacles have no
+persistent tracker, only a per-step belief-map peak or (when seen) an exact
+instantaneous measurement.
+
+**Not needed for collision avoidance.** Checked first, since it would
+undercut the whole exercise if a prior obstacle map were required to avoid
+crashing: `sensor_radius=40` against obstacle radii 5-15 m gives ~25 steps
+of own-radar warning before the clearance margin, and the crash-avoidance
+reward already operates on the SENSED track, not a prior. Reactive-only
+avoidance was already correct; this is about PREDICTING the red and about
+future fast-moving obstacles, not about blues bumping into static ones.
+
+### 9.1 Why a separate tracker, not a reuse of MultiTargetTracker
+
+* **State differs.** Obstacles carry a RADIUS the red's state does not:
+  `[px, py, vx, vy, r]` (5-D) vs `[px, py, vx, vy]` (4-D).
+* **No measured reason for a Gaussian Sum.** The red's multimodality comes
+  from a policy discontinuity ("flee the NEAREST blue") and its own
+  committed manoeuvre choices (§8.3, §7) — an obstacle does neither. Adding
+  the Gaussian-Sum machinery here would be speculative generality with no
+  measurement behind it, which is exactly the discipline this document
+  exists to avoid. A single Gaussian per track is implemented; IF the
+  future interceptor's guidance law (proportional navigation or similar)
+  turns out to have its own discontinuities, that should be MEASURED
+  first, the same way it was for the red, before retrofitting a mixture.
+
+What IS shared, not re-derived: the Joseph-form Kalman update and the
+Hungarian solver. `MultiTargetTracker._update`'s Joseph-form math was
+dimension-agnostic already except for one hardcoded `np.eye(4)`; extracted
+to `isr/tracking/kalman.py::joseph_update` with `np.eye(len(x))` instead —
+bit-identical for the red's 4-D case (`len(x) == 4`), and now directly
+reusable at 5-D for obstacles. Verified: the full non-regression suite
+(`tests/test_gaussian_sum.py`, bit-exact against the frozen pre-GSF
+tracker) still passes unchanged after the extraction.
+
+### 9.2 RADIUS is the cleanest part of this design
+
+A rigid obstacle's TRUE radius does not change during an episode, so
+`F_r = 1`, `Q_r = 0` is not an approximation — unlike DWNA's white-noise
+acceleration assumption for the red, there is no modelling error here at
+all. The filter's radius variance shrinks monotonically with every
+sighting and never diverges. `_build_obstacle_tracks` (what the policy
+observes) reports the exact radius when seen — no measurement noise — so a
+new, additive, default-off knob (`obstacle_radius_noise_std`, feeding a new
+`PursuitEnv.raw_obstacle_detections()`, mirroring `raw_detections()`) gives
+the tracker's radius filter something to average out; at the 0.0 default,
+`raw_obstacle_detections` stays exact and `_fuse_birth` takes the first
+exact return as ground truth outright rather than blending it.
+
+RADIUS also needs no ridge prior, unlike velocity: it is a scalar measured
+directly, never rank-deficient the way a single line-of-sight velocity
+measurement is (§17's whole reason for a ridge). `vel_prior_std` (renamed
+from an earlier, misleadingly-named `radius_prior_std` placeholder that
+turned out to be used only for the velocity ridge) plays the same role as
+the red tracker's parameter of the same name.
+
+### 9.3 sigma_a: measured from the EXISTING patrol physics, not assumed
+
+The obstacle's own acceleration statistics are nothing like the red's.
+Measured directly from `_move_obstacles` (bounce-off-walls patrol, already
+in the codebase, `moving_obstacle_fraction` / `obstacle_speed`, typically 0
+in existing configs):
+
+| regime | fraction of steps | \|a\| |
+|---|---|---|
+| between bounces | 99.1% | exactly 0 |
+| at a bounce | 0.9% | exactly `2 * obstacle_speed` |
+
+This is a discrete regime change (a velocity-sign flip), not a small
+continuous perturbation — nothing like the red's continuously-manoeuvring,
+always-max-magnitude acceleration that motivated DWNA in the first place.
+A NEES sweep (oracle association, isolating the filter):
+
+| sigma_a | NEES (static) | NEES (patrolling) |
+|---|---|---|
+| 0.005 | 3.02 | **13,305,336** |
+| 0.02 | 2.87 | 52.11 |
+| 0.05 | 2.87 | 11.43 |
+| **0.1** | 2.91 | **4.96** |
+| 0.3 | 3.03 | 3.17 |
+
+`sigma_a = 0.1` calibrates the patrolling case well (NEES 4.96 vs a target
+of 5.0) at negligible cost to the static one (2.91 vs 2.87) — adopted as
+the default. Two things worth recording from this sweep:
+
+1. **Static obstacles are INSENSITIVE to sigma_a** across two orders of
+   magnitude (NEES flat ~2.9-3.0). Position/radius converge from
+   measurement fusion regardless; sigma_a mainly matters once there is
+   real motion to get wrong.
+2. **NEES ~3, not ~5, even at good calibration** — a measurement artefact,
+   not miscalibration: under the default exact-radius sensor model, the
+   FIRST sighting already equals the truth exactly (§9.2), so the radius
+   dimension contributes ~0 to NEES forever (zero residual against a
+   correctly near-zero `P_r`) rather than its "fair share" of ~1. The
+   effective target under default settings is closer to 4, not 5.
+3. **Too-small sigma_a is not merely "cautious" here — it is
+   catastrophic.** At sigma_a=0.005 a single bounce, hit with a P the
+   filter believes is near-certain, drives NEES into the millions. This is
+   sharper than the red's analogous finding (§4): the red's sigma_a choice
+   only affects calibration quality; here an under-estimated sigma_a can
+   blow up numerically the moment the ONE real discontinuity in this
+   motion model (a bounce) actually occurs.
+
+### 9.4 The un-modelled bounce: measured cost, not just a caveat
+
+A discrete velocity-sign flip is not something ANY continuous-noise KF can
+predict through — it is corrected only by subsequent measurements
+disagreeing with a temporarily-wrong prediction. Measured (oracle
+association, `sigma_a=0.1`, position error vs. steps since the most recent
+bounce):
+
+| steps since bounce | 0 | +1 | +2 | +3 | +4 | +5 | +6 | +7 |
+|---|---|---|---|---|---|---|---|---|
+| mean position error (m) | 0.54 | 0.70 | **0.88** | 0.85 | 0.77 | 0.68 | 0.48 | 0.47 |
+
+A modest, bounded, self-healing bump (+0.3-0.4 m peaking ~2 steps after the
+bounce, recovering below baseline by step 6-7) — not a catastrophic loss of
+track. The `motion_model` plug point (carried here for interface symmetry
+with the red tracker, unused today) is the natural place to close this gap
+later — e.g. a model that predicts a bounce when a wall is within the next
+step's reach — but the measured cost does not currently justify building
+it; same "measure before building" discipline as everywhere else in this
+document.
+
+### 9.5 A real advantage single-instant fusion did not have
+
+`_fuse_radial_velocity`'s one-shot WLS needs >= 2 non-collinear blues
+SIMULTANEOUSLY to recover full 2-D velocity. A PERSISTENT filter does
+better for an obstacle specifically: a single blue that circles it (or
+just flies past) over several steps sweeps out DIFFERENT line-of-sight
+angles over TIME, and the Kalman recursion accumulates each radial
+equation exactly as the momentary multi-blue case would, one at a time.
+Verified (`tests/test_obstacle_tracker.py`
+`test_single_blue_recovers_velocity_by_circling_over_time`): one blue due
+south of a moving obstacle (LOS ~ perpendicular to its motion, Doppler
+sees almost none of it) then the SAME blue observed from due east 10 steps
+later (LOS ~ aligned) converges the full velocity, matching a scenario no
+single instantaneous fusion could resolve.
+
+The reverse also holds and is a genuine, not merely theoretical,
+limitation: a LONE observer whose LOS stays perpendicular to the true
+motion for many consecutive steps has no Doppler correction on the other
+axis, so process noise alone can random-walk that component far enough to
+push the predicted position outside the gate — measured directly
+(`test_single_blue_static_obstacle_can_drift_off_gate`): a static
+obstacle's position, tracked from a single blue due south of it, drifts
+from 65 m to 62 m over 3 steps on `vx` noise alone and fragments the
+track; a second, non-collinear blue prevents it. Identical failure mode,
+and identical fix, to the red tracker's
+`test_single_blue_crossing_geometry_is_unobservable` (§ tracker.py).
+
 ## Reproduce
 
 ```
@@ -469,5 +631,6 @@ python scripts/eval_tracking.py --episodes 8 --steps 150
 
 Scratch scripts (`scratch/`, not committed): `diag_gap.py` (§2),
 `sweep_q.py` (§3), `autocorr.py` (§4), `clutter_impact.py` (§6),
-`check_stoch_red.py` (§7), `mode_count.py` (§8.3). NEES/NIS are in the
-eval output.
+`check_stoch_red.py` (§7), `mode_count.py` (§8.3),
+`sweep_obstacle_sigma_a.py` (§9.3, and the bounce-cost measurement in
+§9.4). NEES/NIS are in the eval output.
