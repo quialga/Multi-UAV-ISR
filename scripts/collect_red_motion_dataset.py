@@ -216,29 +216,48 @@ def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
     for t in range(steps):
         if not env.agents:
             break
+        # Snapshot the state the red policy will actually SEE.  PursuitEnv
+        # calls red_policy at step 2, BEFORE obstacles move (2.5) and
+        # before blues are integrated (3), so this pre-step snapshot is
+        # exactly its input -- no ordering guesswork.
+        #
+        # Reading env._red_pos AFTER step() instead pairs state_{t+1} with
+        # action_t: an off-by-one that injected a median 8.4 degrees of
+        # spurious, unlearnable error (measured with zero-noise reds, which
+        # must reproduce the policy EXACTLY), inflating the apparent noise
+        # floor and capping what any model could reach.  See
+        # test_action_matches_the_state_the_policy_saw.
+        pre = dict(
+            red_pos=env._red_pos.copy(), red_vel=env._red_vel.copy(),
+            blue_pos=env._blue_pos.copy(), blue_vel=env._blue_vel.copy(),
+            red_active=env._red_active.copy(),
+            obs_pos=None if env._obstacle_pos is None else env._obstacle_pos.copy(),
+            obs_vel=None if env._obstacle_vel is None else env._obstacle_vel.copy(),
+            obs_r=None if env._obstacle_r is None else env._obstacle_r.copy(),
+        )
         actions = {a: blues[a].act(obs_d[a], env, a) for a in env.agents}
         obs_d, _rew, _term, _trunc, _info = env.step(actions)
 
         act_a = env._last_red_action
-        placed = 0 if env._obstacle_pos is None else len(env._obstacle_pos)
-        for r in np.where(env._red_active)[0]:
-            rp, rv = env._red_pos[r], env._red_vel[r]
+        placed = 0 if pre["obs_pos"] is None else len(pre["obs_pos"])
+        for r in np.where(pre["red_active"])[0]:
+            rp, rv = pre["red_pos"][r], pre["red_vel"][r]
 
             blue_rel_pos = np.zeros((blue_cap, 2), dtype=np.float32)
             blue_rel_vel = np.zeros((blue_cap, 2), dtype=np.float32)
-            blue_rel_pos[:n_blue] = (env._blue_pos - rp) / L
-            blue_rel_vel[:n_blue] = env._blue_vel / V_NORM
+            blue_rel_pos[:n_blue] = (pre["blue_pos"] - rp) / L
+            blue_rel_vel[:n_blue] = pre["blue_vel"] / V_NORM
 
             obs_rel_pos = np.zeros((obs_cap, 2), dtype=np.float32)
             obs_rel_vel = np.zeros((obs_cap, 2), dtype=np.float32)
             obs_radius = np.zeros((obs_cap,), dtype=np.float32)
             obs_mask = np.zeros((obs_cap,), dtype=bool)
             if placed > 0:
-                ovel = (env._obstacle_vel if env._obstacle_vel is not None
+                ovel = (pre["obs_vel"] if pre["obs_vel"] is not None
                        else np.zeros((placed, 2), dtype=np.float32))
-                obs_rel_pos[:placed] = (env._obstacle_pos - rp) / L
+                obs_rel_pos[:placed] = (pre["obs_pos"] - rp) / L
                 obs_rel_vel[:placed] = ovel / V_NORM
-                obs_radius[:placed] = env._obstacle_r / L
+                obs_radius[:placed] = pre["obs_r"] / L
                 obs_mask[:placed] = True
 
             wall_dist = np.array(

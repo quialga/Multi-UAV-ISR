@@ -132,3 +132,58 @@ def test_shard_round_trip(tmp_path):
     assert set(loaded.keys()) == set(_FIELDS)
     assert loaded["accel"].shape == (len(samples), 2)
     assert np.allclose(loaded["red_pos"][0], samples[0]["red_pos"])
+
+
+def test_action_matches_the_state_the_policy_saw():
+    """The label must pair with the state the policy ACTED ON, not the one
+    that resulted from acting.
+
+    With a fully deterministic red (every noise knob off), recomputing
+    run_from_nearest_uav from the stored features must reproduce the
+    logged action EXACTLY -- there is no randomness left to explain a
+    difference.  Reading env._red_pos after step() instead pairs
+    state_{t+1} with action_t, which measured a median 8.4 degrees of
+    spurious error here: unlearnable noise that inflated the apparent
+    noise floor and silently capped what any model could achieve.
+    """
+    L, INFLUENCE, W_REPULSE = 130.0, 12.0, 1.5
+    rng = np.random.default_rng(0)
+    samples = collect_episode(
+        rng, ep_id=0, steps=60,
+        n_blue_range=(3, 3), n_red_range=(1, 1), n_obs_range=(2, 2),
+        blue_cap=3, obs_cap=2, arena_size=L, p_deterministic=1.0)
+    assert samples
+
+    errs = []
+    for s in samples:
+        a = s["accel"]
+        if np.linalg.norm(a) < 1e-6:
+            continue
+        brp = s["blue_rel_pos"][:s["n_blue"]] * L
+        nearest = brp[np.linalg.norm(brp, axis=1).argmin()]
+        flee = -nearest / np.linalg.norm(nearest)
+
+        repulse = np.zeros(2)
+        for o in range(s["n_obs_placed"]):
+            oc = -s["obs_rel_pos"][o] * L          # red -> obstacle centre
+            od = np.linalg.norm(oc)
+            surf = od - s["obs_radius"][o] * L
+            if surf < INFLUENCE and od > 1e-6:
+                repulse += np.clip((INFLUENCE - surf) / INFLUENCE, 0, 1) * (oc / od)
+        for i, inward in enumerate(([1., 0.], [-1., 0.], [0., 1.], [0., -1.])):
+            dist = s["wall_dist"][i] * L
+            if dist < INFLUENCE:
+                repulse += (np.clip((INFLUENCE - dist) / INFLUENCE, 0, 1)
+                           * np.array(inward))
+
+        vec = flee + W_REPULSE * repulse
+        n = np.linalg.norm(vec)
+        want = vec / n if n > 1e-8 else flee
+        d = np.arctan2(want[1], want[0]) - np.arctan2(a[1], a[0])
+        errs.append(abs((d + np.pi) % (2 * np.pi) - np.pi) * 180 / np.pi)
+
+    errs = np.array(errs)
+    assert errs.max() < 0.01, (
+        f"features and label are misaligned: max {errs.max():.2f} deg "
+        f"(median {np.median(errs):.2f}) against a deterministic policy "
+        f"that should reproduce exactly")
