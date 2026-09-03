@@ -14,6 +14,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
+from isr.agents.red_motion_features import N_BINS, ZERO_CLASS
 from isr.agents.red_motion_gnn import RedMotionGNN, _build_x2r_edges
 
 
@@ -35,15 +36,20 @@ def test_one_categorical_per_red():
     matching the dataset's one-sample-per-(step, red) layout."""
     net = RedMotionGNN(n_blue=5, n_red=3, n_obs=4)
     out = net(**_inputs())
-    assert out.shape == (4, 3, 36 * 5)
+    assert out.shape == (4, 3, N_BINS)
 
 
 def test_grid_view_is_a_proper_joint_distribution():
+    """grid + the ZERO class must together be one distribution.  ZERO is
+    returned SEPARATELY, not folded into the grid: it has no heading, so
+    placing it in a heading bin would invent a direction it lacks."""
     net = RedMotionGNN(n_blue=5, n_red=3, n_obs=4)
-    p = net.grid_probs(**_inputs())
-    assert p.shape == (4, 3, 36, 5)
-    # sums to 1 over the JOINT grid, not per-axis
-    assert torch.allclose(p.sum(dim=(-2, -1)), torch.ones(4, 3), atol=1e-5)
+    with torch.no_grad():
+        grid, p_zero = net.grid_probs(**_inputs())
+    assert grid.shape == (4, 3, 36, 5)
+    assert p_zero.shape == (4, 3)
+    total = grid.sum(dim=(-2, -1)) + p_zero
+    assert torch.allclose(total, torch.ones(4, 3), atol=1e-5)
 
 
 def test_initialises_near_uniform():
@@ -53,7 +59,7 @@ def test_initialises_near_uniform():
     with torch.no_grad():
         lp = net.log_probs(**_inputs())
     ent = float(-(lp.exp() * lp).sum(-1).mean())
-    assert abs(ent - np.log(36 * 5)) < 0.05
+    assert abs(ent - np.log(N_BINS)) < 0.05
 
 
 def test_permutation_invariant_over_blues():
@@ -109,7 +115,7 @@ def test_works_without_obstacles():
     net = RedMotionGNN(n_blue=3, n_red=2, n_obs=0)
     x = _inputs(B=2, n_blue=3, n_red=2, n_obs=1)
     out = net(x["red_feats"], x["blue_feats"], x["b2r_edge_feats"])
-    assert out.shape == (2, 2, 36 * 5)
+    assert out.shape == (2, 2, N_BINS)
 
 
 def test_edge_index_ordering_matches_the_env_convention():
@@ -131,6 +137,16 @@ def test_gradients_flow_to_every_input_branch():
              "o2r_edge_feats"):
         assert x[k].grad is not None and torch.any(x[k].grad != 0), (
             f"no gradient reached {k}")
+
+
+def test_bin_count_comes_from_one_source_of_truth():
+    """The head's width must track the featuriser's label space -- these
+    drifted apart exactly once during development, when the ZERO class was
+    added on one side only."""
+    net = RedMotionGNN(n_blue=2, n_red=1, n_obs=0)
+    assert net.n_bins == N_BINS
+    assert net.zero_class == ZERO_CLASS
+    assert net.head[-1].out_features == N_BINS
 
 
 def test_parameter_count_is_modest():

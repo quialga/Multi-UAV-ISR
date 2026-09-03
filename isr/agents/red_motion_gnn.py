@@ -52,6 +52,14 @@ from typing import Optional, Tuple
 import torch
 import torch.nn as nn
 
+# Single source of truth for the action discretisation.  Defining the bin
+# counts here as well would let the head's width silently drift from the
+# featuriser's labels -- a bug hit exactly once during development, when
+# the ZERO class was added on one side only.
+from isr.agents.red_motion_features import (
+    N_BINS, N_HEADING_BINS, N_MAGNITUDE_BINS, ZERO_CLASS,
+)
+
 
 def _layer_init(layer: nn.Linear, std: float = 1.4142135623730951,
                 bias_const: float = 0.0) -> nn.Linear:
@@ -113,8 +121,6 @@ class RedMotionGNN(nn.Module):
         blue_feat_dim:    int = 1,
         obs_feat_dim:     int = 2,
         edge_feat_dim:    int = 7,
-        n_heading_bins:   int = 36,
-        n_magnitude_bins: int = 5,
         d_hidden:         int = 64,
         n_msg_rounds:     int = 2,
         trunk_hidden:     int = 128,
@@ -125,9 +131,11 @@ class RedMotionGNN(nn.Module):
         self.n_obs = n_obs
         self.d_hidden = d_hidden
         self.n_msg_rounds = n_msg_rounds
-        self.n_heading_bins = n_heading_bins
-        self.n_magnitude_bins = n_magnitude_bins
-        self.n_bins = n_heading_bins * n_magnitude_bins
+        # Taken from red_motion_features, never redeclared here.
+        self.n_heading_bins = N_HEADING_BINS
+        self.n_magnitude_bins = N_MAGNITUDE_BINS
+        self.n_bins = N_BINS
+        self.zero_class = ZERO_CLASS
 
         self.red_input_mlp = _mlp(red_feat_dim, [d_hidden], d_hidden)
         self.blue_input_mlp = _mlp(blue_feat_dim, [d_hidden], d_hidden)
@@ -150,11 +158,13 @@ class RedMotionGNN(nn.Module):
             self.o2r_edge_mlp = None
 
         # Shared head: one red embedding -> logits over the joint
-        # (heading, magnitude) grid.  A single flat softmax over
-        # n_heading_bins * n_magnitude_bins, per docs Sec. 8.4 — each cell
-        # IS a possible mode, so bimodality is native and needs no mixture
-        # machinery.  Small head gain: logits start near-uniform rather
-        # than committing hard before any training.
+        # (heading, magnitude) grid PLUS the ZERO class, per docs Sec. 8.4.
+        # A single flat softmax: each cell IS a possible mode, so
+        # bimodality is native and needs no mixture machinery.  The extra
+        # ZERO class covers |a| ~ 0, where the heading is undefined and
+        # "do not accelerate" is a genuine discrete outcome (1.78% of
+        # collected samples).  Small head gain: logits start near-uniform
+        # rather than committing hard before any training.
         self.head = _mlp(d_hidden, [trunk_hidden, trunk_hidden], self.n_bins)
         _layer_init(self.head[-1], std=0.01)
 
@@ -219,12 +229,18 @@ class RedMotionGNN(nn.Module):
         """Log-softmax over the joint grid, shape (B, n_red, n_bins)."""
         return torch.log_softmax(self.forward(*args, **kwargs), dim=-1)
 
-    def grid_probs(self, *args, **kwargs) -> torch.Tensor:
-        """Probabilities reshaped to (B, n_red, n_heading, n_magnitude).
+    def grid_probs(self, *args, **kwargs
+                  ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """``(grid, p_zero)`` — the (heading, magnitude) probabilities
+        reshaped to (B, n_red, n_heading, n_magnitude), and the ZERO
+        class's probability (B, n_red) alongside it.
 
-        For inspection and for extracting marginals — the model itself is
-        one flat joint softmax; this is only a view of it.
+        For inspection and marginals only; the model itself is one flat
+        joint softmax over grid + ZERO.  They are returned separately
+        because the ZERO class has no heading and so no place in the grid
+        — folding it in would invent a direction it does not have.
         """
         p = torch.softmax(self.forward(*args, **kwargs), dim=-1)
-        return p.reshape(*p.shape[:-1], self.n_heading_bins,
-                        self.n_magnitude_bins)
+        grid = p[..., :self.zero_class].reshape(
+            *p.shape[:-1], self.n_heading_bins, self.n_magnitude_bins)
+        return grid, p[..., self.zero_class]
