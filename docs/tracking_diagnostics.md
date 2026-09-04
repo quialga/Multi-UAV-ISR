@@ -109,6 +109,13 @@ it does NOT change recall (§3).
 
 ## 5. Why F cannot be fixed, and the recall budget
 
+> **RETRACTED — see §11.** The 0.64 figure below does not reproduce. A
+> perfect motion model (the TRUE policy, queried at the red's exact state)
+> measures recall **0.305 / 0.316**, i.e. no better than constant
+> velocity. The claim that `F` is the wrong model is still correct; the
+> claim that fixing it buys recall is not. The rest of this section is
+> kept as written so the correction is legible.
+
 `F` is a LINEAR, state-INDEPENDENT transition. The red's motion is a
 NON-LINEAR function of a state `F` does not even see (nearest blue,
 obstacles, walls). No constant 4×4 matrix can represent "flee the nearest
@@ -120,7 +127,7 @@ Recall budget:
 | stage | recall | limited by |
 |---|---|---|
 | today (constant velocity) | 0.30 | at the detectability ceiling; bridges no gaps |
-| + learned motion model (step b) | **0.64** (measured with the true policy) | still capped by detection |
+| ~~+ learned motion model (step b)~~ | ~~**0.64** (measured with the true policy)~~ | **retracted, §11** |
 | + directed search (step c) | > 0.64 | targets never yet detected |
 
 The remaining 0.36 at stage 2 are targets **never detected**, so no track
@@ -688,14 +695,110 @@ are reproducible. Throughput: ~1600 samples/s, ~7.7 episodes/s on CPU (a
 150-step episode with ~3 active reds yields ~450 samples) — a
 million-sample dataset costs on the order of ten minutes, no GPU.
 
+## 11. The learned motion model does not pay for itself — and neither does a perfect one
+
+The model from §10 was trained, wired into the `motion_model` plug point
+(`isr/agents/learned_red_motion.py`) and measured downstream. The result is
+negative, and the reason turned out to invalidate §5's recall budget
+rather than the network.
+
+### 11.1 What the learned model scores
+
+Same 6 episodes × 120 steps as every other row, so this is attribution and
+not a comparison across runs.
+
+| configuration | recall | MOTP | IDF1 | FP | NEES |
+|---|---|---|---|---|---|
+| KF + real assoc (constant velocity) | **0.322** | 1.06 | 0.45 | 13 | 3.60 |
+| LEARNED + real assoc | 0.315 | 1.14 | 0.37 | 90 | 5.66 |
+
+Worse on every column: slightly lower recall, worse localisation, worse
+identity, ~7× the false positives, and badly overconfident. Raising
+`sigma_a_model` fixes the NEES — at 1.0 it reaches 3.88 — but at that
+setting the isotropic model-error term dominates the branch covariance and
+the learned model simply *reduces to* constant velocity. It becomes
+honest exactly when it stops carrying information.
+
+### 11.2 Why it actively hurts rather than being neutral
+
+Constant velocity asserts NO acceleration; it only widens its covariance.
+The learned model asserts a specific one, so a confidently wrong assertion
+pushes the track off at ~1 m/step in the wrong direction, compounding.
+
+Isolating the network from its inputs (query the same state three ways,
+score against `env._last_red_action`):
+
+| query state | median | mean | p90 |
+|---|---|---|---|
+| TRUTH (exact position and velocity) | 8.0° | 26.1° | **100.3°** |
+| exact velocity, tracker position | 9.6° | 25.8° | 76.4° |
+| tracker estimate (what really happens) | 14.5° | 32.4° | 113.7° |
+
+*(deterministic red, where the noise floor is exactly 0° — there is no
+randomness to excuse any of this)*
+
+Two readings. First, the tracker's state costs +6.5°, of which ~4.9° comes
+from VELOCITY error (0.35–0.40 m/s) and only ~1.6° from position — but
+this is the smaller problem. Second, even with perfect inputs on a
+perfectly predictable target the model's **p90 is 100°**: it is
+catastrophically wrong on 10–15% of states. The tail, not the median, is
+what breaks the tracker.
+
+### 11.3 The finding that matters: a PERFECT model buys nothing either
+
+Before concluding the network needs to be better, the ceiling it is aiming
+at was re-measured — plugging the TRUE policy in as the motion model,
+queried at the red's exact state, with the process floor swept so the
+comparison is not a calibration artefact:
+
+| motion model | coast 5 | coast 20 | coast 80 |
+|---|---|---|---|
+| constant velocity | 0.328 | 0.345 | 0.346 |
+| TRUE policy | 0.316 | 0.316 | 0.317 |
+
+Flat, and never better than constant velocity. **§5's 0.64 does not
+reproduce.**
+
+The mechanism is arithmetic. Measured invisibility gaps last a **median 74
+steps (deterministic) / 88 steps (stochastic)**; only 14% / 0% are ≤ 5
+steps. Bridging an N-step gap and still landing inside the 5 m match gate
+needs velocity accuracy better than `5/N` m/s — for N = 74 that is **0.068
+m/s**, against the tracker's 0.35–0.40. The initial velocity uncertainty
+alone drags a perfectly-predicted track ~30 m off course. Prediction
+quality is irrelevant next to that.
+
+Two earlier sweeps each missed this because each held the other variable
+at its unhelpful value: the coast budget was swept with the poor learned
+model, and the motion model was swept with coast fixed at 5. Only the
+crossed experiment shows the ceiling is not there.
+
+### 11.4 What this means
+
+* Recall in this configuration is bounded by DETECTION, exactly as the
+  detectability ceiling (0.30) says. No motion model — learned, perfect,
+  or otherwise — moves it, because the gaps are two orders of magnitude
+  longer than any useful coast.
+* Improving the network (it was still underfitting) will not change this.
+  The limit is not in the model.
+* The learned model may still be worth having for a DIFFERENT consumer —
+  the policy, for interception — where "where will this red be in 3
+  steps" is consumed directly rather than through a match gate. That is a
+  separate measurement and is not evidence in hand.
+* The recall budget belongs to SEARCH (§5 step c), which was always the
+  larger term.
+
 ## Reproduce
 
 ```
 python scripts/eval_tracking.py --episodes 8 --steps 150
+python scripts/eval_tracking.py --learned runs/red_motion/model_v2.pt \
+    --stochastic-red --max-misses 20
 ```
 
 Scratch scripts (`scratch/`, not committed): `diag_gap.py` (§2),
 `sweep_q.py` (§3), `autocorr.py` (§4), `clutter_impact.py` (§6),
 `check_stoch_red.py` (§7), `mode_count.py` (§8.3),
 `sweep_obstacle_sigma_a.py` (§9.3, and the bounce-cost measurement in
-§9.4). NEES/NIS are in the eval output.
+§9.4), `noise_floor.py` (§10), `input_quality.py` (§11.2),
+`verify_ceiling.py` and `ceiling_x_coast.py` (§11.3). NEES/NIS are in the
+eval output.
