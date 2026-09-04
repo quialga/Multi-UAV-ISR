@@ -879,27 +879,68 @@ of all samples. Two conclusions:
   categorical + basins + Gaussian Sum instead of a single regressed
   heading.
 
-Which makes the binding constraint a tracker parameter, not the network:
+Which raises the question of why the mixture is not visibly doing this
+work:
 
 ```
 components per track: mean 1.01   p90 1   max 2
 ```
 
-The branches are still collapsing to one. `merge_gate = 4.0` folds them
-before they can pay, and the tracker's own docstring flags it as "a
-placeholder default, not yet tuned against a real branching model" —
-there now IS one. NEES also moved: 2.23–2.56 against a target of 4.0, so
-with the kinematics fixed the branches are now UNDER-confident and
-`sigma_a_model` (0.35, never tuned) can come down.
+The branches collapse to one. The obvious suspect was `merge_gate = 4.0`,
+which the tracker's own docstring flags as "a placeholder default, not yet
+tuned against a real branching model". **It is not the cause**, and no
+value of it would be:
+
+| coast age (misses) | branch separation | branch sd | d² |
+|---|---|---|---|
+| 0 (just updated) | 0.34 m | 1.01 m | 0.441 |
+| 1–5 | 0.28 m | 4.60 m | 0.038 |
+| 6–20 | 0.19 m | 47.25 m | 0.005 |
+| 21–80 | 0.23 m | 305.72 m | 0.002 |
+
+| d2/d1 (tie ratio) | branch separation | branch sd | d² | top-2 heading sep |
+|---|---|---|---|---|
+| 1.00–1.05 | 0.31 m | 8.34 m | 0.018 | **48°** |
+| 1.05–1.15 | 0.25 m | 15.21 m | 0.013 | 39° |
+| > 1.50 | 0.23 m | 215.58 m | 0.004 | 49° |
+
+At a near-tie the branches genuinely point 48° apart — the model produces
+the multimodality. But ONE STEP of that acceleration difference separates
+the resulting states by only **0.31 m**, against a track sd of 1 m in the
+very best case (freshly updated) and 305 m mid-coast. So d² is 0.002–0.44,
+already below the gate everywhere. Lowering `sigma_a_model` to 0.15 moves
+the p90 of d² from 1.09 to 2.41 — still under 4.
+
+**The multimodality is real in ACCELERATION and invisible in one-step
+STATE space.** The modes live in the trajectory, not in the next state:
+branches would need many steps to separate enough to be distinguishable,
+and `_reduce` runs after every PREDICT, merging them at step 1 before they
+can diverge. No gate value fixes that; it is structural to reducing a
+Gaussian Sum at a one-step horizon.
+
+The classical remedy is an **IMM**, where each mode is a LABELLED filter
+with a mode-transition matrix and modes are never merged by proximity —
+identity persists by construction instead of being rediscovered by
+distance.
+
+An uncomfortable corollary: with 1.01 components per track the mixture has
+been **inert throughout**, so the entire measured gain (MOTA 0.19 → 0.52)
+comes from the better MEAN prediction, not from the Gaussian Sum. That is
+reassuring about the gain's robustness — it does not depend on the fragile
+part — but the branching machinery currently earns nothing.
 
 ### 11.5 What is still open
 
-* **`merge_gate`** is now the highest-value knob: the branches that hold
-  the answer at nearest-blue ties are being merged away (§11.4).
+* **The mixture earns nothing yet** (§11.4). Either make modes persist
+  with labels (IMM-style) so they can diverge across steps, or accept the
+  Gaussian Sum as unused here and keep the mean-prediction gain, which is
+  where all of the measured improvement actually comes from. `merge_gate`
+  tuning is NOT the answer — measured, not assumed.
 * **`sigma_a_model`** (0.35) was never tuned, and NEES 2.23–2.56 against
-  a 4.0 target says it is now too LARGE. Both directions of this were
-  wrong at different times, which is the argument for tuning it against
-  NEES rather than picking a number.
+  a 4.0 target says it is now too LARGE. It has been wrong in both
+  directions at different times, which is the argument for tuning it
+  against NEES rather than picking a number. It does not affect the
+  merging (§11.4).
 * **`max_misses`** needs a real choice. 80 is where these were measured;
   a long budget cost constant velocity ~5× the false positives, but under
   the learned model FP went DOWN, so the trade is different now.
