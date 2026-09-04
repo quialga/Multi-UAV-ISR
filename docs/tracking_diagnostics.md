@@ -962,7 +962,69 @@ comes from the better MEAN prediction, not from the Gaussian Sum. That is
 reassuring about the gain's robustness — it does not depend on the fragile
 part — but the branching machinery currently earns nothing.
 
-### 11.5 What is still open
+### 11.5 Tuning: sigma_a_model, and the coast budget
+
+8 episodes × 150 steps, stochastic red, 20 m gate, `merge_gate = 0.25`.
+
+**`sigma_a_model` against NEES** (target 4.0 for a 4-D state), coast 80:
+
+| sigma | NEES | NIS | MOTA | MOTP | IDF1 | recall | FP | IDSW |
+|---|---|---|---|---|---|---|---|---|
+| **0.35** | 3.25 | 1.24 | **0.56** | 3.05 | 0.65 | 0.626 | **160** | 65 |
+| 0.25 | 3.88 | 1.29 | 0.54 | 2.78 | 0.65 | 0.622 | 220 | 82 |
+| 0.18 | 4.50 | 1.37 | 0.53 | 2.87 | 0.64 | 0.626 | 266 | 91 |
+| 0.12 | 4.91 | 1.43 | 0.53 | 3.00 | 0.64 | 0.634 | 291 | 90 |
+| 0.06 | 5.38 | 1.44 | 0.52 | 2.94 | 0.63 | 0.631 | 298 | 86 |
+| 0.00 | 5.58 | 1.46 | 0.50 | 2.93 | 0.58 | 0.629 | 371 | 101 |
+
+**This is the first place in this project where NEES and the MOT metrics
+disagree.** NEES-closest is 0.25; every MOT column prefers 0.35. NEES 3.25
+means slightly CONSERVATIVE — covariance a little larger than the actual
+error — which is the safe direction, and it carries no observed cost: FP
+is *lowest* there. Chasing NEES = 4.0 exactly costs MOTA and doubles FP.
+
+**Adopted `sigma_a_model = 0.35`** — the placeholder turns out to have
+been a good value, now measured rather than assumed.
+
+**Coast budget** at `sigma_a_model = 0.35`:
+
+| coast | model | MOTA | MOTP | IDF1 | recall | FP | FN | IDSW | NEES |
+|---|---|---|---|---|---|---|---|---|---|
+| 20 | CV | 0.35 | 2.92 | 0.47 | 0.386 | 101 | 2211 | 40 | 3.85 |
+| 20 | LEARNED | 0.38 | 1.85 | 0.49 | 0.409 | 48 | 2128 | 39 | 4.64 |
+| 40 | CV | 0.29 | 3.16 | 0.47 | 0.399 | 361 | 2162 | 39 | 3.73 |
+| 40 | LEARNED | 0.47 | 2.49 | 0.55 | 0.502 | 68 | 1794 | 39 | 4.01 |
+| 80 | CV | 0.13 | 3.30 | 0.42 | 0.405 | 931 | 2142 | 43 | 3.57 |
+| 80 | LEARNED | **0.56** | 3.05 | 0.65 | 0.626 | 160 | 1348 | 65 | 3.25 |
+| 150 | CV | 0.05 | 3.35 | 0.40 | 0.407 | 1235 | 2135 | 47 | 3.59 |
+| 150 | LEARNED | **0.60** | 3.17 | 0.68 | **0.689** | 227 | 1119 | 81 | 3.04 |
+
+The two models move in OPPOSITE directions. Constant velocity peaks around
+coast 20 and then degrades badly — MOTA 0.35 → 0.05, FP 101 → 1235 — because
+a longer budget only keeps drifting tracks alive. The learned model climbs
+monotonically, MOTA 0.31 → 0.60 and recall 0.320 → 0.689, with FP an order
+of magnitude lower than CV's at the same budget.
+
+At coast 5 the two are identical (0.31 each). At coast 150 it is 0.05
+against 0.60. The coast budget is not one parameter among others: it is
+the condition that separates a model that can predict from one that
+cannot, and raising it is actively HARMFUL without one.
+
+Two honest caveats. Recall 0.689 sits at **2.2× the detectability
+ceiling** (0.31), so the model is genuinely bridging gaps rather than
+accumulating luck. But `max_misses = 150` with 150-step episodes means a
+track never dies — that row is the limiting "never kill anything" case,
+not a tuned value, and the cost shows in IDSW (39 → 81).
+
+**Recommended `max_misses = 80`**: it captures most of the gain (MOTA 0.56
+of 0.60) with 30% fewer false positives and 20% fewer ID switches, and it
+is a real timeout rather than the degenerate case.
+
+One coupling to note: the learned model's NEES FALLS as the coast budget
+rises (4.64 at coast 20 → 3.04 at 150), so the NEES-optimal sigma depends
+on the budget. At a long budget the current setting is conservative.
+
+### 11.6 What is still open
 
 * **The mixture earns nothing, and that is now settled** (§11.4).
   Disabling merging entirely lets the hypotheses persist (1.01 → 28.8
@@ -971,14 +1033,10 @@ part — but the branching machinery currently earns nothing.
   nor an IMM has a measured case behind it. All of the gain is the mean
   prediction. `merge_gate = 0.25` is a small free win (best MOTA, lowest
   IDSW) and the only change indicated here.
-* **`sigma_a_model`** (0.35) was never tuned, and NEES 2.23–2.56 against
-  a 4.0 target says it is now too LARGE. It has been wrong in both
-  directions at different times, which is the argument for tuning it
-  against NEES rather than picking a number. It does not affect the
-  merging (§11.4).
-* **`max_misses`** needs a real choice. 80 is where these were measured;
-  a long budget cost constant velocity ~5× the false positives, but under
-  the learned model FP went DOWN, so the trade is different now.
+* ~~`sigma_a_model`~~ and ~~`max_misses`~~ — measured in §11.5. Adopted
+  0.35 and 80. Neither is applied as a DEFAULT yet: `max_misses` is a
+  tracker-wide default that the belief-map and policy paths also consume,
+  so changing it is a production decision, not a diagnostics one.
 * **Velocity estimation** is worth attention: it contributes ~4.9° of the
   +6.5° input penalty (§11.3), and the red policy does not even read
   velocity — the network uses it only as the observable trace of the
