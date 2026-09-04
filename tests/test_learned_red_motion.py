@@ -179,20 +179,45 @@ def test_a_bimodal_categorical_yields_two_separated_branches():
     assert cos < -0.9, f"modes collapsed toward each other (cos {cos:.2f})"
 
 
-def test_prediction_applies_the_acceleration_as_a_control_term():
-    """Each branch must MOVE its state by the acceleration the cell names
-    -- that missing control term is the whole point of a learned model
-    over the constant-velocity default."""
+def test_prediction_matches_the_env_integration_exactly():
+    """A branch must advance its state the way PursuitEnv ACTUALLY does.
+
+    The env uses ``v' = clip(v + a*dt, -v_max, v_max)`` then
+    ``p' = p + v'*dt`` -- so the position gain is dt^2, not the textbook
+    dt^2/2, and the velocity is capped AXIS-WISE.  Getting either wrong is
+    invisible in a single step and ruinous over a coast: the textbook gain
+    predicts half a metre short per step, and an uncapped velocity reaches
+    80 m/s over an 80-step coast, throwing the estimate a thousand metres
+    outside a 130 m arena.  Both were measured before this test existed.
+    """
+    from isr.env.entities import RED_TARGET
+
     ad = _adapter(max_branches=8, dt=1.0)
     ad.set_context(blue_pos=np.array([[20.0, 20.0]]), blue_vel=np.zeros((1, 2)))
-    x = np.array([65.0, 65.0, 1.0, 0.0])
-    P = np.eye(4) * 1e-9
-    for w, xb, _ in ad(x, P):
-        # recover the acceleration the branch implies and check it maps
-        # back to a state consistent with x_pred = F x + G a
-        a = np.array([xb[2] - x[2], xb[3] - x[3]]) / ad.dt
-        assert np.allclose(xb[:2], x[:2] + x[2:] * ad.dt + 0.5 * a * ad.dt ** 2)
-        assert np.linalg.norm(a) <= ad.a_max + 1e-6
+    for x in (np.array([65.0, 65.0, 1.0, 0.0]),      # already at v_max
+              np.array([65.0, 65.0, -0.4, 0.9]),
+              np.array([65.0, 65.0, 0.0, 0.0])):
+        for _, xb, _ in ad(x, np.eye(4) * 1e-9):
+            # Recover the acceleration this branch applied, then re-derive
+            # the state through the env's own formula.
+            a = (xb[2:] - x[2:]) / ad.dt
+            v = np.clip(x[2:] + a * ad.dt, -RED_TARGET.v_max, RED_TARGET.v_max)
+            assert np.allclose(xb[2:], v, atol=1e-9)
+            assert np.allclose(xb[:2], x[:2] + v * ad.dt, atol=1e-9)
+
+
+def test_velocity_never_exceeds_the_red_speed_cap():
+    """The cap is what stops a coasting track accelerating without bound."""
+    from isr.env.entities import RED_TARGET
+
+    ad = _adapter(max_branches=4)
+    ad.set_context(blue_pos=np.array([[10.0, 10.0]]), blue_vel=np.zeros((1, 2)))
+    x = np.array([65.0, 65.0, 0.0, 0.0])
+    for _ in range(200):                       # a long coast, no detections
+        branches = ad(x, np.eye(4))
+        x = max(branches, key=lambda b: b[0])[1]
+    assert np.all(np.abs(x[2:]) <= RED_TARGET.v_max + 1e-9), (
+        f"velocity ran away to {x[2:]} over a long coast")
 
 
 def test_learned_branch_is_tighter_than_the_constant_velocity_default():

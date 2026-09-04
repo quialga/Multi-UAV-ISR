@@ -109,12 +109,13 @@ it does NOT change recall (§3).
 
 ## 5. Why F cannot be fixed, and the recall budget
 
-> **RETRACTED — see §11.** The 0.64 figure below does not reproduce. A
-> perfect motion model (the TRUE policy, queried at the red's exact state)
-> measures recall **0.305 / 0.316**, i.e. no better than constant
-> velocity. The claim that `F` is the wrong model is still correct; the
-> claim that fixing it buys recall is not. The rest of this section is
-> kept as written so the correction is legible.
+> **CONFIRMED — see §11.** This section was briefly retracted on the
+> strength of a measurement that turned out to have two bugs in the
+> measuring apparatus, not in the claim. Re-measured correctly, a good
+> motion model takes recall from 0.35 to **0.51–0.61**, and the learned
+> model reaches the same place. One condition has to be added, though:
+> the gain only exists once `max_misses` is raised. At the default coast
+> budget of 5 steps, no motion model changes anything.
 
 `F` is a LINEAR, state-INDEPENDENT transition. The red's motion is a
 NON-LINEAR function of a state `F` does not even see (nearest blue,
@@ -127,8 +128,8 @@ Recall budget:
 | stage | recall | limited by |
 |---|---|---|
 | today (constant velocity) | 0.30 | at the detectability ceiling; bridges no gaps |
-| ~~+ learned motion model (step b)~~ | ~~**0.64** (measured with the true policy)~~ | **retracted, §11** |
-| + directed search (step c) | > 0.64 | targets never yet detected |
+| + learned motion model (step b) | **0.58** (§11, learned; 0.61 with oracle association) | still capped by detection |
+| + directed search (step c) | > 0.61 | targets never yet detected |
 
 The remaining 0.36 at stage 2 are targets **never detected**, so no track
 is even born — unfixable by any filter; it needs SEARCH (the grid as birth
@@ -695,97 +696,167 @@ are reproducible. Throughput: ~1600 samples/s, ~7.7 episodes/s on CPU (a
 150-step episode with ~3 active reds yields ~450 samples) — a
 million-sample dataset costs on the order of ten minutes, no GPU.
 
-## 11. The learned motion model does not pay for itself — and neither does a perfect one
+## 11. The learned motion model, measured downstream
 
 The model from §10 was trained, wired into the `motion_model` plug point
-(`isr/agents/learned_red_motion.py`) and measured downstream. The result is
-negative, and the reason turned out to invalidate §5's recall budget
-rather than the network.
+(`isr/agents/learned_red_motion.py`) and measured. It works — but three
+bugs in the adapter had to be found first, and the middle two of them
+produced a confident, thoroughly documented negative result that was
+entirely an artefact of the measuring apparatus. That sequence is recorded
+here because the failure mode is the interesting part: every one of the
+three was invisible in a single prediction step and ruinous over a coast.
 
-### 11.1 What the learned model scores
+### 11.1 The headline
 
-Same 6 episodes × 120 steps as every other row, so this is attribution and
-not a comparison across runs.
+STOCHASTIC red, 6 episodes × 120 steps, `max_misses=80`, 20 m match gate.
+Same episodes for every row, so this is attribution rather than a
+comparison across runs.
 
-| configuration | recall | MOTP | IDF1 | FP | NEES |
+| configuration | MOTA | MOTP | IDF1 | recall | FP | MT |
+|---|---|---|---|---|---|---|
+| KF + real assoc (constant velocity) | 0.19 | 3.13 | 0.45 | 0.41 | 460 | 0.17 |
+| **LEARNED + real assoc** | **0.52** | 3.07 | **0.61** | **0.58** | **96** | **0.44** |
+| LEARNED + ORACLE assoc | 0.60 | 3.16 | 0.66 | 0.61 | 1 | 0.50 |
+
+Better on every column. MOTA nearly triples, and false positives drop
+**5×** — because a coasted track that stays near the truth is a match,
+while one that drifts away is counted twice over, as both a miss and a
+false positive.
+
+Recall by match gate, at three coast budgets:
+
+| motion model | coast | 5 m | 10 m | 20 m | 40 m |
 |---|---|---|---|---|---|
-| KF + real assoc (constant velocity) | **0.322** | 1.06 | 0.45 | 13 | 3.60 |
-| LEARNED + real assoc | 0.315 | 1.14 | 0.37 | 90 | 5.66 |
+| constant velocity | 5 | 0.328 | 0.331 | 0.331 | 0.331 |
+| TRUE policy | 5 | 0.330 | 0.331 | 0.331 | 0.331 |
+| LEARNED | 5 | 0.331 | 0.331 | 0.331 | 0.331 |
+| constant velocity | 20 | 0.345 | 0.373 | 0.390 | 0.400 |
+| LEARNED | 20 | 0.383 | 0.398 | 0.401 | 0.401 |
+| constant velocity | 80 | 0.346 | 0.380 | 0.441 | 0.509 |
+| TRUE policy | 80 | 0.481 | 0.584 | 0.597 | 0.597 |
+| **LEARNED** | 80 | **0.509** | 0.568 | **0.609** | 0.609 |
 
-Worse on every column: slightly lower recall, worse localisation, worse
-identity, ~7× the false positives, and badly overconfident. Raising
-`sigma_a_model` fixes the NEES — at 1.0 it reaches 3.88 — but at that
-setting the isotropic model-error term dominates the branch covariance and
-the learned model simply *reduces to* constant velocity. It becomes
-honest exactly when it stops carrying information.
+Two conditions, both necessary, neither sufficient:
 
-### 11.2 Why it actively hurts rather than being neutral
+* **The coast budget.** At `max_misses=5` every motion model scores 0.331,
+  including a perfect one. Measured invisibility gaps last a median **74
+  steps** (deterministic) / **88** (stochastic), and only 14% / 0% are
+  within 5 steps — so a 5-step budget can cover at most a few percent of a
+  gap no matter how good the prediction is. This is a CONFIGURATION
+  change, and it is what unlocks everything else.
+* **The match gate.** 5 m is a MOT evaluation convention, not an
+  operational requirement. What a blue needs is "point me somewhere that
+  puts the target inside my sensor disk", and the sensor radius is 40 m.
+  Relaxing the gate lifts even constant velocity (0.346 → 0.509).
 
-Constant velocity asserts NO acceleration; it only widens its covariance.
-The learned model asserts a specific one, so a confidently wrong assertion
-pushes the track off at ~1 m/step in the wrong direction, compounding.
+The learned model reaches, and at the tight gate slightly exceeds, the
+TRUE-policy oracle (0.509 vs 0.481 at 5 m). Not a paradox: the oracle
+queries the policy at the red's TRUE position but applies the answer to a
+component that has already drifted, so it is internally inconsistent. The
+learned model queries its OWN estimated state, which is exactly the
+question a motion model should answer.
 
-Isolating the network from its inputs (query the same state three ways,
-score against `env._last_red_action`):
+Drift while coasting, stochastic red, `max_misses=80`:
+
+| motion model | 6–20 misses | 21–50 | 51–80 |
+|---|---|---|---|
+| constant velocity | 8.8 m | 22.9 m | 53.3 m |
+| TRUE policy | 3.2 m | 5.2 m | 4.2 m |
+| LEARNED | 2.8 m | 4.2 m | 5.0 m |
+
+The error SATURATES rather than growing. This is worth stating because an
+earlier argument here was that bridging an N-step gap within tolerance D
+requires velocity accuracy better than `D/N` — 0.068 m/s for N = 74,
+against the tracker's 0.35–0.40 — and therefore that no model could
+bridge. That reasoning assumed the error integrates from a fixed initial
+velocity error. It does not: a motion model that reproduces the policy
+re-derives the correct velocity every step, so the error stays at whatever
+it was when the coast began. The arithmetic only describes constant
+velocity, which is precisely the model that has no way to correct itself.
+
+### 11.2 Three adapter bugs, and why each was invisible in one step
+
+**(a) Top-k cells are not modes.** Training uses SOFT LABELS that smear
+mass onto adjacent bins, so the k most probable cells are one mode sampled
+k times. The tracker's merge gate correctly folded them into a single
+component: measured mean **1.01 components per track**, i.e. the entire
+Gaussian-Sum machinery inert. Compounding it, with 181 classes and a ~7%
+peak the top 4 cells hold only ~20% of the mass, so a 0.9 mass threshold
+was never reachable and ~80% of the distribution — all of it tail — was
+discarded. Branch covariances then described a far narrower belief than
+the model had predicted: NEES 6.6 against a target of 4.0.
+
+Fixed by splitting the categorical into BASINS around local maxima of the
+heading marginal and assigning every heading bin to its nearest kept peak.
+Nothing is discarded; `max_branches` now controls how finely modes are
+resolved, not how much of the distribution survives. NEES 6.6 → 5.0.
+Heading defines the modes because this adversary's multimodality is a
+left/right commitment; magnitude is ordinal and unimodal within a
+direction, so splitting on it would manufacture near-duplicates.
+
+**(b) The wrong integration gain.** `PursuitEnv._integrate` advances the
+position with the NEW velocity:
+
+```
+v' = clip(v + a*dt, -v_max, v_max)      p' = p + v'*dt
+```
+
+so `p' = p + v*dt + a*dt^2`. The adapter used the textbook `dt^2/2`,
+predicting half a metre short per step at full acceleration — nothing in
+one step, cumulative over a coast.
+
+**(c) No velocity cap.** The env clips red speed AXIS-WISE at
+`RED_TARGET.v_max = 1.0`. The adapter did not, so a unit acceleration
+applied every step of an 80-step coast reached 80 m/s and put the estimate
+**over a thousand metres outside a 130 m arena** (measured: 1172 m median
+drift at 51–80 misses). Constant velocity never accelerates and so was
+never affected, which is exactly why it appeared to win.
+
+(b) and (c) were in the evaluation oracle too, which is how they produced
+a *coherent* false story: a "perfect" motion model that lost to constant
+velocity, and a plausible-sounding arithmetic explanation for why. The
+tell was in the diagnostics rather than the conclusion — a drift of 1172 m
+in a 130 m arena is not a model degrading, it is divergence.
+
+`test_prediction_matches_the_env_integration_exactly` and
+`test_velocity_never_exceeds_the_red_speed_cap` now pin both against the
+env's own formula.
+
+### 11.3 Model quality, isolated from input quality
+
+Querying the network three ways and scoring against `env._last_red_action`
+(deterministic red, where the noise floor is exactly 0° — no randomness
+excuses anything):
 
 | query state | median | mean | p90 |
 |---|---|---|---|
-| TRUTH (exact position and velocity) | 8.0° | 26.1° | **100.3°** |
+| TRUTH (exact position and velocity) | 8.0° | 26.1° | 100.3° |
 | exact velocity, tracker position | 9.6° | 25.8° | 76.4° |
 | tracker estimate (what really happens) | 14.5° | 32.4° | 113.7° |
 
-*(deterministic red, where the noise floor is exactly 0° — there is no
-randomness to excuse any of this)*
+The tracker's state costs +6.5°, of which ~4.9° comes from VELOCITY error
+(0.35–0.40 m/s) and only ~1.6° from position. Notably, the red policy does
+not read velocity at all — the network uses it as the only observable
+trace of the adversary's hidden state (AR(1) phase, commitment), so a
+better velocity estimate should pay off directly.
 
-Two readings. First, the tracker's state costs +6.5°, of which ~4.9° comes
-from VELOCITY error (0.35–0.40 m/s) and only ~1.6° from position — but
-this is the smaller problem. Second, even with perfect inputs on a
-perfectly predictable target the model's **p90 is 100°**: it is
-catastrophically wrong on 10–15% of states. The tail, not the median, is
-what breaks the tracker.
+The heavy tail is real and unexplained by inputs: **p90 = 100° with
+perfect inputs on a perfectly predictable target**. The model still wins
+downstream despite it, because the Gaussian-Sum carries the uncertainty
+and the branch covariance absorbs it — but this is the obvious place to
+look for more, and the network was still underfitting when training
+stopped (train 3.865 vs val 3.928 at epoch 40).
 
-### 11.3 The finding that matters: a PERFECT model buys nothing either
+### 11.4 What is still open
 
-Before concluding the network needs to be better, the ceiling it is aiming
-at was re-measured — plugging the TRUE policy in as the motion model,
-queried at the red's exact state, with the process floor swept so the
-comparison is not a calibration artefact:
-
-| motion model | coast 5 | coast 20 | coast 80 |
-|---|---|---|---|
-| constant velocity | 0.328 | 0.345 | 0.346 |
-| TRUE policy | 0.316 | 0.316 | 0.317 |
-
-Flat, and never better than constant velocity. **§5's 0.64 does not
-reproduce.**
-
-The mechanism is arithmetic. Measured invisibility gaps last a **median 74
-steps (deterministic) / 88 steps (stochastic)**; only 14% / 0% are ≤ 5
-steps. Bridging an N-step gap and still landing inside the 5 m match gate
-needs velocity accuracy better than `5/N` m/s — for N = 74 that is **0.068
-m/s**, against the tracker's 0.35–0.40. The initial velocity uncertainty
-alone drags a perfectly-predicted track ~30 m off course. Prediction
-quality is irrelevant next to that.
-
-Two earlier sweeps each missed this because each held the other variable
-at its unhelpful value: the coast budget was swept with the poor learned
-model, and the motion model was swept with coast fixed at 5. Only the
-crossed experiment shows the ceiling is not there.
-
-### 11.4 What this means
-
-* Recall in this configuration is bounded by DETECTION, exactly as the
-  detectability ceiling (0.30) says. No motion model — learned, perfect,
-  or otherwise — moves it, because the gaps are two orders of magnitude
-  longer than any useful coast.
-* Improving the network (it was still underfitting) will not change this.
-  The limit is not in the model.
-* The learned model may still be worth having for a DIFFERENT consumer —
-  the policy, for interception — where "where will this red be in 3
-  steps" is consumed directly rather than through a match gate. That is a
-  separate measurement and is not evidence in hand.
-* The recall budget belongs to SEARCH (§5 step c), which was always the
-  larger term.
+* `sigma_a_model` (0.35) remains a PLACEHOLDER, never NEES-tuned. The
+  learned rows already win with it untuned, so the tuning is upside, not a
+  correction.
+* `max_misses` needs a real choice. 80 is where these were measured; the
+  cost of a long budget under CV was ~5× the false positives, but under
+  the learned model FP went DOWN, so the trade is different now.
+* Obstacle geometry is ground truth in these rows; deployment reads the
+  obstacle tracker.
 
 ## Reproduce
 

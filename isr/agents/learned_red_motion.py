@@ -49,6 +49,7 @@ from isr.agents.red_motion_features import (
     bin_to_accel, featurize_shard,
 )
 from isr.agents.red_motion_gnn import RedMotionGNN
+from isr.env.entities import RED_TARGET
 
 _INPUT_KEYS = ("red_feats", "blue_feats", "b2r_edge_feats",
               "obs_feats", "o2r_edge_feats", "b2r_active", "o2r_active")
@@ -92,6 +93,7 @@ class LearnedRedMotion:
         obs_cap:          int,
         dt:               float = 1.0,
         a_max:            float = 1.0,
+        v_max:            float = RED_TARGET.v_max,
         arena_size:       float = 130.0,
         max_branches:     int = 4,
         sigma_a_model:    float = 0.35,
@@ -102,6 +104,7 @@ class LearnedRedMotion:
         self.obs_cap = int(obs_cap)
         self.dt = float(dt)
         self.a_max = float(a_max)
+        self.v_max = float(v_max)
         self.L = float(arena_size)
         # A cap on MODES, not on cells: every heading bin is assigned to a
         # kept peak, so raising or lowering this never discards mass, it
@@ -115,10 +118,16 @@ class LearnedRedMotion:
 
         self.F = np.eye(4)
         self.F[0, 2] = self.F[1, 3] = self.dt
-        # Control/noise gain for state [px, py, vx, vy] under a constant
-        # acceleration held across the step.
-        self.G = np.array([[0.5 * self.dt ** 2, 0.0],
-                          [0.0, 0.5 * self.dt ** 2],
+        # Control/noise gain for state [px, py, vx, vy].
+        #
+        # dt^2, NOT the textbook dt^2/2.  PursuitEnv._integrate advances
+        # the position with the NEW velocity:
+        #     v' = clip(v + a*dt),   p' = p + v'*dt
+        # so p' = p + v*dt + a*dt^2.  Using dt^2/2 here predicts half a
+        # metre short per step at full acceleration, which compounds over
+        # a coast -- the model would be blamed for an integration mismatch.
+        self.G = np.array([[self.dt ** 2, 0.0],
+                          [0.0, self.dt ** 2],
                           [self.dt, 0.0],
                           [0.0, self.dt]])
 
@@ -346,6 +355,24 @@ class LearnedRedMotion:
                        self.sigma_a_model ** 2 * np.eye(2)))
         return out
 
+    def _advance(self, x: np.ndarray, accel: np.ndarray) -> np.ndarray:
+        """Advance a state exactly as ``PursuitEnv._integrate`` would.
+
+        The velocity cap is AXIS-WISE (matching the env, which clips the
+        components, not the magnitude) and is what stops a coasting track
+        accelerating without bound: applied every step, an uncapped unit
+        acceleration reaches 80 m/s over an 80-step coast and throws the
+        estimate a thousand metres outside a 130 m arena.  Measured
+        exactly that before the cap was added.
+
+        Arena clipping is deliberately NOT applied.  It is a hard
+        non-linearity that would bias the mixture at the boundary, and a
+        track whose mean has left the arena is already lost by any useful
+        tolerance.
+        """
+        v = np.clip(x[2:] + accel * self.dt, -self.v_max, self.v_max)
+        return np.concatenate([x[:2] + v * self.dt, v])
+
     def __call__(self, x: np.ndarray, P: np.ndarray
                  ) -> List[Tuple[float, np.ndarray, np.ndarray]]:
         """One Gaussian-Sum branch per MODE of the predicted categorical."""
@@ -353,7 +380,11 @@ class LearnedRedMotion:
         FPFt = self.F @ P @ self.F.T
         out: List[Tuple[float, np.ndarray, np.ndarray]] = []
         for w, accel, cov_a in self._basins(probs):
-            x_pred = self.F @ x + self.G @ accel
+            # Mean through the env's exact (clipped) kinematics; covariance
+            # through the linear gain.  Where the cap binds, the true
+            # spread is SMALLER than the linear one, so this errs
+            # conservative -- the safe direction for a gate.
+            x_pred = self._advance(x, accel)
             P_pred = FPFt + self.G @ cov_a @ self.G.T
             out.append((float(w), x_pred, P_pred))
         return out
