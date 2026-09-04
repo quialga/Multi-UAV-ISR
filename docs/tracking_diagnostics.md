@@ -840,21 +840,75 @@ not read velocity at all — the network uses it as the only observable
 trace of the adversary's hidden state (AR(1) phase, commitment), so a
 better velocity estimate should pay off directly.
 
-The heavy tail is real and unexplained by inputs: **p90 = 100° with
-perfect inputs on a perfectly predictable target**. The model still wins
-downstream despite it, because the Gaussian-Sum carries the uncertainty
-and the branch covariance absorbs it — but this is the obvious place to
-look for more, and the network was still underfitting when training
-stopped (train 3.865 vs val 3.928 at epoch 40).
+The heavy tail is real and not explained by inputs: **p90 = 100° with
+perfect inputs on a perfectly predictable target**.
 
-### 11.4 What is still open
+Training 3× longer (120 epochs, val loss 3.928 → 3.736, converged — train
+3.62 vs val 3.75, plateaued from epoch ~104) sharpened the median 8.0° →
+7.1° and made the p90 **worse**, 100° → 121°. That rules out underfitting:
+the model is not hesitant on those states, it is confidently wrong, and
+more training makes it more confident. Downstream, v3 buys tighter
+localisation (MOTP 3.07 → 2.65) and no extra recall.
 
-* `sigma_a_model` (0.35) remains a PLACEHOLDER, never NEES-tuned. The
-  learned rows already win with it untuned, so the tuning is upside, not a
-  correction.
-* `max_misses` needs a real choice. 80 is where these were measured; the
-  cost of a long budget under CV was ~5× the false positives, but under
+### 11.4 The tail is the policy's discontinuity, and the mixture already holds the answer
+
+`run_from_nearest_uav` is DISCONTINUOUS in the identity of the nearest
+blue: near a tie, an arbitrarily small displacement flips the flee
+direction by a large angle. Bucketing the error by the distance ratio of
+the two nearest blues (`d2/d1`, so 1.0 is a perfect tie):
+
+| d2/d1 | n | top mode median | p90 | **best branch** median | p90 |
+|---|---|---|---|---|---|
+| 1.00–1.05 | 1411 | 19.4° | **134.4°** | 11.4° | **37.4°** |
+| 1.05–1.15 | 1104 | 16.1° | 79.3° | 13.1° | 42.2° |
+| 1.15–1.35 | 893 | 12.2° | 71.5° | 11.3° | 54.1° |
+| 1.35–2.00 | 702 | 16.2° | 89.3° | 14.6° | 67.9° |
+| > 2.00 | 210 | 8.4° | 30.8° | 8.0° | 25.7° |
+| ALL | 4320 | 15.7° | 93.6° | 11.9° | 46.1° |
+
+The tail concentrates exactly where predicted, and that bucket is a THIRD
+of all samples. Two conclusions:
+
+* The tail is **irreducible pointwise**. No capacity predicts which side
+  of a tie you are on; the information is not in the state. It is not a
+  training defect and cannot be trained away — as the 120-epoch run
+  demonstrated by making it worse.
+* The mixture **already carries the right answer**: at a near-tie the best
+  branch is p90 37° against the top mode's 134°. This is the EPISTEMIC
+  multimodality §8.3 predicted, and it retroactively justifies the joint
+  categorical + basins + Gaussian Sum instead of a single regressed
+  heading.
+
+Which makes the binding constraint a tracker parameter, not the network:
+
+```
+components per track: mean 1.01   p90 1   max 2
+```
+
+The branches are still collapsing to one. `merge_gate = 4.0` folds them
+before they can pay, and the tracker's own docstring flags it as "a
+placeholder default, not yet tuned against a real branching model" —
+there now IS one. NEES also moved: 2.23–2.56 against a target of 4.0, so
+with the kinematics fixed the branches are now UNDER-confident and
+`sigma_a_model` (0.35, never tuned) can come down.
+
+### 11.5 What is still open
+
+* **`merge_gate`** is now the highest-value knob: the branches that hold
+  the answer at nearest-blue ties are being merged away (§11.4).
+* **`sigma_a_model`** (0.35) was never tuned, and NEES 2.23–2.56 against
+  a 4.0 target says it is now too LARGE. Both directions of this were
+  wrong at different times, which is the argument for tuning it against
+  NEES rather than picking a number.
+* **`max_misses`** needs a real choice. 80 is where these were measured;
+  a long budget cost constant velocity ~5× the false positives, but under
   the learned model FP went DOWN, so the trade is different now.
+* **Velocity estimation** is worth attention: it contributes ~4.9° of the
+  +6.5° input penalty (§11.3), and the red policy does not even read
+  velocity — the network uses it only as the observable trace of the
+  adversary's hidden state.
+* More network capacity is NOT indicated. It converged, and the remaining
+  error is epistemic (§11.4).
 * Obstacle geometry is ground truth in these rows; deployment reads the
   obstacle tracker.
 
