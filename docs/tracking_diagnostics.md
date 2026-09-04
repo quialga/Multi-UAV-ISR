@@ -918,10 +918,43 @@ and `_reduce` runs after every PREDICT, merging them at step 1 before they
 can diverge. No gate value fixes that; it is structural to reducing a
 Gaussian Sum at a one-step horizon.
 
-The classical remedy is an **IMM**, where each mode is a LABELLED filter
-with a mode-transition matrix and modes are never merged by proximity —
-identity persists by construction instead of being rediscovered by
-distance.
+The classical remedy would be an **IMM**, where each mode is a LABELLED
+filter with a mode-transition matrix and modes are never merged by
+proximity — identity persists by construction instead of being
+rediscovered by distance.
+
+**Tested directly instead of argued.** `merge_gate < 0` disables merging
+outright (a squared Mahalanobis distance is never negative), so the
+hypotheses simply persist and diverge across steps. `max_components` then
+binds, since `_predict_track` calls the motion model once per EXISTING
+component and each call returns up to `max_branches`, so the count
+multiplies ×4 every step (1 → 4 → 16 → 64 …) — which is why `_reduce` is
+mandatory rather than optional.
+
+| merge | max_comp | MOTA | MOTP | IDF1 | recall | FP | IDSW | comps |
+|---|---|---|---|---|---|---|---|---|
+| — (constant velocity) | — | 0.19 | 3.13 | 0.45 | 0.406 | 460 | 11 | — |
+| 4.0 (today) | 8 | 0.52 | 2.65 | 0.60 | 0.580 | 98 | 27 | 1.01 |
+| never | 8 | 0.52 | 2.59 | 0.62 | 0.581 | 97 | 24 | 7.69 |
+| never | 16 | 0.52 | 2.67 | 0.62 | 0.581 | 97 | 24 | 15.02 |
+| never | 32 | 0.52 | 2.84 | 0.61 | 0.581 | 97 | 28 | 28.75 |
+| 0.25 | 16 | **0.53** | 2.61 | 0.61 | 0.581 | 97 | **21** | 1.54 |
+
+The hypotheses now genuinely survive — 1.01 → 7.7 → 28.8 components,
+saturating the cap — and the metrics do not move: MOTA 0.52 → 0.52, recall
+0.580 → 0.581. Only IDF1 (0.60 → 0.62), IDSW (27 → 24) and MOTP (2.65 →
+2.59) shift, all marginally.
+
+That closes the question the clean way: **merging was not destroying
+information**. Keeping 30 near-identical Gaussians costs 30× the compute
+and buys nothing, because the branches carry no distinguishable
+information at a one-step horizon. Note `max_components=32` makes MOTP
+*worse* (2.84 vs 2.59) — the readout is the dominant component, and among
+many near-identical ones the dominant can be a slightly worse branch.
+More hypotheses without real separation is noise, not information.
+
+`merge_gate = 0.25` (merge only true duplicates) is the small free win:
+best MOTA and lowest IDSW at 1.54 components.
 
 An uncomfortable corollary: with 1.01 components per track the mixture has
 been **inert throughout**, so the entire measured gain (MOTA 0.19 → 0.52)
@@ -931,11 +964,13 @@ part — but the branching machinery currently earns nothing.
 
 ### 11.5 What is still open
 
-* **The mixture earns nothing yet** (§11.4). Either make modes persist
-  with labels (IMM-style) so they can diverge across steps, or accept the
-  Gaussian Sum as unused here and keep the mean-prediction gain, which is
-  where all of the measured improvement actually comes from. `merge_gate`
-  tuning is NOT the answer — measured, not assumed.
+* **The mixture earns nothing, and that is now settled** (§11.4).
+  Disabling merging entirely lets the hypotheses persist (1.01 → 28.8
+  components) and changes recall by 0.001. The branches are not
+  distinguishable at a one-step horizon, so neither `merge_gate` tuning
+  nor an IMM has a measured case behind it. All of the gain is the mean
+  prediction. `merge_gate = 0.25` is a small free win (best MOTA, lowest
+  IDSW) and the only change indicated here.
 * **`sigma_a_model`** (0.35) was never tuned, and NEES 2.23–2.56 against
   a 4.0 target says it is now too LARGE. It has been wrong in both
   directions at different times, which is the argument for tuning it

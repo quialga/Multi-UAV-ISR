@@ -74,7 +74,8 @@ def _env(seed: int, stochastic_red: bool = False, **kw):
 def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900,
         learned_ckpt: str = "", sigma_a_model: float = 0.35,
         max_branches: int = 4, stochastic_red: bool = False,
-        max_misses: int = 5):
+        max_misses: int = 5, merge_gate: float = 4.0,
+        max_components: int = 8):
     learned_keys = ("lrn_oracle", "lrn_real") if learned_ckpt else ()
     keys = ("raw", "belief", "oracle", "real") + learned_keys
     acc = {k: MOTAccumulator(match_dist) for k in keys}
@@ -103,11 +104,11 @@ def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900,
             "real": MultiTargetTracker(**common),
         }
         if motion is not None:
+            gs = dict(motion_model=motion, max_components=max_components,
+                     merge_gate=merge_gate)
             trk["lrn_oracle"] = MultiTargetTracker(
-                oracle_association=True, motion_model=motion,
-                max_components=8, **common)
-            trk["lrn_real"] = MultiTargetTracker(
-                motion_model=motion, max_components=8, **common)
+                oracle_association=True, **gs, **common)
+            trk["lrn_real"] = MultiTargetTracker(**gs, **common)
         for _ in range(steps):
             if not e.agents:
                 break
@@ -209,6 +210,14 @@ def main() -> None:
                    help="consecutive misses before a track dies -- this is "
                         "the COAST BUDGET, and it caps how much any motion "
                         "model can buy by predicting through sensor gaps")
+    p.add_argument("--merge-gate", type=float, default=4.0,
+                   help="squared Mahalanobis distance below which two "
+                        "components are folded together; NEGATIVE disables "
+                        "merging entirely (d^2 is never < 0)")
+    p.add_argument("--max-components", type=int, default=8,
+                   help="cap on Gaussian-Sum components per track -- the "
+                        "binding constraint once merging is off, since "
+                        "branches multiply every step")
     p.add_argument("--stochastic-red", action="store_true",
                    help="evaluate against the stochastic adversary the model "
                         "was trained on, instead of the deterministic one")
@@ -217,7 +226,8 @@ def main() -> None:
     acc, cons, ntr, ceiling, branches = run(
         a.episodes, a.steps, a.match_dist, learned_ckpt=a.learned,
         sigma_a_model=a.sigma_a_model, max_branches=a.max_branches,
-        stochastic_red=a.stochastic_red, max_misses=a.max_misses)
+        stochastic_red=a.stochastic_red, max_misses=a.max_misses,
+        merge_gate=a.merge_gate, max_components=a.max_components)
 
     labels = {"raw": "raw detections (floor)",
               "belief": "belief peaks (today)",
