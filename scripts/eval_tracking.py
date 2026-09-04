@@ -12,11 +12,25 @@ attributed rather than guessed:
   3. KF + REAL association — the full system.  The gap against (2) is
      exactly what data association costs.
 
+With ``--learned CKPT`` two more rows appear, using the trained
+red-motion model as the tracker's ``motion_model`` instead of the
+constant-velocity default.  The gap against rows 2-3 is exactly what
+PREDICTING the adversary's next acceleration buys — the number the whole
+learned-motion line of work is for.  Because every configuration runs on
+the SAME episodes, that gap is attribution, not comparison across runs.
+
+Two idealisations in the learned rows, both stated rather than hidden:
+obstacle geometry is taken as ground truth (in deployment it comes from
+the separate obstacle tracker), and blue positions are exact — the latter
+is not an idealisation at all, since blues are our OWN drones.
+
 Everything is CPU and needs no training.
 
 Run:
     python scripts/eval_tracking.py
     python scripts/eval_tracking.py --episodes 12 --steps 150
+    python scripts/eval_tracking.py --learned runs/red_motion/model_v2.pt
+    python scripts/eval_tracking.py --learned ... --stochastic-red
 """
 from __future__ import annotations
 
@@ -28,19 +42,28 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from isr.agents.stochastic_red import StochasticRed
 from isr.env.pursuit_env import PursuitEnv, run_from_nearest_uav
 from isr.tracking import MultiTargetTracker
 from isr.tracking.metrics import ConsistencyAccumulator, MOTAccumulator
 
+# Representative stochastic adversary — the middle of the domain
+# randomisation the collector trained on, not a new set of magic numbers.
+STOCH_RED = dict(heading_noise_std=0.25, heading_rho=0.85, commit_prob=0.15,
+                commit_steps=8, commit_angle=1.1, magnitude_noise_std=0.15)
 
-def _env(seed: int, **kw):
+
+def _env(seed: int, stochastic_red: bool = False, **kw):
+    policy = run_from_nearest_uav
+    if stochastic_red:
+        policy = StochasticRed(seed=seed, **STOCH_RED)
     base = dict(
         n_blue=5, n_red=3, n_obstacles=4, arena_size=130.0, max_steps=400,
         capture_radius=3.0, sensor_radius=40.0, use_belief_maps=True,
         enemy_belief_decay=0.99, enemy_belief_diffusion=0.2,
         sensor_pos_noise_std=1.0, sensor_vel_noise_std=0.1,
         sensor_noise_range_growth=1.0, track_conf_min=0.5,
-        red_policy=run_from_nearest_uav, seed=seed,
+        red_policy=policy, seed=seed,
     )
     base.update(kw)
     e = PursuitEnv(**base)
@@ -48,21 +71,43 @@ def _env(seed: int, **kw):
     return e
 
 
-def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900):
-    keys = ("raw", "belief", "oracle", "real")
+def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900,
+        learned_ckpt: str = "", sigma_a_model: float = 0.35,
+        max_branches: int = 4, stochastic_red: bool = False,
+        max_misses: int = 5):
+    learned_keys = ("lrn_oracle", "lrn_real") if learned_ckpt else ()
+    keys = ("raw", "belief", "oracle", "real") + learned_keys
     acc = {k: MOTAccumulator(match_dist) for k in keys}
-    cons = {k: ConsistencyAccumulator() for k in ("oracle", "real")}
+    cons = {k: ConsistencyAccumulator() for k in ("oracle", "real") + learned_keys}
     n_tracks = {k: [] for k in keys}
     detectable = []          # the ceiling nothing can beat without PREDICTING
+    branch_counts = []
+
+    motion = None
+    if learned_ckpt:
+        from isr.agents.learned_red_motion import (
+            LearnedRedMotion, load_red_motion_model,
+        )
+        model, blue_cap, obs_cap = load_red_motion_model(learned_ckpt)
+        motion = LearnedRedMotion(
+            model, blue_cap, obs_cap, dt=1.0, a_max=1.0, arena_size=130.0,
+            max_branches=max_branches, sigma_a_model=sigma_a_model)
 
     for ep in range(episodes):
-        e = _env(seed_base + ep)
+        e = _env(seed_base + ep, stochastic_red=stochastic_red)
         rng = np.random.default_rng(seed_base + ep)
+        common = dict(dt=1.0, a_max=1.0, vel_prior_std=1.0,
+                     max_misses=max_misses)
         trk = {
-            "oracle": MultiTargetTracker(dt=1.0, a_max=1.0, vel_prior_std=1.0,
-                                         oracle_association=True),
-            "real": MultiTargetTracker(dt=1.0, a_max=1.0, vel_prior_std=1.0),
+            "oracle": MultiTargetTracker(oracle_association=True, **common),
+            "real": MultiTargetTracker(**common),
         }
+        if motion is not None:
+            trk["lrn_oracle"] = MultiTargetTracker(
+                oracle_association=True, motion_model=motion,
+                max_components=8, **common)
+            trk["lrn_real"] = MultiTargetTracker(
+                motion_model=motion, max_components=8, **common)
         for _ in range(steps):
             if not e.agents:
                 break
@@ -104,8 +149,22 @@ def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900):
 
             # --- 2 & 3. the tracker -------------------------------------
             dets = raw
-            for key in ("oracle", "real"):
+            # The learned model is conditional on where the blues are RIGHT
+            # NOW, so the context has to be refreshed every step, before any
+            # tracker that uses it predicts.  Blue positions are exact
+            # because blues are OUR drones; obstacle geometry is ground
+            # truth here (see the module docstring).
+            if motion is not None:
+                motion.set_context(
+                    blue_pos=e._blue_pos, blue_vel=e._blue_vel,
+                    obs_pos=getattr(e, "_obstacle_pos", None),
+                    obs_vel=getattr(e, "_obstacle_vel", None),
+                    obs_r=getattr(e, "_obstacle_r", None))
+            for key in trk:
                 trk[key].step(dets)
+                if key.startswith("lrn_"):
+                    branch_counts.extend(
+                        len(t.components) for t in trk[key].tracks)
                 cons[key].add_nis(trk[key].last_nis)
                 conf = trk[key].confirmed_tracks()
                 acc[key].update(gt_ids, gt_pos,
@@ -126,7 +185,8 @@ def run(episodes: int, steps: int, match_dist: float, seed_base: int = 900):
                         x_true = np.concatenate([e._red_pos[r], e._red_vel[r]])
                         cons[key].add_nees(t.x, t.P, x_true)
 
-    return acc, cons, n_tracks, float(np.mean(detectable))
+    return (acc, cons, n_tracks, float(np.mean(detectable)),
+            np.array(branch_counts) if branch_counts else np.zeros(0))
 
 
 def main() -> None:
@@ -136,19 +196,44 @@ def main() -> None:
     p.add_argument("--steps", type=int, default=150)
     p.add_argument("--match-dist", type=float, default=5.0,
                    help="max distance for a hypothesis to count as a match")
+    p.add_argument("--learned", type=str, default="",
+                   help="checkpoint for the learned red-motion model; adds "
+                        "two rows using it as the tracker's motion_model")
+    p.add_argument("--sigma-a-model", type=float, default=0.35,
+                   help="per-branch model-error std (NOT yet tuned; sweep "
+                        "this against NEES before trusting the rows)")
+    p.add_argument("--max-branches", type=int, default=4,
+                   help="cap on MODES per prediction; no mass is discarded "
+                        "at any setting, only resolved more or less finely")
+    p.add_argument("--max-misses", type=int, default=5,
+                   help="consecutive misses before a track dies -- this is "
+                        "the COAST BUDGET, and it caps how much any motion "
+                        "model can buy by predicting through sensor gaps")
+    p.add_argument("--stochastic-red", action="store_true",
+                   help="evaluate against the stochastic adversary the model "
+                        "was trained on, instead of the deterministic one")
     a = p.parse_args()
 
-    acc, cons, ntr, ceiling = run(a.episodes, a.steps, a.match_dist)
+    acc, cons, ntr, ceiling, branches = run(
+        a.episodes, a.steps, a.match_dist, learned_ckpt=a.learned,
+        sigma_a_model=a.sigma_a_model, max_branches=a.max_branches,
+        stochastic_red=a.stochastic_red, max_misses=a.max_misses)
 
     labels = {"raw": "raw detections (floor)",
               "belief": "belief peaks (today)",
               "oracle": "KF + ORACLE assoc",
-              "real":   "KF + real assoc"}
+              "real":   "KF + real assoc",
+              "lrn_oracle": "LEARNED + ORACLE assoc",
+              "lrn_real":   "LEARNED + real assoc"}
     keys = ("raw", "belief", "oracle", "real")
+    if a.learned:
+        keys = keys + ("lrn_oracle", "lrn_real")
     cols = ("MOTA", "MOTP", "IDF1", "recall", "IDSW", "Frag", "FP", "FN", "MT", "ML")
 
+    red_kind = "STOCHASTIC" if a.stochastic_red else "deterministic"
     print(f"\n{a.episodes} episodes x {a.steps} steps, match gate "
-          f"{a.match_dist} m\n")
+          f"{a.match_dist} m, {red_kind} red, coast budget "
+          f"{a.max_misses} steps\n")
     hdr = f"{'configuration':<22}" + "".join(f"{c:>8}" for c in cols) + f"{'tracks':>8}"
     print(hdr)
     print("-" * len(hdr))
@@ -163,11 +248,30 @@ def main() -> None:
 
     print("\nfilter consistency (NEES target 4.0; NIS target ~2 for the "
           "2-D position update)")
-    for k in ("oracle", "real"):
+    for k in keys:
+        if k in ("raw", "belief"):
+            continue
         c = cons[k].summary()
         if c:
             print(f"  {labels[k]:<22} NEES {c.get('NEES', float('nan')):6.2f}"
                   f"   NIS {c.get('NIS', float('nan')):6.2f}")
+
+    if a.learned:
+        print(f"\nLEARNED rows use {a.learned}")
+        print(f"  sigma_a_model {a.sigma_a_model}  "
+              f"max_branches {a.max_branches}")
+        if len(branches):
+            print(f"  components per track: mean {branches.mean():.2f}  "
+                  f"p90 {np.percentile(branches, 90):.0f}  "
+                  f"max {branches.max()}")
+        print("  NEES above 4.0 means the branches are OVERCONFIDENT: raise")
+        print("  sigma_a_model.  Overconfidence here is the dangerous")
+        print("  direction -- a tight gate rejects true detections, tracks")
+        print("  die, and recall falls BELOW the constant-velocity rows,")
+        print("  which reads as 'the learned model is worse' when the real")
+        print("  fault is an untuned covariance.")
+        print("  Obstacle geometry is ground truth in these rows; in")
+        print("  deployment it comes from the obstacle tracker.")
 
     print(f"\nDETECTABILITY CEILING = {ceiling:.2f} — the fraction of active")
     print("targets inside sensor_radius.  Recall cannot exceed this without")

@@ -39,7 +39,7 @@ downstream number from this adapter as provisional.
 """
 from __future__ import annotations
 
-from typing import List, Optional, Sequence, Tuple
+from typing import List, Optional, Tuple
 
 import numpy as np
 import torch
@@ -93,7 +93,6 @@ class LearnedRedMotion:
         dt:               float = 1.0,
         a_max:            float = 1.0,
         arena_size:       float = 130.0,
-        mass_threshold:   float = 0.90,
         max_branches:     int = 4,
         sigma_a_model:    float = 0.35,
         device:           str = "cpu",
@@ -104,7 +103,9 @@ class LearnedRedMotion:
         self.dt = float(dt)
         self.a_max = float(a_max)
         self.L = float(arena_size)
-        self.mass_threshold = float(mass_threshold)
+        # A cap on MODES, not on cells: every heading bin is assigned to a
+        # kept peak, so raising or lowering this never discards mass, it
+        # only changes how finely the modes are resolved.
         self.max_branches = int(max_branches)
         # Stands in for the NETWORK's own error, on top of the within-bin
         # quantisation spread computed per branch below.  Placeholder --
@@ -128,6 +129,14 @@ class LearnedRedMotion:
         # one), so it is applied per branch.
         self._sd_radial = (self.a_max / N_MAGNITUDE_BINS) / np.sqrt(12.0)
         self._sd_tangential_per_a = (2 * np.pi / N_HEADING_BINS) / np.sqrt(12.0)
+
+        # Per-cell acceleration and quantisation covariance are FIXED
+        # properties of the grid, so they are built once rather than per
+        # component per step.
+        cells = np.arange(ZERO_CLASS)
+        self._cell_accel = bin_to_accel(cells) * self.a_max        # (180, 2)
+        self._cell_quant = np.stack(
+            [self._quantisation_cov(a) for a in self._cell_accel])  # (180,2,2)
 
         self._ctx: Optional[dict] = None
 
@@ -237,45 +246,114 @@ class LearnedRedMotion:
 
     # ----------------------------------------------------------------- #
 
-    def _branch_cov(self, accel: np.ndarray) -> np.ndarray:
-        """Residual acceleration covariance for a branch, in WORLD axes.
+    def _quantisation_cov(self, accel: np.ndarray) -> np.ndarray:
+        """Spread of the true acceleration WITHIN one cell, in world axes.
 
-        Two independent contributions:
-          * QUANTISATION — the branch names a cell, not a point, so the
-            true acceleration is spread over the cell.  Anisotropic and
-            aligned with the acceleration: radial spread from the
-            magnitude bin, tangential from the heading arc.
-          * MODEL ERROR — isotropic, ``sigma_a_model``, standing in for
-            how wrong the network itself is.  Not yet tuned.
+        A cell names a region, not a point.  Anisotropic and aligned with
+        the acceleration: radial spread set by the magnitude bin's width,
+        tangential by the heading arc.  Which axis is coarser is a fact
+        about the grid, not a guess — on 36x5 the magnitude bin (0.2) beats
+        the arc at |a| = a_max (2*pi/36 = 0.175), and the tangential term
+        shrinks with |a| while the radial does not, so RADIAL dominates
+        throughout.
         """
-        iso = self.sigma_a_model ** 2 * np.eye(2)
         mag = float(np.linalg.norm(accel))
         if mag < 1e-9:                       # ZERO class: no cell geometry
-            return iso
+            return np.zeros((2, 2))
         u = accel / mag                                  # radial unit
         t = np.array([-u[1], u[0]])                      # tangential unit
-        var_r = self._sd_radial ** 2
-        var_t = (mag * self._sd_tangential_per_a) ** 2
-        return iso + var_r * np.outer(u, u) + var_t * np.outer(t, t)
+        return (self._sd_radial ** 2 * np.outer(u, u)
+               + (mag * self._sd_tangential_per_a) ** 2 * np.outer(t, t))
+
+    def _branch_cov(self, accel: np.ndarray) -> np.ndarray:
+        """Single-cell residual covariance: quantisation + model error."""
+        return (self._quantisation_cov(accel)
+               + self.sigma_a_model ** 2 * np.eye(2))
+
+    # ----------------------------------------------------------------- #
+
+    def _basins(self, probs: np.ndarray) -> List[Tuple[float, np.ndarray,
+                                                      np.ndarray]]:
+        """Split the categorical into MODES, keeping ALL of the mass.
+
+        Two things make the obvious "take the top-k cells" wrong, and both
+        were measured rather than reasoned about:
+
+        * Training uses SOFT LABELS that deliberately smear mass onto
+          neighbouring bins, so the k most probable cells are almost always
+          ONE mode sampled k times, not k modes.  Fed to the tracker they
+          are near-duplicates, the merge gate correctly folds them into a
+          single component, and the mixture machinery does nothing at all
+          (measured: mean 1.01 components per track).
+        * With 181 classes and a peak around 7%, the top 4 cells hold only
+          ~20% of the mass.  Truncating there discards the tails, so the
+          branch covariance reflects a far narrower distribution than the
+          model actually predicted — measured NEES 6.6 against a target of
+          4.0, i.e. badly overconfident, which is the direction that kills
+          tracks.
+
+        So: find local maxima of the HEADING marginal, keep the strongest
+        ``max_branches`` of them, and assign EVERY heading bin to its
+        nearest kept peak.  No mass is discarded; each branch is a genuine
+        mode carrying its own basin's weight, mean and spread.
+
+        Heading, not the joint grid, defines the modes: the multimodality
+        this adversary actually produces is a left/right commitment, which
+        is a split in DIRECTION.  Magnitude is ordinal and unimodal within
+        a direction, so splitting on it would manufacture branches that
+        differ only in effort — exactly the near-duplicates to avoid.
+        """
+        grid = probs[:ZERO_CLASS].reshape(N_HEADING_BINS, N_MAGNITUDE_BINS)
+        ph = grid.sum(axis=1)                       # heading marginal
+
+        prev, nxt = np.roll(ph, 1), np.roll(ph, -1)     # circular neighbours
+        peaks = np.nonzero((ph >= prev) & (ph >= nxt))[0]
+        if len(peaks) == 0:                             # perfectly flat
+            peaks = np.array([int(ph.argmax())])
+        peaks = peaks[np.argsort(-ph[peaks])][:self.max_branches]
+
+        # Circular distance from every heading bin to every kept peak.
+        d = np.abs(np.arange(N_HEADING_BINS)[:, None] - peaks[None, :])
+        d = np.minimum(d, N_HEADING_BINS - d)
+        owner = d.argmin(axis=1)                        # (36,) kept-peak index
+
+        out = []
+        for k in range(len(peaks)):
+            rows = np.nonzero(owner == k)[0]
+            w_cells = grid[rows].reshape(-1)            # (len(rows)*5,)
+            w = float(w_cells.sum())
+            if w <= 0.0:
+                continue
+            idx = (rows[:, None] * N_MAGNITUDE_BINS
+                  + np.arange(N_MAGNITUDE_BINS)[None, :]).reshape(-1)
+            a = self._cell_accel[idx]                   # (n, 2)
+            p = w_cells / w
+            mu = p @ a
+            dev = a - mu
+            # Mixture covariance over the basin: the spread of the cell
+            # means PLUS each cell's own within-cell spread, then the
+            # model's isotropic error.  Dropping the first term is exactly
+            # the overconfidence the top-k version suffered.
+            cov = (dev * p[:, None]).T @ dev
+            cov = cov + np.einsum("n,nij->ij", p, self._cell_quant[idx])
+            out.append((w, mu, cov + self.sigma_a_model ** 2 * np.eye(2)))
+
+        p_zero = float(probs[ZERO_CLASS])
+        if p_zero > 0.0:
+            # Genuinely discrete: "do not accelerate" is not a direction,
+            # so it cannot belong to any heading basin.
+            out.append((p_zero, np.zeros(2),
+                       self.sigma_a_model ** 2 * np.eye(2)))
+        return out
 
     def __call__(self, x: np.ndarray, P: np.ndarray
                  ) -> List[Tuple[float, np.ndarray, np.ndarray]]:
-        """One Gaussian-Sum branch per significant cell of the categorical."""
+        """One Gaussian-Sum branch per MODE of the predicted categorical."""
         probs = self.predict_probs(x[:2], x[2:])
-
-        order = np.argsort(-probs)
-        csum = np.cumsum(probs[order])
-        # Smallest prefix reaching the mass threshold, capped.  searchsorted
-        # gives the index where the threshold is crossed; +1 makes it a count.
-        k = min(int(np.searchsorted(csum, self.mass_threshold)) + 1,
-               self.max_branches, len(order))
-        chosen = order[:k]
-
         FPFt = self.F @ P @ self.F.T
         out: List[Tuple[float, np.ndarray, np.ndarray]] = []
-        for idx in chosen:
-            accel = bin_to_accel(int(idx)) * self.a_max
+        for w, accel, cov_a in self._basins(probs):
             x_pred = self.F @ x + self.G @ accel
-            P_pred = FPFt + self.G @ self._branch_cov(accel) @ self.G.T
-            out.append((float(probs[idx]), x_pred, P_pred))
+            P_pred = FPFt + self.G @ cov_a @ self.G.T
+            out.append((float(w), x_pred, P_pred))
         return out

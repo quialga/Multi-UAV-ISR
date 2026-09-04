@@ -94,13 +94,13 @@ def test_adapter_features_match_the_training_path_exactly():
 # --------------------------------------------------------------------- #
 
 def test_branches_form_a_valid_weighted_mixture():
-    ad = _adapter(mass_threshold=0.9, max_branches=4)
+    ad = _adapter(max_branches=4)
     ad.set_context(blue_pos=np.array([[40.0, 60.0], [90.0, 70.0]]),
                   blue_vel=np.array([[1.0, 0.0], [0.0, -1.0]]))
     x = np.array([65.0, 65.0, 0.5, -0.3])
     P = np.diag([4.0, 4.0, 1.0, 1.0])
     branches = ad(x, P)
-    assert 1 <= len(branches) <= 4
+    assert 1 <= len(branches) <= 5          # <= max_branches modes + ZERO
     for w, xb, Pb in branches:
         assert w > 0.0
         assert xb.shape == (4,) and Pb.shape == (4, 4)
@@ -109,16 +109,74 @@ def test_branches_form_a_valid_weighted_mixture():
         assert np.min(np.linalg.eigvalsh(Pb)) > 0, "covariance not PD"
 
 
-def test_branch_count_respects_the_mass_threshold():
-    """A LOW threshold must need fewer branches than a high one -- the cap
-    is on mass, not an arbitrary k."""
-    lo, hi = _adapter(mass_threshold=0.05, max_branches=64), \
-             _adapter(mass_threshold=0.95, max_branches=64)
+def test_branches_keep_all_of_the_probability_mass():
+    """The defining property of basin splitting over top-k: NOTHING is
+    discarded.  Truncating to the k most probable cells threw away ~80% of
+    the distribution and made the branch covariance badly overconfident
+    (measured NEES 6.6 against a target of 4.0)."""
+    ad = _adapter(max_branches=3)
+    ad.set_context(blue_pos=np.array([[45.0, 45.0]]), blue_vel=np.zeros((1, 2)))
+    probs = ad.predict_probs(np.array([65.0, 65.0]), np.array([0.3, 0.2]))
+    total = sum(w for w, _, _ in ad._basins(probs))
+    assert np.isclose(total, 1.0, atol=1e-6), (
+        f"basins hold {total:.4f} of the mass, not all of it")
+
+
+def test_basin_mean_and_spread_match_the_distribution_they_summarise():
+    """Each branch must be the true first and second moment of its own
+    basin -- otherwise the mixture is not a faithful reduction."""
+    ad = _adapter(max_branches=1, sigma_a_model=0.0)
+    ad.set_context(blue_pos=np.array([[45.0, 45.0]]), blue_vel=np.zeros((1, 2)))
+    probs = ad.predict_probs(np.array([65.0, 65.0]), np.array([0.3, 0.2]))
+    basins = ad._basins(probs)
+    grid_basins = [b for b in basins if np.linalg.norm(b[1]) > 1e-12]
+    assert len(grid_basins) == 1, "max_branches=1 should give one grid basin"
+    w, mu, cov = grid_basins[0]
+
+    # With a single basin every grid cell belongs to it, so the moments are
+    # just those of the whole grid part of the categorical.
+    p = probs[:ZERO_CLASS] / probs[:ZERO_CLASS].sum()
+    a = ad._cell_accel
+    assert np.allclose(mu, p @ a, atol=1e-9)
+    dev = a - mu
+    want = (dev * p[:, None]).T @ dev + np.einsum("n,nij->ij", p, ad._cell_quant)
+    assert np.allclose(cov, want, atol=1e-9)
+
+
+def test_more_branches_resolve_finer_modes_without_losing_mass():
+    """Raising the cap splits the SAME distribution more finely; it never
+    changes how much of it is represented."""
     ctx = dict(blue_pos=np.array([[30.0, 30.0]]), blue_vel=np.array([[1.0, 1.0]]))
-    lo.set_context(**ctx)
-    hi.set_context(**ctx)
-    x, P = np.array([65.0, 65.0, 0.0, 0.0]), np.eye(4)
-    assert len(lo(x, P)) < len(hi(x, P))
+    one, four = _adapter(max_branches=1), _adapter(max_branches=4)
+    one.set_context(**ctx)
+    four.set_context(**ctx)
+    probs = one.predict_probs(np.array([65.0, 65.0]), np.array([0.0, 0.0]))
+    b1, b4 = one._basins(probs), four._basins(probs)
+    assert len(b4) >= len(b1)
+    assert np.isclose(sum(w for w, _, _ in b1), 1.0, atol=1e-6)
+    assert np.isclose(sum(w for w, _, _ in b4), 1.0, atol=1e-6)
+
+
+def test_a_bimodal_categorical_yields_two_separated_branches():
+    """The whole reason the tracker is a Gaussian SUM: two opposed modes
+    must survive as two branches whose means point in opposite directions,
+    instead of being averaged onto a heading the evader will never fly.
+
+    Driven by a synthetic categorical rather than the network, so the test
+    asserts the SPLITTING logic and does not depend on what an untrained
+    model happens to predict.
+    """
+    ad = _adapter(max_branches=4, sigma_a_model=0.0)
+    probs = np.zeros(N_BINS)
+    top = N_MAGNITUDE_BINS - 1                       # |a| ~ a_max row
+    for h, mass in ((0, 0.5), (18, 0.5)):            # 180 degrees apart
+        probs[h * N_MAGNITUDE_BINS + top] = mass
+    basins = [b for b in ad._basins(probs) if b[0] > 1e-9]
+    assert len(basins) == 2, f"expected 2 modes, got {len(basins)}"
+    (w1, m1, _), (w2, m2, _) = basins
+    assert np.isclose(w1, 0.5) and np.isclose(w2, 0.5)
+    cos = (m1 @ m2) / (np.linalg.norm(m1) * np.linalg.norm(m2))
+    assert cos < -0.9, f"modes collapsed toward each other (cos {cos:.2f})"
 
 
 def test_prediction_applies_the_acceleration_as_a_control_term():
@@ -179,13 +237,20 @@ def test_tangential_spread_scales_with_the_acceleration_magnitude():
     assert np.isclose(large[0, 0], small[0, 0]), "radial term should not scale"
 
 
-def test_zero_class_branch_carries_no_acceleration():
-    ad = _adapter()
-    ad.set_context(blue_pos=np.array([[10.0, 10.0]]), blue_vel=np.zeros((1, 2)))
-    from isr.agents.red_motion_features import bin_to_accel
-    assert np.allclose(bin_to_accel(ZERO_CLASS), 0.0)
-    C = ad._branch_cov(np.zeros(2))
-    assert np.allclose(C, ad.sigma_a_model ** 2 * np.eye(2)), (
+def test_zero_class_is_its_own_branch_with_no_acceleration():
+    """"Do not accelerate" is not a direction, so it cannot belong to any
+    heading basin -- it has to come through as a separate branch."""
+    ad = _adapter(max_branches=2, sigma_a_model=0.2)
+    probs = np.zeros(N_BINS)
+    probs[0 * N_MAGNITUDE_BINS + 4] = 0.7
+    probs[ZERO_CLASS] = 0.3
+    basins = ad._basins(probs)
+    zero = [b for b in basins if np.linalg.norm(b[1]) < 1e-12]
+    assert len(zero) == 1, "ZERO class did not survive as its own branch"
+    w, mu, cov = zero[0]
+    assert np.isclose(w, 0.3)
+    assert np.allclose(mu, 0.0)
+    assert np.allclose(cov, ad.sigma_a_model ** 2 * np.eye(2)), (
         "the ZERO class has no cell geometry, so only model error applies")
 
 
@@ -238,7 +303,7 @@ def test_context_without_obstacles_is_valid():
 def test_tracker_runs_with_the_learned_motion_model():
     """Smoke: the tracker must accept these branches and keep a track alive
     across steps with a genuinely branching model (max_components > 1)."""
-    ad = _adapter(mass_threshold=0.9, max_branches=3)
+    ad = _adapter(max_branches=3)
     tr = MultiTargetTracker(dt=1.0, motion_model=ad, max_components=8)
     rng = np.random.default_rng(1)
     truth = np.array([60.0, 60.0])
