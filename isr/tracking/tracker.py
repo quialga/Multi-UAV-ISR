@@ -259,11 +259,27 @@ class MultiTargetTracker:
     ) -> None:
         # Plug point for a LEARNED transition model.  A callable
         # (x, P) -> [(rel_weight, x_pred, P_pred), ...] — one branch per
-        # mode the model predicts (e.g. per discretised heading bin holding
-        # >=90% of the mass; see docs/tracking_diagnostics.md Sec. 8).
-        # Relative weights need not sum to 1 (renormalised against the
-        # parent's own weight).  None -> a single constant-velocity branch,
-        # which is what makes this tracker reduce exactly to a plain KF.
+        # mode the model predicts (see docs/tracking_diagnostics.md Sec. 8).
+        # None -> a single constant-velocity branch, which is what makes
+        # this tracker reduce exactly to a plain KF.
+        #
+        # WEIGHTS MUST SUM TO THE SAME TOTAL FOR EVERY CALL — normally 1,
+        # i.e. the branches account for ALL of the model's predicted mass.
+        # An earlier note here said they "need not sum to 1", which is
+        # true only in the harmless case: `_predict_track` sets
+        # w_child = w_parent * rel_w and `_reduce` then normalises
+        # GLOBALLY across every child of every parent.  If one parent's
+        # branches summed to 1.0 and another's to 0.5, that global step
+        # would silently move weight from the second parent to the first —
+        # not because any evidence favoured it, but because its branch set
+        # captured less of its own distribution.  A top-k branch selector
+        # that keeps "the cells holding >=90% of the mass" does exactly
+        # this, since the number of cells needed varies with the state.
+        #
+        # Verified for the basin-splitting model in
+        # isr/agents/learned_red_motion.py, whose branches keep all the
+        # mass by construction: max |1 - sum(rel_w)| = 1.8e-7 over 528
+        # calls, so the renormalisation is inert.
         self.motion_model = motion_model
         # EVALUATION ONLY.  Reads det["truth_id"] to associate perfectly,
         # which isolates FILTER quality from ASSOCIATION quality: the gap

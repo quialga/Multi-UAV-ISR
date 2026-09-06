@@ -109,6 +109,35 @@ def test_branches_form_a_valid_weighted_mixture():
         assert np.min(np.linalg.eigvalsh(Pb)) > 0, "covariance not PD"
 
 
+def test_branch_weights_sum_to_one_so_no_weight_flows_between_parents():
+    """The tracker sets w_child = w_parent * rel_w and then normalises
+    GLOBALLY across every child of every parent.
+
+    That is only safe if EVERY call returns the same total mass. If one
+    parent's branches summed to 1.0 and another's to 0.5, the global step
+    would quietly move weight from the second parent to the first --
+    with no evidence favouring it, purely because its branch set captured
+    less of its own distribution. A top-k selector keyed on "the cells
+    holding >=90% of the mass" breaks this, since the count needed varies
+    with the state.
+    """
+    ad = _adapter(max_branches=4)
+    rng = np.random.default_rng(0)
+    for _ in range(25):
+        n_blue = int(rng.integers(1, BLUE_CAP + 1))
+        ad.set_context(
+            blue_pos=rng.uniform(5, 125, (n_blue, 2)),
+            blue_vel=rng.uniform(-1, 1, (n_blue, 2)),
+            obs_pos=rng.uniform(20, 110, (2, 2)),
+            obs_vel=np.zeros((2, 2)),
+            obs_r=rng.uniform(4, 12, 2))
+        x = np.concatenate([rng.uniform(5, 125, 2), rng.uniform(-1, 1, 2)])
+        total = sum(w for w, _, _ in ad(x, np.diag([4.0, 4.0, 1.0, 1.0])))
+        assert abs(total - 1.0) < 1e-5, (
+            f"branch weights sum to {total}, so this call would lose weight "
+            f"to parents whose branches summed higher")
+
+
 def test_branches_keep_all_of_the_probability_mass():
     """The defining property of basin splitting over top-k: NOTHING is
     discarded.  Truncating to the k most probable cells threw away ~80% of
