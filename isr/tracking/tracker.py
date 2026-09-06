@@ -273,6 +273,19 @@ class MultiTargetTracker:
         self.dt = float(dt)
         # sigma_a is a STANDARD DEVIATION, not a bound.
         #
+        # SCOPE: this is the process noise of the DEFAULT constant-velocity
+        # motion model ONLY.  self.Q is built from it and is referenced in
+        # exactly one place -- the `motion_model is None` branch of
+        # _predict_track -- so when a learned motion model is plugged in,
+        # Q is never used and this value is irrelevant.  Do not confuse it
+        # with LearnedRedMotion.sigma_a_model (0.35), which is that model's
+        # own per-branch error term.  They answer different questions:
+        #   sigma_a       = 1.414  "I know nothing about the acceleration"
+        #   sigma_a_model = 0.35   "the model predicted it; how wrong is it"
+        # The ~4x ratio between them IS the learned model's value,
+        # quantified -- and the mechanical reason a coasted track holds 5 m
+        # of error over 80 steps instead of 53 m (docs Sec. 11.5).
+        #
         # Step 1 — the white-noise value.  This red normalises its
         # acceleration to unit magnitude, so only the DIRECTION varies:
         # a_i = a_max*cos(theta), hence Var[a_i] = a_max^2/2 and
@@ -317,9 +330,7 @@ class MultiTargetTracker:
         # a_max*sqrt(2) remains the right value at both budgets (best MOTA
         # at 2-4x white, and NEES 3.91 at max_misses=80).  See
         # docs/tracking_diagnostics.md Sec. 11.5 for the coast-budget
-        # analysis, and note this sigma_a is a DIFFERENT parameter from
-        # LearnedRedMotion's sigma_a_model, which is the learned model's
-        # own per-branch error term.
+        # analysis.
         #
         # (Nothing here changes with the Gaussian-Sum refactor: this Q is
         # still the per-component process noise used by the DEFAULT
@@ -347,6 +358,8 @@ class MultiTargetTracker:
 
         self.F = np.eye(4)
         self.F[0, 2] = self.F[1, 3] = self.dt
+        # Used ONLY when motion_model is None -- see the SCOPE note on
+        # sigma_a above.
         self.Q = _dwna_Q(self.dt, self.sigma_a)
         self.H_pos = np.zeros((2, 4)); self.H_pos[0, 0] = self.H_pos[1, 1] = 1.0
 
