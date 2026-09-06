@@ -292,12 +292,38 @@ class MultiTargetTracker:
         #
         #     sigma_a = a_max * sqrt(2)   (= 2x the white-noise value)
         #
-        # NEES 5.29 -> 4.91 against a target of 4.0.  Note this does NOT
-        # change recall (a Q sweep over 16x moved it 0.30-0.31): Q scales
-        # the covariance, not the predicted MEAN.  It buys calibration and
-        # fewer false positives, nothing more.  (Nothing here changes with
-        # the Gaussian-Sum refactor: this Q is still the per-component
-        # process noise used by the DEFAULT single-branch motion model.)
+        # NEES 5.29 -> 4.91 against a target of 4.0 (deterministic red,
+        # 5 m match gate, at the DEFAULT coast budget).
+        #
+        # Step 3 — the scope of "Q does not change recall".  That was
+        # measured at max_misses=5 and holds there: a 16x sweep moves
+        # recall 0.320-0.321, with FP minimised exactly at the adopted
+        # value.  It does NOT generalise to a long coast budget.  Re-run at
+        # max_misses=80 (stochastic red, 20 m gate) the same sweep moves
+        # recall 0.387-0.454, about 17% relative:
+        #
+        #   x_white   0.5    1.0    2.0    4.0    8.0
+        #   recall  0.454  0.442  0.428  0.411  0.387
+        #   FP       1253    896    777    712    688
+        #   MOTA     0.09   0.18   0.20   0.20   0.18
+        #
+        # The stated mechanism is still right — Q scales the covariance,
+        # not the predicted MEAN — but the conclusion does not follow once
+        # tracks coast: the covariance sets the GATE, the gate decides
+        # whether a re-detection joins the old track or starts a new one,
+        # and that decides recall.  A smaller Q buys recall by keeping
+        # narrow-gated tracks alive, at a catastrophic FP cost.
+        #
+        # a_max*sqrt(2) remains the right value at both budgets (best MOTA
+        # at 2-4x white, and NEES 3.91 at max_misses=80).  See
+        # docs/tracking_diagnostics.md Sec. 11.5 for the coast-budget
+        # analysis, and note this sigma_a is a DIFFERENT parameter from
+        # LearnedRedMotion's sigma_a_model, which is the learned model's
+        # own per-branch error term.
+        #
+        # (Nothing here changes with the Gaussian-Sum refactor: this Q is
+        # still the per-component process noise used by the DEFAULT
+        # single-branch motion model.)
         self.sigma_a = float(a_max * np.sqrt(2.0)) if sigma_a is None \
             else float(sigma_a)
         self.vel_prior_std = float(vel_prior_std)
