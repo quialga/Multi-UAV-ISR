@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 
@@ -91,6 +92,36 @@ def test_accel_matches_the_true_action_not_a_re_invocation():
     for s in samples:
         assert np.all(np.abs(s["accel"]) <= 1.0 + 1e-6)
         assert np.all(np.isfinite(s["accel"]))
+
+
+def test_collector_rejects_a_red_that_breaches_the_grid_bound():
+    """accel_to_bin CLIPS magnitude at ACCEL_SCALE, so a red that
+    accelerates harder is silently folded into the top bin and the model
+    learns to under-predict the most aggressive manoeuvres.
+
+    No current red does this -- run_from_nearest_uav normalises to unit
+    magnitude. But the env's action space is the square Box(-1, 1, (2,)),
+    which admits |a| up to sqrt(2) on the diagonal (blue uses exactly
+    that), so a learned or self-play red WOULD breach it. Fail at
+    collection time, not after training.
+    """
+    from isr.agents.red_motion_features import ACCEL_SCALE
+
+    def too_hard(blue_pos, red_pos, red_active, obstacle_pos=None,
+                obstacle_r=None, arena_size=None):
+        # The diagonal corner of the action box: legal for the env,
+        # out of range for the grid.
+        a = np.zeros((len(red_pos), 2), dtype=np.float32)
+        a[red_active] = [1.0, 1.0]          # |a| = sqrt(2)
+        return a
+
+    rng = np.random.default_rng(11)
+    with pytest.raises(ValueError, match="ACCEL_SCALE"):
+        collect_episode(
+            rng, ep_id=0, steps=10, n_blue_range=(2, 2), n_red_range=(1, 1),
+            n_obs_range=(0, 0), blue_cap=2, obs_cap=1, arena_size=130.0,
+            p_deterministic=1.0, red_policy=too_hard)
+    assert ACCEL_SCALE == 1.0, "test's sqrt(2) assumption tracks ACCEL_SCALE"
 
 
 def test_wall_dist_matches_the_env_convention():

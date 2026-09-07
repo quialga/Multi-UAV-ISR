@@ -98,6 +98,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from isr.env.entities import BLUE_UAV, RED_TARGET
 from isr.env.pursuit_env import PursuitEnv
 from isr.agents.heuristics import GreedyPursuer, RandomAgent
+from isr.agents.red_motion_features import ACCEL_SCALE
 from isr.agents.stochastic_red import StochasticRed
 
 V_NORM = BLUE_UAV.v_max     # shared velocity normaliser (blue and obstacle)
@@ -190,14 +191,17 @@ def _sample_blue_heuristics(agent_names, rng: np.random.Generator) -> Dict:
 def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
                     n_blue_range, n_red_range, n_obs_range,
                     blue_cap: int, obs_cap: int, arena_size: float,
-                    p_deterministic: float) -> List[Dict]:
+                    p_deterministic: float, red_policy=None) -> List[Dict]:
     n_blue = int(rng.integers(n_blue_range[0], n_blue_range[1] + 1))
     n_red = int(rng.integers(n_red_range[0], n_red_range[1] + 1))
     n_obs = int(rng.integers(n_obs_range[0], n_obs_range[1] + 1))
     assert n_blue <= blue_cap and n_obs <= obs_cap
 
     seed = int(rng.integers(1 << 31))
-    red_policy = MixedStochasticRed(n_red, rng, p_deterministic)
+    # red_policy is an override for tests; production always uses the
+    # domain-randomised mixture.
+    if red_policy is None:
+        red_policy = MixedStochasticRed(n_red, rng, p_deterministic)
     # No n_obstacles_min: team sizes are already varied ACROSS episodes
     # (n_blue/n_red/n_obs sampled above); adding the env's OWN within-
     # capacity placed-count randomness on top would be a redundant second
@@ -239,6 +243,28 @@ def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
         obs_d, _rew, _term, _trunc, _info = env.step(actions)
 
         act_a = env._last_red_action
+        # The action grid's magnitude axis is bounded by ACCEL_SCALE, and
+        # accel_to_bin CLIPS against it -- so anything above that bound is
+        # silently folded into the top bin and the model learns to
+        # under-predict exactly the most aggressive manoeuvres.
+        #
+        # No current red hits this: run_from_nearest_uav normalises to unit
+        # magnitude, and 240k collected samples show max |a| = 1.0000 with
+        # nothing above 1.0 + 1e-6.  But that is a property of the SCRIPTED
+        # red, not of the env, whose action space is the square box
+        # Box(-1, 1, (2,)) and therefore admits |a| up to sqrt(2) on the
+        # diagonal -- which is what blue actually uses.  A learned or
+        # self-play red acting in that box would breach the bound, so fail
+        # loudly at collection time rather than after training.
+        worst = float(np.linalg.norm(act_a[pre["red_active"]], axis=1).max(
+            initial=0.0))
+        if worst > ACCEL_SCALE + 1e-5:
+            raise ValueError(
+                f"red action |a| = {worst:.4f} exceeds ACCEL_SCALE="
+                f"{ACCEL_SCALE}; accel_to_bin would clip it into the top "
+                f"magnitude bin and bias the labels. Raise ACCEL_SCALE in "
+                f"red_motion_features (and re-collect) before training on "
+                f"a red that accelerates this hard.")
         placed = 0 if pre["obs_pos"] is None else len(pre["obs_pos"])
         for r in np.where(pre["red_active"])[0]:
             rp, rv = pre["red_pos"][r], pre["red_vel"][r]
