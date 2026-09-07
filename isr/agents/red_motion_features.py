@@ -9,6 +9,13 @@ hit here because the collector stores some fields normalised and some raw
 (``red_pos``/``red_vel`` are raw by design, everything else is already
 divided by ``arena_size`` or ``V_NORM``).
 
+POSITIONS are stored RELATIVE to the red; VELOCITIES are stored ABSOLUTE
+and made relative here, once.  The asymmetry is easy to misread, so the
+velocity fields are named ``blue_vel`` / ``obs_vel``: they were originally
+``*_rel_vel``, which described neither what they held nor what a consumer
+should do with them, and a caller who "helpfully" pre-subtracted would
+feed the network ``v_sender - 2*v_red`` with nothing to catch it.
+
 Edge features follow the env's own 7-D convention exactly
 (``_build_obs``/``GNNEncoder``):
 
@@ -166,6 +173,19 @@ def soft_targets(idx: np.ndarray, heading_eps: float = 0.10,
 #  Training path: collector shards -> network inputs
 # --------------------------------------------------------------------- #
 
+def _sender_vel(d: Dict[str, np.ndarray], kind: str) -> np.ndarray:
+    """Sender velocities, ABSOLUTE and V_NORM-normalised.
+
+    Accepts the legacy ``*_rel_vel`` key so shards collected before the
+    rename still load.  That name was actively misleading: the field never
+    held a relative velocity, and reading it as one invites subtracting the
+    red's velocity twice.
+    """
+    key = f"{kind}_vel"
+    if key not in d:
+        key = f"{kind}_rel_vel"          # legacy shards
+    return d[key].astype(np.float64)
+
 def featurize_shard(d: Dict[str, np.ndarray], arena_size: float = 130.0
                     ) -> Dict[str, np.ndarray]:
     """Turn one loaded ``.npz`` shard into network inputs + targets.
@@ -196,14 +216,19 @@ def featurize_shard(d: Dict[str, np.ndarray], arena_size: float = 130.0
         [obs_mask.astype(np.float64), d["obs_radius"].astype(np.float64)],
         axis=-1)                                                     # (n, O, 2)
 
+    # Senders' velocities are stored ABSOLUTE (V_NORM-normalised); the
+    # subtraction that makes them relative happens HERE, once.  A caller
+    # that helpfully pre-subtracted would get v_sender - 2*v_red, which is
+    # silent train/serve skew -- the reason these fields are named
+    # blue_vel / obs_vel rather than *_rel_vel.
     rv = red_vel[:, None, :]                             # broadcast receiver vel
     b2r = edge_features(
         d["blue_rel_pos"].astype(np.float64),
-        d["blue_rel_vel"].astype(np.float64) - rv,       # sender minus receiver
+        _sender_vel(d, "blue") - rv,                     # sender minus receiver
         np.broadcast_to(rv, (n, blue_cap, 2)))           # (n, B, 7)
     o2r = edge_features(
         d["obs_rel_pos"].astype(np.float64),
-        d["obs_rel_vel"].astype(np.float64) - rv,
+        _sender_vel(d, "obs") - rv,
         np.broadcast_to(rv, (n, obs_cap, 2)))            # (n, O, 7)
 
     return dict(

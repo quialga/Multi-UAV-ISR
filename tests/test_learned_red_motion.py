@@ -48,9 +48,9 @@ def _context_from_sample(s: dict) -> dict:
     nb, no = int(s["n_blue"]), int(s["n_obs_placed"])
     return dict(
         blue_pos=rp + s["blue_rel_pos"][:nb].astype(np.float64) * L,
-        blue_vel=s["blue_rel_vel"][:nb].astype(np.float64) * V_NORM,
+        blue_vel=s["blue_vel"][:nb].astype(np.float64) * V_NORM,
         obs_pos=rp + s["obs_rel_pos"][:no].astype(np.float64) * L,
-        obs_vel=s["obs_rel_vel"][:no].astype(np.float64) * V_NORM,
+        obs_vel=s["obs_vel"][:no].astype(np.float64) * V_NORM,
         obs_r=s["obs_radius"][:no].astype(np.float64) * L,
     )
 

@@ -243,20 +243,24 @@ def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
         for r in np.where(pre["red_active"])[0]:
             rp, rv = pre["red_pos"][r], pre["red_vel"][r]
 
+            # Positions RELATIVE to the red, velocities ABSOLUTE: the
+            # subtraction that makes them relative lives in
+            # red_motion_features.featurize_shard, and doing it here as
+            # well would feed the network v_sender - 2*v_red.
             blue_rel_pos = np.zeros((blue_cap, 2), dtype=np.float32)
-            blue_rel_vel = np.zeros((blue_cap, 2), dtype=np.float32)
+            blue_vel = np.zeros((blue_cap, 2), dtype=np.float32)
             blue_rel_pos[:n_blue] = (pre["blue_pos"] - rp) / L
-            blue_rel_vel[:n_blue] = pre["blue_vel"] / V_NORM
+            blue_vel[:n_blue] = pre["blue_vel"] / V_NORM
 
             obs_rel_pos = np.zeros((obs_cap, 2), dtype=np.float32)
-            obs_rel_vel = np.zeros((obs_cap, 2), dtype=np.float32)
+            obs_vel = np.zeros((obs_cap, 2), dtype=np.float32)
             obs_radius = np.zeros((obs_cap,), dtype=np.float32)
             obs_mask = np.zeros((obs_cap,), dtype=bool)
             if placed > 0:
                 ovel = (pre["obs_vel"] if pre["obs_vel"] is not None
                        else np.zeros((placed, 2), dtype=np.float32))
                 obs_rel_pos[:placed] = (pre["obs_pos"] - rp) / L
-                obs_rel_vel[:placed] = ovel / V_NORM
+                obs_vel[:placed] = ovel / V_NORM
                 obs_radius[:placed] = pre["obs_r"] / L
                 obs_mask[:placed] = True
 
@@ -267,8 +271,8 @@ def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
                 episode_id=ep_id, step=t, red_id=int(r),
                 red_pos=rp.astype(np.float32), red_vel=rv.astype(np.float32),
                 accel=act_a[r].astype(np.float32),
-                blue_rel_pos=blue_rel_pos, blue_rel_vel=blue_rel_vel,
-                obs_rel_pos=obs_rel_pos, obs_rel_vel=obs_rel_vel,
+                blue_rel_pos=blue_rel_pos, blue_vel=blue_vel,
+                obs_rel_pos=obs_rel_pos, obs_vel=obs_vel,
                 obs_radius=obs_radius, obs_mask=obs_mask,
                 wall_dist=wall_dist,
                 n_blue=n_blue, n_obs_placed=placed,
@@ -280,8 +284,13 @@ def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
 #  Shard writer
 # --------------------------------------------------------------------- #
 
+# blue_vel / obs_vel are ABSOLUTE (V_NORM-normalised) while the *_rel_pos
+# fields are relative -- see featurize_shard, which does the one
+# subtraction.  Shards written before the rename carry blue_rel_vel /
+# obs_rel_vel and still load; the old names described neither the contents
+# nor the required handling.
 _FIELDS = ("episode_id", "step", "red_id", "red_pos", "red_vel", "accel",
-          "blue_rel_pos", "blue_rel_vel", "obs_rel_pos", "obs_rel_vel",
+          "blue_rel_pos", "blue_vel", "obs_rel_pos", "obs_vel",
           "obs_radius", "obs_mask", "wall_dist", "n_blue", "n_obs_placed")
 
 

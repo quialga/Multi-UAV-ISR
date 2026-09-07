@@ -174,9 +174,9 @@ def _fake_shard(n=8, blue_cap=4, obs_cap=3, seed=0):
         red_vel=rng.uniform(-1, 1, (n, 2)).astype(np.float32),
         accel=a,
         blue_rel_pos=rng.normal(size=(n, blue_cap, 2)).astype(np.float32),
-        blue_rel_vel=rng.normal(size=(n, blue_cap, 2)).astype(np.float32),
+        blue_vel=rng.normal(size=(n, blue_cap, 2)).astype(np.float32),
         obs_rel_pos=rng.normal(size=(n, obs_cap, 2)).astype(np.float32),
-        obs_rel_vel=np.zeros((n, obs_cap, 2), np.float32),
+        obs_vel=np.zeros((n, obs_cap, 2), np.float32),
         obs_radius=rng.uniform(0, 0.1, (n, obs_cap)).astype(np.float32),
         obs_mask=obs_mask,
         wall_dist=rng.uniform(0, 1, (n, 4)).astype(np.float32),
@@ -219,11 +219,30 @@ def test_featurize_shard_normalises_the_raw_red_velocity():
 def test_featurize_shard_uses_relative_not_absolute_velocity():
     """Edge rel_vel must be sender MINUS receiver, per the env's
     convention -- not the sender's absolute velocity the collector
-    stored."""
+    stored.
+
+    This subtraction happens HERE and only here: positions are stored
+    relative to the red, velocities absolute.  A writer that pre-subtracted
+    would produce v_sender - 2*v_red with nothing to catch it, which is why
+    the fields are blue_vel / obs_vel rather than *_rel_vel.
+    """
     d = _fake_shard()
     f = featurize_shard(d)
-    want = d["blue_rel_vel"] - (d["red_vel"] / V_NORM)[:, None, :]
+    want = d["blue_vel"] - (d["red_vel"] / V_NORM)[:, None, :]
     assert np.allclose(f["b2r_edge_feats"][..., 2:4], want, atol=1e-5)
+
+
+def test_legacy_rel_vel_shards_still_load():
+    """Shards collected before the rename carry blue_rel_vel / obs_rel_vel.
+    Re-collecting a million samples to fix a NAME would be absurd, so the
+    old keys must still work and give identical features."""
+    d = _fake_shard()
+    legacy = {k: v for k, v in d.items() if k not in ("blue_vel", "obs_vel")}
+    legacy["blue_rel_vel"] = d["blue_vel"]
+    legacy["obs_rel_vel"] = d["obs_vel"]
+    new, old = featurize_shard(d), featurize_shard(legacy)
+    for k in ("b2r_edge_feats", "o2r_edge_feats", "red_feats", "target"):
+        assert np.allclose(new[k], old[k]), f"{k} differs on a legacy shard"
 
 
 def test_featurize_shard_carries_wall_distances_through():

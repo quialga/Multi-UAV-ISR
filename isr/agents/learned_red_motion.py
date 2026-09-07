@@ -228,18 +228,24 @@ class LearnedRedMotion:
             op, ov, orad = op[keep], ov[keep], orad[keep]
         n_obs = len(op)
 
+        # Positions RELATIVE to the red, velocities ABSOLUTE -- the
+        # collector's convention, and featurize_shard does the single
+        # subtraction that makes the velocities relative.  Pre-subtracting
+        # here would feed the network v_sender - 2*v_red, with the anti-skew
+        # test as the only thing standing between that and a silent
+        # train/serve mismatch.
         blue_rel_pos = np.zeros((1, cap_b, 2), dtype=np.float32)
-        blue_rel_vel = np.zeros((1, cap_b, 2), dtype=np.float32)
+        blue_vel = np.zeros((1, cap_b, 2), dtype=np.float32)
         blue_rel_pos[0, :n_blue] = (bp - red_pos) / L
-        blue_rel_vel[0, :n_blue] = bv / V_NORM
+        blue_vel[0, :n_blue] = bv / V_NORM
 
         obs_rel_pos = np.zeros((1, cap_o, 2), dtype=np.float32)
-        obs_rel_vel = np.zeros((1, cap_o, 2), dtype=np.float32)
+        obs_vel = np.zeros((1, cap_o, 2), dtype=np.float32)
         obs_radius = np.zeros((1, cap_o), dtype=np.float32)
         obs_mask = np.zeros((1, cap_o), dtype=bool)
         if n_obs:
             obs_rel_pos[0, :n_obs] = (op - red_pos) / L
-            obs_rel_vel[0, :n_obs] = ov / V_NORM
+            obs_vel[0, :n_obs] = ov / V_NORM
             obs_radius[0, :n_obs] = orad / L
             obs_mask[0, :n_obs] = True
 
@@ -247,8 +253,8 @@ class LearnedRedMotion:
             accel=np.zeros((1, 2), dtype=np.float32),     # unused at inference
             red_pos=red_pos.astype(np.float32)[None, :],
             red_vel=red_vel.astype(np.float32)[None, :],
-            blue_rel_pos=blue_rel_pos, blue_rel_vel=blue_rel_vel,
-            obs_rel_pos=obs_rel_pos, obs_rel_vel=obs_rel_vel,
+            blue_rel_pos=blue_rel_pos, blue_vel=blue_vel,
+            obs_rel_pos=obs_rel_pos, obs_vel=obs_vel,
             obs_radius=obs_radius, obs_mask=obs_mask,
             wall_dist=np.array([[red_pos[0], L - red_pos[0],
                                 red_pos[1], L - red_pos[1]]],
