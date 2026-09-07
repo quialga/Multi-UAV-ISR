@@ -840,6 +840,30 @@ not read velocity at all — the network uses it as the only observable
 trace of the adversary's hidden state (AR(1) phase, commitment), so a
 better velocity estimate should pay off directly.
 
+**And the model supplies that itself.** A track is born with velocity from
+DOPPLER fusion — weighted least squares on the radial components, so with
+≥2 non-collinear lines of sight the velocity is determined at birth
+(measured median error 0.27 m/s from one return, 0.14 from two, 0.08 from
+three or more). Tracking that error by track age:
+
+| track age | velocity error, CV | velocity error, LEARNED |
+|---|---|---|
+| 0 (birth) | 0.20 | 0.22 |
+| 1–2 | 0.46 | **0.31** |
+| 3–5 | 0.47 | **0.24** |
+| 6–15 | 0.50 | **0.27** |
+| > 15 | 0.48 | **0.39** |
+
+Under constant velocity the error gets WORSE with age — 0.20 at birth to
+~0.48 — which a correctly specified filter does not do. It is model
+misspecification, not convergence: the red manoeuvres every step and CV
+converges to a biased velocity. The learned model holds the estimate near
+its birth value instead.
+
+So there is a loop here: velocity error is the largest part of the
+model's own input penalty, and the model roughly halves it. Better model →
+better velocity estimate → better input → better prediction.
+
 The heavy tail is real and not explained by inputs: **p90 = 100° with
 perfect inputs on a perfectly predictable target**.
 
