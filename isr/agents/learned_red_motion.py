@@ -217,6 +217,14 @@ class LearnedRedMotion:
 
         bp, bv = c["blue_pos"], c["blue_vel"]
         if len(bp) > cap_b:                       # keep the NEAREST cap_b
+            # OUT OF DISTRIBUTION, deliberately allowed.  The collector
+            # asserts n_blue <= blue_cap, so training NEVER omits a blue:
+            # its masks only ever mean "this slot is padding".  Here they
+            # would additionally mean "a real blue was dropped", which the
+            # model has not seen.  Defensible, since run_from_nearest_uav
+            # reads only the nearest blue and so the TRUE action is
+            # unchanged — but it is untested against the model, and the
+            # operating regime (5-6 blues) never reaches it.
             keep = np.argsort(np.linalg.norm(bp - red_pos, axis=1))[:cap_b]
             bp, bv = bp[keep], bv[keep]
         n_blue = len(bp)
