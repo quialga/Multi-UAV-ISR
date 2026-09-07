@@ -109,6 +109,34 @@ def test_branches_form_a_valid_weighted_mixture():
         assert np.min(np.linalg.eigvalsh(Pb)) > 0, "covariance not PD"
 
 
+def test_cell_accelerations_round_trip_through_the_discretiser():
+    """The adapter's per-cell accelerations must be the ones the LABELS
+    were built from, cell for cell.
+
+    bin_to_accel already returns PHYSICAL units, because the magnitude
+    axis is defined against ACCEL_SCALE, which mirrors the env's own clip
+    on the red action. Rescaling them again in the adapter (by an a_max
+    that looks like a free knob but is not) would emit accelerations the
+    model was never trained to predict, and would break this round trip.
+    """
+    from isr.agents.red_motion_features import ACCEL_SCALE, accel_to_bin
+
+    ad = _adapter()
+    cells = np.arange(ZERO_CLASS)
+    assert np.array_equal(accel_to_bin(ad._cell_accel), cells), (
+        "adapter cell accelerations do not map back to their own cells")
+    assert np.max(np.linalg.norm(ad._cell_accel, axis=1)) <= ACCEL_SCALE
+
+
+def test_a_max_disagreeing_with_the_discretiser_is_rejected():
+    """a_max is not a free knob: the grid and every training label assume
+    ACCEL_SCALE, so a mismatch must fail loudly rather than silently
+    emitting untrained accelerations."""
+    model = RedMotionGNN(n_blue=BLUE_CAP, n_red=1, n_obs=OBS_CAP)
+    with pytest.raises(ValueError, match="ACCEL_SCALE"):
+        LearnedRedMotion(model, BLUE_CAP, OBS_CAP, arena_size=L, a_max=2.0)
+
+
 def test_branch_weights_sum_to_one_so_no_weight_flows_between_parents():
     """The tracker sets w_child = w_parent * rel_w and then normalises
     GLOBALLY across every child of every parent.

@@ -45,6 +45,17 @@ N_BINS = N_HEADING_BINS * N_MAGNITUDE_BINS + 1     # + the ZERO class
 ZERO_CLASS = N_BINS - 1
 ZERO_EPS = 1e-6              # |a| below this is the ZERO class
 
+# Largest |a| the magnitude axis can represent.  This is NOT a free
+# parameter: ``PursuitEnv.step`` clips the red action to [-1, 1] and then
+# feeds it to ``_integrate`` AS the acceleration, with no scale factor
+# anywhere, so the grid's units and the env's physical units are the same
+# thing.  ``accel_to_bin`` mirrors that clip, which means the whole
+# discretisation — and therefore every training label — assumes this
+# bound.  A red class with a different acceleration limit would need this
+# changed HERE, not worked around by rescaling a consumer's output: doing
+# that would emit accelerations the model was never trained to predict.
+ACCEL_SCALE = 1.0
+
 
 # --------------------------------------------------------------------- #
 #  Edge features — the one primitive both paths share
@@ -91,8 +102,9 @@ def accel_to_bin(accel: np.ndarray) -> np.ndarray:
     ang = np.arctan2(accel[..., 1], accel[..., 0])          # [-pi, pi)
     h = np.floor((ang + np.pi) / (2 * np.pi) * N_HEADING_BINS).astype(np.int64)
     h = np.clip(h, 0, N_HEADING_BINS - 1)
-    m = np.floor(np.clip(mag, 0.0, 1.0) * N_MAGNITUDE_BINS).astype(np.int64)
-    m = np.clip(m, 0, N_MAGNITUDE_BINS - 1)                 # |a| == 1 -> top bin
+    m = np.floor(np.clip(mag / ACCEL_SCALE, 0.0, 1.0)
+                * N_MAGNITUDE_BINS).astype(np.int64)
+    m = np.clip(m, 0, N_MAGNITUDE_BINS - 1)      # |a| == ACCEL_SCALE -> top bin
     out = h * N_MAGNITUDE_BINS + m
     return np.where(mag < ZERO_EPS, ZERO_CLASS, out)
 
@@ -107,7 +119,7 @@ def bin_to_accel(idx: np.ndarray) -> np.ndarray:
     h = idx // N_MAGNITUDE_BINS
     m = idx % N_MAGNITUDE_BINS
     ang = (h + 0.5) / N_HEADING_BINS * 2 * np.pi - np.pi
-    mag = (m + 0.5) / N_MAGNITUDE_BINS
+    mag = (m + 0.5) / N_MAGNITUDE_BINS * ACCEL_SCALE
     out = np.stack([mag * np.cos(ang), mag * np.sin(ang)], axis=-1)
     return np.where((idx == ZERO_CLASS)[..., None], 0.0, out)
 

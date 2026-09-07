@@ -45,8 +45,8 @@ import numpy as np
 import torch
 
 from isr.agents.red_motion_features import (
-    N_HEADING_BINS, N_MAGNITUDE_BINS, V_NORM, ZERO_CLASS,
-    bin_to_accel, featurize_shard,
+    ACCEL_SCALE, N_HEADING_BINS, N_MAGNITUDE_BINS, V_NORM, ZERO_CLASS,
+    accel_to_bin, bin_to_accel, featurize_shard,
 )
 from isr.agents.red_motion_gnn import RedMotionGNN
 from isr.env.entities import RED_TARGET
@@ -105,6 +105,17 @@ class LearnedRedMotion:
         self.dt = float(dt)
         self.a_max = float(a_max)
         self.v_max = float(v_max)
+        # a_max is NOT a free knob here.  The action discretisation bakes
+        # ACCEL_SCALE into every training label (accel_to_bin clips against
+        # it, mirroring PursuitEnv's own clip on the red action), so a
+        # different bound has to be changed in red_motion_features, not
+        # patched by rescaling this consumer's output.  Failing loudly
+        # beats silently emitting accelerations the model never learned.
+        if not np.isclose(self.a_max, ACCEL_SCALE):
+            raise ValueError(
+                f"a_max={self.a_max} disagrees with the discretiser's "
+                f"ACCEL_SCALE={ACCEL_SCALE}; the grid and every training "
+                f"label assume that bound (see red_motion_features)")
         self.L = float(arena_size)
         # A cap on MODES, not on cells: every heading bin is assigned to a
         # kept peak, so raising or lowering this never discards mass, it
@@ -136,14 +147,21 @@ class LearnedRedMotion:
         # the heading bin's arc, which scales with |a| (a 10 degree bin is
         # a wider absolute spread for a large acceleration than a small
         # one), so it is applied per branch.
-        self._sd_radial = (self.a_max / N_MAGNITUDE_BINS) / np.sqrt(12.0)
+        self._sd_radial = (ACCEL_SCALE / N_MAGNITUDE_BINS) / np.sqrt(12.0)
         self._sd_tangential_per_a = (2 * np.pi / N_HEADING_BINS) / np.sqrt(12.0)
 
         # Per-cell acceleration and quantisation covariance are FIXED
         # properties of the grid, so they are built once rather than per
         # component per step.
+        #
+        # NOT rescaled by a_max: bin_to_accel already returns PHYSICAL
+        # units, because the grid's magnitude axis is defined against
+        # ACCEL_SCALE, which mirrors the env's own clip on the red action.
+        # Multiplying here as well would emit accelerations the model was
+        # never trained to predict, and would break the round trip
+        # accel_to_bin(bin_to_accel(k)) == k that the labels rely on.
         cells = np.arange(ZERO_CLASS)
-        self._cell_accel = bin_to_accel(cells) * self.a_max        # (180, 2)
+        self._cell_accel = bin_to_accel(cells)                     # (180, 2)
         self._cell_quant = np.stack(
             [self._quantisation_cov(a) for a in self._cell_accel])  # (180,2,2)
 
