@@ -109,6 +109,18 @@ def test_branches_form_a_valid_weighted_mixture():
         assert np.min(np.linalg.eigvalsh(Pb)) > 0, "covariance not PD"
 
 
+def test_predict_probs_returns_one_normalised_categorical():
+    """forward gives (batch, n_red, N_BINS); both leading axes are
+    singleton here, so the readout is one distribution over the bins."""
+    ad = _adapter()
+    ad.set_context(blue_pos=np.array([[40.0, 40.0], [80.0, 90.0]]),
+                  blue_vel=np.zeros((2, 2)))
+    p = ad.predict_probs(np.array([65.0, 65.0]), np.array([0.3, -0.2]))
+    assert p.shape == (N_BINS,)
+    assert np.isclose(p.sum(), 1.0, atol=1e-6)
+    assert np.all(p >= 0.0)
+
+
 def test_cell_accelerations_round_trip_through_the_discretiser():
     """The adapter's per-cell accelerations must be the ones the LABELS
     were built from, cell for cell.

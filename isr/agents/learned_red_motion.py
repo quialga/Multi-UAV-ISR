@@ -273,7 +273,21 @@ class LearnedRedMotion:
 
     def predict_probs(self, red_pos: np.ndarray, red_vel: np.ndarray
                       ) -> np.ndarray:
-        """The network's full categorical at one exact state, shape (N_BINS,)."""
+        """The network's full categorical at one exact state, shape (N_BINS,).
+
+        ``forward`` returns ``(batch, n_red, N_BINS)``.  Both leading axes
+        are singleton here, for different reasons: ``_pack`` builds exactly
+        ONE sample, and the model is constructed with ``n_red=1`` — which
+        is exact rather than an approximation, since the network has no
+        red->red edges (``run_from_nearest_uav`` provably never reads
+        another red's state), so the computation factorises per red.
+
+        The assertion guards the natural optimisation of this method.  The
+        tracker calls the motion model once per COMPONENT, so this runs a
+        batch-of-one forward pass many times per step; batching the
+        components would be a real speedup, and a bare ``[0, 0]`` would
+        then silently return the first one instead of failing.
+        """
         if self._ctx is None:
             raise RuntimeError(
                 "set_context() must be called before predicting: the red's "
@@ -283,6 +297,11 @@ class LearnedRedMotion:
                            arena_size=self.L)
         with torch.no_grad():
             logits = self.model(*[torch.from_numpy(f[k]) for k in _INPUT_KEYS])
+            if logits.shape[:2] != (1, 1):
+                raise RuntimeError(
+                    f"expected one sample and one red node, got "
+                    f"{tuple(logits.shape)}; [0, 0] would silently drop the "
+                    f"rest — batch the callers instead of indexing here")
             return torch.softmax(logits[0, 0], dim=-1).numpy().astype(np.float64)
 
     # ----------------------------------------------------------------- #
