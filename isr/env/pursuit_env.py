@@ -203,6 +203,7 @@ class PursuitEnv(ParallelEnv):
         obstacle_radius_max:      float = 15.0,
         obstacle_spawn_clearance: float = 10.0,
         use_belief_maps:          bool  = False,
+        use_staleness:            bool  = False,
         belief_grid_size:         int   = 26,
         belief_channels:          int   = 2,
         belief_clip:              float = 10.0,
@@ -365,6 +366,15 @@ class PursuitEnv(ParallelEnv):
                                    radii, in metres.
         obstacle_spawn_clearance   Minimum distance blues and reds must
                                    spawn from any obstacle boundary.
+        use_staleness              When True, maintain ``_staleness``:
+                                   steps since each grid cell was last
+                                   OBSERVED by any blue.  Answers "where
+                                   have I not looked", which the belief
+                                   map answers only indirectly (its decay
+                                   confounds "never looked" with "looked
+                                   long ago and forgot").  Independent of
+                                   ``use_belief_maps``; costs one extra
+                                   occlusion pass per step.
         use_belief_maps            When True, allocate and update the
                                    command-layer fused log-odds belief
                                    map every step (env-level latent;
@@ -448,6 +458,7 @@ class PursuitEnv(ParallelEnv):
         self.obstacle_radius_max      = float(obstacle_radius_max)
         self.obstacle_spawn_clearance = float(obstacle_spawn_clearance)
         self.use_belief_maps          = bool(use_belief_maps)
+        self.use_staleness            = bool(use_staleness)
         self.belief_grid_size         = int(belief_grid_size)
         self.belief_channels          = int(belief_channels)
         self.belief_clip              = float(belief_clip)
@@ -614,6 +625,10 @@ class PursuitEnv(ParallelEnv):
         self._obstacle_r:   Optional[np.ndarray] = None
         self._obstacle_vel: Optional[np.ndarray] = None   # (n_obs, 2) patrol vel
         self._belief_maps:  Optional[np.ndarray] = None
+        # ``_staleness`` (W, H) int32 — steps since each cell was last
+        # OBSERVED.  See _update_staleness for why this is deliberately
+        # not a Bayesian quantity.
+        self._staleness:    Optional[np.ndarray] = None
 
     # ------------------------------------------------------------------ #
     #  PettingZoo API                                                     #
@@ -690,6 +705,16 @@ class PursuitEnv(ParallelEnv):
             # First observation update happens before returning obs so
             # the initial belief map reflects step-0 observations.
             self._update_belief_maps()
+
+        # Staleness starts at the MAXIMUM ("never observed"), not zero:
+        # at reset nothing has been looked at yet, and starting at zero
+        # would tell the policy the whole arena is freshly swept.  The
+        # step-0 observation then carves out what the blues can actually
+        # see from their spawn positions.
+        if self.use_staleness:
+            g = self.belief_grid_size
+            self._staleness = np.full((g, g), self.max_steps, dtype=np.int32)
+            self._staleness[self._observed_cells_mask()] = 0
 
         obs = {a: self._build_obs(i) for i, a in enumerate(self.possible_agents)}
         info = {a: {} for a in self.possible_agents}
@@ -890,6 +915,10 @@ class PursuitEnv(ParallelEnv):
         # step, so its cells' P(enemy) will decay from now on.
         if self.use_belief_maps:
             self._update_belief_maps()
+        # Same placement and for the same reason: age AFTER movement, so
+        # "observed" means the footprint the blues occupy now.
+        if self.use_staleness:
+            self._update_staleness()
 
         # 8. Pack the per-agent dicts:
         #        r_i = r_team + r_crash_i + r_clear_i - action_cost_i
@@ -1161,6 +1190,8 @@ class PursuitEnv(ParallelEnv):
                 snap["obstacle_vel"] = self._obstacle_vel.copy()
         if self._belief_maps is not None:
             snap["belief_maps"] = self._belief_maps.copy()
+        if self._staleness is not None:
+            snap["staleness"] = self._staleness.copy()
         return snap
 
     # ------------------------------------------------------------------ #
@@ -2028,6 +2059,67 @@ class PursuitEnv(ParallelEnv):
             axis=-1,
         )                                   # (n_real, n_active)
         return float(d.min(axis=1).mean())
+
+    def _observed_cells_mask(self) -> np.ndarray:
+        """(W, H) bool — cells inside ANY blue's sensor disk with clear
+        line of sight.  "Did anyone LOOK here this step", independent of
+        whether the sensor's Bernoulli draw then fired.
+
+        Same geometry ``_update_belief_maps`` applies per blue (disk test
+        then the exact analytic occlusion test), computed here as a union
+        over blues.  It is deliberately NOT refactored out of that method:
+        the per-blue loop there interleaves the occlusion test with RNG
+        draws, and restructuring it would reorder the random stream and
+        break the bit-exactness its own tests rely on.  The duplication is
+        pinned instead by
+        ``test_observed_mask_matches_the_cells_the_belief_update_touches``.
+        """
+        centres = getattr(self, "_cell_centres", None)   # cached at reset
+        if self.sensor_radius is None or centres is None:
+            g = self.belief_grid_size
+            return np.zeros((g, g), dtype=bool)
+        out = np.zeros(centres.shape[:2], dtype=bool)
+        for i in range(self.n_blue):
+            uav_pos = self._blue_pos[i]
+            in_disk = np.linalg.norm(centres - uav_pos, axis=-1) <= self.sensor_radius
+            if not bool(np.any(in_disk)):
+                continue
+            cx_idx, cy_idx = np.where(in_disk)
+            occluded = self._rays_occluded_by_obstacles(
+                uav_pos, centres[cx_idx, cy_idx],
+            )
+            vis = ~occluded
+            out[cx_idx[vis], cy_idx[vis]] = True
+        return out
+
+    def _update_staleness(self) -> None:
+        """Age every cell by one step, reset the observed ones to zero.
+
+        Deliberately NOT Bayesian.  For a target never yet detected the
+        prior is uniform, so "probability it is here AND we have not seen
+        it" is monotone in the time since we last looked — the staleness
+        IS the sufficient statistic, with no gamma, no diffusion kernel
+        and no log-odds clip to tune.  Positive evidence is a different
+        question and belongs to the tracker, so the two never overlap and
+        the same target cannot be counted twice.
+
+        Capped at ``max_steps`` so that dividing by it yields [0, 1], and
+        so the initial "never observed" value is the natural maximum
+        rather than an arbitrary sentinel.
+
+        One known limitation, measured as second-order: with ``p_TP``
+        below 1 a single look is not conclusive, and this resets to zero
+        regardless.  The belief map accumulates that ambiguity properly.
+        It is second-order here because the dominant failure is "nobody
+        has been near this region for ~70 steps" rather than "we looked
+        and were unlucky" (three looks leave a 0.15^3 = 0.3% miss), and
+        because the fix if it ever matters is to count CONSECUTIVE CLEAN
+        LOOKS instead — still one integer per cell, still no Bayes.
+        """
+        if self._staleness is None:
+            return
+        np.minimum(self._staleness + 1, self.max_steps, out=self._staleness)
+        self._staleness[self._observed_cells_mask()] = 0
 
     def _update_belief_maps(self) -> None:
         """
