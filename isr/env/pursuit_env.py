@@ -204,6 +204,7 @@ class PursuitEnv(ParallelEnv):
         obstacle_spawn_clearance: float = 10.0,
         use_belief_maps:          bool  = False,
         use_staleness:            bool  = False,
+        staleness_regions:        int   = 5,
         belief_grid_size:         int   = 26,
         belief_channels:          int   = 2,
         belief_clip:              float = 10.0,
@@ -375,6 +376,13 @@ class PursuitEnv(ParallelEnv):
                                    long ago and forgot").  Independent of
                                    ``use_belief_maps``; costs one extra
                                    occlusion pass per step.
+        staleness_regions          R: the staleness field is aggregated to
+                                   R x R REGION nodes for the graph.  Set
+                                   by physics, not taste — a region finer
+                                   than the sensor footprint is a
+                                   distinction the policy cannot act on.
+                                   Default 5 gives 26 m regions against a
+                                   40 m sensor radius.
         use_belief_maps            When True, allocate and update the
                                    command-layer fused log-odds belief
                                    map every step (env-level latent;
@@ -459,6 +467,8 @@ class PursuitEnv(ParallelEnv):
         self.obstacle_spawn_clearance = float(obstacle_spawn_clearance)
         self.use_belief_maps          = bool(use_belief_maps)
         self.use_staleness            = bool(use_staleness)
+        self.staleness_regions        = int(staleness_regions)
+        assert 1 <= self.staleness_regions <= int(belief_grid_size)
         self.belief_grid_size         = int(belief_grid_size)
         self.belief_channels          = int(belief_channels)
         self.belief_clip              = float(belief_clip)
@@ -2120,6 +2130,75 @@ class PursuitEnv(ParallelEnv):
             return
         np.minimum(self._staleness + 1, self.max_steps, out=self._staleness)
         self._staleness[self._observed_cells_mask()] = 0
+
+    def _region_bounds(self) -> List[Tuple[int, int]]:
+        """Cell-index ranges for each region along one axis.
+
+        The grid side (26) has no divisor near the useful region count, so
+        regions are split as evenly as the grid allows (5, 5, 5, 5, 6 for
+        R = 5) rather than forcing a resolution that divides.  Both node
+        features are INTENSIVE (a mean and a fraction), so the uneven last
+        region introduces no bias, and its centre is computed from its own
+        cells rather than assumed to be at a regular spacing.
+        """
+        W = self.belief_grid_size
+        R = self.staleness_regions
+        edges = [(i * W) // R for i in range(R + 1)]
+        return [(edges[i], edges[i + 1]) for i in range(R)]
+
+    def _build_region_nodes(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Aggregate the staleness field into R x R REGION nodes.
+
+        Resolution is set by physics, not by taste: a region finer than
+        the sensor footprint is a distinction the policy cannot act on,
+        since arriving anywhere in it sweeps the whole thing.  With
+        sensor_radius 40 m in a 130 m arena, R = 5 gives 26 m regions —
+        about one footprint across.
+
+        Two features per node, each answering something the other does
+        not:
+
+        ``staleness``  mean steps since observed, over the region's
+            SEARCHABLE cells only, divided by max_steps -> [0, 1].
+            Averaging in obstacle interiors would dilute the signal with
+            area that cannot hide a target.
+        ``searchable`` fraction of the region's cells outside every
+            obstacle.  A region that is mostly rock is cheap to dismiss
+            and the policy should be able to tell; without this, a stale
+            but unsearchable region looks exactly like a stale open one.
+
+        A fully blocked region reports staleness 0 (nothing to find),
+        not max — the honest value, since sweeping it gains nothing.
+
+        Returns
+        -------
+        feats   : (R*R, 2) float32 — [staleness, searchable]
+        centres : (R*R, 2) float32 — world coordinates of each region's
+                  centroid, the anchor for region->blue edge geometry.
+        """
+        R = self.staleness_regions
+        bounds = self._region_bounds()
+        feats = np.zeros((R * R, 2), dtype=np.float32)
+        centres = np.zeros((R * R, 2), dtype=np.float32)
+        if self._staleness is None:
+            return feats, centres
+
+        obst = getattr(self, "_obstacle_grid", None)
+        free = (obst <= 0.5) if obst is not None else np.ones_like(
+            self._staleness, dtype=bool)
+
+        k = 0
+        for x0, x1 in bounds:
+            for y0, y1 in bounds:
+                cells = self._staleness[x0:x1, y0:y1]
+                open_ = free[x0:x1, y0:y1]
+                n_open = int(open_.sum())
+                feats[k, 1] = n_open / cells.size
+                if n_open:
+                    feats[k, 0] = float(cells[open_].mean()) / self.max_steps
+                centres[k] = self._cell_centres[x0:x1, y0:y1].reshape(-1, 2).mean(0)
+                k += 1
+        return feats, centres
 
     def _update_belief_maps(self) -> None:
         """

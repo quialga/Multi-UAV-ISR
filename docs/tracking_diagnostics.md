@@ -1069,6 +1069,10 @@ on the budget. At a long budget the current setting is conservative.
   error is epistemic (§11.4).
 * Obstacle geometry is ground truth in these rows; deployment reads the
   obstacle tracker.
+* **The remaining budget is SEARCH**, and it is a separate line of work:
+  see `docs/search_design.md`. Measured there: 57% of the "lost" mass is
+  not lost at all — a track holds it to within 3.1 m and no blue goes
+  there — and only 43% needs genuine search.
 
 ## Reproduce
 
