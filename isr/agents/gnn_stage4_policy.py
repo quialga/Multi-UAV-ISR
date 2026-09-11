@@ -141,7 +141,16 @@ class GNNEncoder(nn.Module):
     encoder is fully observable — identical semantics to Stage 2/3.
 
     When ``n_obs == 0`` the obstacle path is disabled (no obstacle
-    nodes, no ob edges).
+    nodes, no ob edges).  Likewise ``n_region == 0`` disables the
+    COVERAGE path (region nodes + gb edges), which is how the encoder
+    stays bit-identical to the pre-coverage version by default.
+
+    Region nodes answer a different question from every other type:
+    reds and obstacles say "where is this OBJECT", regions say "where
+    have I NOT LOOKED" (docs/search_design.md).  They follow the same
+    typed pattern — their own input and edge MLPs, the SHARED message and
+    update MLPs — because the type information is already carried by
+    those type-specific encoders.
     """
 
     def __init__(
@@ -155,11 +164,14 @@ class GNNEncoder(nn.Module):
         edge_feat_dim:  int = 7,
         d_hidden:       int = 64,
         n_msg_rounds:   int = 2,
+        n_region:       int = 0,   # R*R coverage nodes; 0 = path disabled
+        region_feat_dim: int = 2,  # [staleness, searchable]
     ) -> None:
         super().__init__()
         self.n_blue       = n_blue
         self.n_red        = n_red
         self.n_obs        = n_obs
+        self.n_region     = n_region
         self.d_hidden     = d_hidden
         self.n_msg_rounds = n_msg_rounds
 
@@ -187,6 +199,16 @@ class GNNEncoder(nn.Module):
             self.obs_input_mlp = None
             self.ob_edge_mlp   = None
 
+        if n_region > 0:
+            self.region_input_mlp = _mlp(region_feat_dim, [d_hidden], d_hidden)
+            self.gb_edge_mlp      = _mlp(edge_feat_dim,   [d_hidden], d_hidden)
+            gb_src, gb_dst = _build_xb_edges(n_region, n_blue)
+            self.register_buffer("gb_src", gb_src, persistent=False)
+            self.register_buffer("gb_dst", gb_dst, persistent=False)
+        else:
+            self.region_input_mlp = None
+            self.gb_edge_mlp      = None
+
     def forward(
         self,
         blue_feats:    torch.Tensor,      # (B, N_blue, blue_feat_dim)
@@ -198,6 +220,9 @@ class GNNEncoder(nn.Module):
         bb_visible:    Optional[torch.Tensor] = None,  # (B, n_bb)
         rb_visible:    Optional[torch.Tensor] = None,  # (B, n_rb)
         ob_visible:    Optional[torch.Tensor] = None,  # (B, n_ob)
+        region_feats:   Optional[torch.Tensor] = None,  # (B, n_region, region_feat_dim)
+        gb_edge_feats:  Optional[torch.Tensor] = None,  # (B, n_gb, edge_feat_dim)
+        gb_weight:      Optional[torch.Tensor] = None,  # (B, n_gb)
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         """
         Returns final (blue, red, obstacle) node embeddings after
@@ -217,6 +242,11 @@ class GNNEncoder(nn.Module):
             e_ob  = self.ob_edge_mlp(ob_edge_feats)
         else:
             h_obs = None
+
+        has_region = self.n_region > 0 and region_feats is not None
+        if has_region:
+            h_region = self.region_input_mlp(region_feats)
+            e_gb     = self.gb_edge_mlp(gb_edge_feats)
 
         for _ in range(self.n_msg_rounds):
             # Blue-Blue messages.
@@ -249,6 +279,41 @@ class GNNEncoder(nn.Module):
                 if ob_visible is not None:
                     msg_ob = msg_ob * ob_visible.unsqueeze(-1)
                 agg.index_add_(1, self.ob_dst, msg_ob)
+
+            # Region->Blue (coverage) messages.
+            #
+            # gb_weight is NOT a visibility mask.  Coverage is a
+            # command-layer quantity like the belief map, so no region is
+            # hidden from a blue; the weights are an AGGREGATION choice,
+            # and they ride the same per-edge multiply slot the masks use
+            # so the aggregation mechanism itself is untouched.
+            #
+            # Why weights at all: there are ~25 region nodes against 14
+            # other edges, so a plain index_add_ SUM would let coverage
+            # dominate the blue's aggregate by sheer count, and its
+            # magnitude would scale with R^2 — turning a RESOLUTION knob
+            # into a gradient-scale knob.  Measured (scratch/
+            # region_mean_bias.py), a uniform mean is worse than merely
+            # large: because region nodes tile the arena, an off-centre
+            # blue has more of them on one side, so the aggregate points
+            # into the arena REGARDLESS of staleness.  At >45 m from the
+            # centre — where blues sit 72% of the time — the uniform mean
+            # lands within 15 degrees of that pure tiling direction.
+            # Weighting by staleness x searchable removes it with zero
+            # parameters, and has the right limits: a uniform field gives
+            # uniform weights (correctly, no preference), a structured one
+            # concentrates on what is actually unexplored.  Uniform
+            # weights recover the plain mean, and learned attention would
+            # contain both — the three are nested, so they ablate cleanly.
+            if has_region:
+                h_send_gb = h_region.index_select(1, self.gb_src)
+                h_recv_gb = h_blue.index_select(1, self.gb_dst)
+                msg_gb = self.msg_mlp(
+                    torch.cat([h_send_gb, h_recv_gb, e_gb], dim=-1),
+                )
+                if gb_weight is not None:
+                    msg_gb = msg_gb * gb_weight.unsqueeze(-1)
+                agg.index_add_(1, self.gb_dst, msg_gb)
 
             # Residual node update on blues only.
             h_blue = h_blue + self.update_mlp(torch.cat([h_blue, agg], dim=-1))

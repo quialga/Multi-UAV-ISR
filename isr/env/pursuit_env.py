@@ -2200,6 +2200,55 @@ class PursuitEnv(ParallelEnv):
                 k += 1
         return feats, centres
 
+    def _build_region_graph(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """The coverage path's graph pieces: node features, gb edge
+        features, and the per-edge aggregation weights.
+
+        Edge ordering matches ``_build_xb_edges(n_region, n_blue)`` —
+        ``for s in regions: for b in blues`` — the same convention rb and
+        ob already use.
+
+        Regions are STATIC senders, so this is exactly the obstacle
+        treatment: ``_edge_features_for`` with zero sender velocity, which
+        makes ``rel_vel`` driven entirely by the blue's own motion and
+        leaves the bearing at zero (the env defines bearing in the
+        SENDER's frame, and a motionless sender has no frame).
+
+        ``gb_weight`` is an AGGREGATION weight, not a visibility mask —
+        coverage is command-layer, so no region is hidden from any blue.
+        It is ``staleness x searchable`` normalised to sum to 1 over
+        regions, so each blue receives a weighted MEAN.  See the
+        aggregation comment in ``GNNEncoder.forward`` for why a plain sum
+        or a uniform mean will not do: with the regions tiling the arena,
+        a uniform mean points into the arena regardless of staleness, and
+        at >45 m off centre — where blues sit 72% of the time — it lands
+        within 15 degrees of that pure tiling direction
+        (``scratch/region_mean_bias.py``).
+
+        Falls back to uniform weights when nothing is stale, which is the
+        honest answer: with no coverage signal there is no preference.
+
+        Returns
+        -------
+        region_feats  : (R*R, 2)            [staleness, searchable]
+        gb_edge_feats : (R*R*n_blue, 7)
+        gb_weight     : (R*R*n_blue,)
+        """
+        feats, centres = self._build_region_nodes()
+        n_r = feats.shape[0]
+        src_pos = np.repeat(centres, self.n_blue, axis=0)
+        src_vel = np.zeros_like(src_pos)
+        dst_pos = np.tile(self._blue_pos, (n_r, 1))
+        dst_vel = np.tile(self._blue_vel, (n_r, 1))
+        edge_feats = self._edge_features_for(src_pos, src_vel,
+                                            dst_pos, dst_vel)
+
+        w = (feats[:, 0] * feats[:, 1]).astype(np.float64)
+        tot = float(w.sum())
+        w = (w / tot) if tot > 1e-9 else np.full(n_r, 1.0 / n_r)
+        gb_weight = np.repeat(w, self.n_blue).astype(np.float32)
+        return feats, edge_feats, gb_weight
+
     def _update_belief_maps(self) -> None:
         """
         Vectorised Bayesian log-odds update on the belief map
