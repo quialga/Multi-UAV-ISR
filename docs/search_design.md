@@ -129,14 +129,68 @@ would send the policy to search solid rock.
 `searchable` earns its place separately — without it a stale but
 unsearchable region is indistinguishable from a stale open one.
 
-## 5. What is built, and what is not
+## 5. Aggregation: weighted, not averaged
+
+There are ~25 region nodes against 14 other edges into a blue, so the
+encoder's `index_add_` SUM would let coverage dominate the aggregate by
+sheer count, with a magnitude scaling as R² — turning a RESOLUTION knob
+into a gradient-scale one.
+
+A uniform MEAN fixes the scale but not the content, and the reason is
+worth stating precisely because the obvious intuition is backwards. Each
+message already carries its own direction (`gb_edge_mlp` embeds
+`rel_pos`), so the mean is **not** direction-blind — it is
+direction-DOMINATED. The 25 messages differ mostly because their geometry
+differs, while staleness only modulates each one mildly through
+`h_region`.
+
+Measured on the aggregate itself (`scratch/region_agg_signal.py`), by
+replacing the real staleness field with a flat one and asking how much of
+the aggregate moves:
+
+| weighting | share of the aggregate carrying coverage |
+|---|---|
+| uniform mean | **0.016** |
+| staleness × searchable | **0.309** (19.7×) |
+
+So under a uniform mean, 98.4% of what the coverage path delivers is
+positional baseline — and that part is **redundant**, since the blue
+already has its position in its own wall-distance features. The pathway
+would deliver almost nothing new.
+
+The weights are `staleness × searchable`, normalised to sum to 1 over
+regions. Zero parameters, and the limits are right: a uniform field gives
+uniform weights (correctly — there is no preference), a structured one
+concentrates on what is actually unexplored. This does not hand-code
+where to go; it states that a freshly swept region carries no SEARCH
+information, which is true by the definition of the node type.
+
+Mechanically the weights ride the same per-edge multiply slot the
+visibility masks already use, so the aggregation mechanism is untouched —
+and the three options are nested (uniform ⊂ weighted ⊂ learned
+attention), so the attention step ablates as a single variable.
+
+*Caveat, stated rather than buried:* measured with an UNTRAINED encoder,
+so this is accessibility at initialisation — what decides whether the
+pathway can start learning, not what training converges to.
+
+*Method note:* an earlier version of this measurement
+(`scratch/region_mean_bias.py`) used the mean of the raw `rel_pos`
+vectors as a proxy. It pointed the same way but could not establish the
+claim, since the aggregate is a mean of MESSAGES through a non-linear MLP
+and `mean(f(x)) ≠ f(mean(x))`. It is kept only as the input-side
+diagnostic it actually is.
+
+## 6. What is built, and what is not
 
 | stage | status |
 |---|---|
 | A — staleness field in the env (`use_staleness`) | **done**, `tests/test_staleness.py` |
 | B — aggregation to region nodes (`staleness_regions`) | **done**, `tests/test_region_nodes.py` |
-| C — region nodes as a typed node in the policy graph | not started |
+| C — region node type + gb edges in `GNNEncoder` | **done**, `tests/test_region_graph.py` |
+| C2 — region features into `_build_obs` / the policy | not started |
 | D — tracker as the source for red/obstacle nodes | not started |
+| E — learned attention over regions (ablate against C) | not started |
 
 A and B are off by default and change nothing when disabled — pinned by
 `test_disabled_env_is_unchanged_step_for_step`. C and D change the
@@ -145,7 +199,7 @@ checkpoint consumes belief-map features and is the control to compare
 against, which is why the belief map should stay switchable rather than
 being deleted in the same change.
 
-## 6. The open risk: there is no reward for searching
+## 7. The open risk: there is no reward for searching
 
 ```python
 r_team = catch_reward * n_caught - step_cost

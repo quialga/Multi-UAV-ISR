@@ -2219,11 +2219,11 @@ class PursuitEnv(ParallelEnv):
         It is ``staleness x searchable`` normalised to sum to 1 over
         regions, so each blue receives a weighted MEAN.  See the
         aggregation comment in ``GNNEncoder.forward`` for why a plain sum
-        or a uniform mean will not do: with the regions tiling the arena,
-        a uniform mean points into the arena regardless of staleness, and
-        at >45 m off centre — where blues sit 72% of the time — it lands
-        within 15 degrees of that pure tiling direction
-        (``scratch/region_mean_bias.py``).
+        or a uniform mean will not do: measured on the aggregate itself
+        (``scratch/region_agg_signal.py``), a uniformly-averaged aggregate
+        changes by only 1.6% when the real staleness field is replaced by
+        a flat one — the rest is positional baseline the blue already has.
+        Weighting takes that to 31%.
 
         Falls back to uniform weights when nothing is stale, which is the
         honest answer: with no coverage signal there is no preference.

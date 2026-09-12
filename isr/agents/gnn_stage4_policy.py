@@ -292,19 +292,29 @@ class GNNEncoder(nn.Module):
             # other edges, so a plain index_add_ SUM would let coverage
             # dominate the blue's aggregate by sheer count, and its
             # magnitude would scale with R^2 — turning a RESOLUTION knob
-            # into a gradient-scale knob.  Measured (scratch/
-            # region_mean_bias.py), a uniform mean is worse than merely
-            # large: because region nodes tile the arena, an off-centre
-            # blue has more of them on one side, so the aggregate points
-            # into the arena REGARDLESS of staleness.  At >45 m from the
-            # centre — where blues sit 72% of the time — the uniform mean
-            # lands within 15 degrees of that pure tiling direction.
-            # Weighting by staleness x searchable removes it with zero
-            # parameters, and has the right limits: a uniform field gives
-            # uniform weights (correctly, no preference), a structured one
-            # concentrates on what is actually unexplored.  Uniform
-            # weights recover the plain mean, and learned attention would
-            # contain both — the three are nested, so they ablate cleanly.
+            # into a gradient-scale knob.
+            #
+            # A uniform MEAN fixes the scale but not the content.  Each message
+            # already carries its own direction (e_gb embeds rel_pos), so
+            # the mean is not direction-blind — it is direction-DOMINATED:
+            # the 25 messages differ mostly because their geometry differs,
+            # while staleness only modulates each one mildly through
+            # h_region.  Measured on the aggregate itself
+            # (scratch/region_agg_signal.py), replacing the real staleness
+            # field with a flat one changes a uniformly-averaged aggregate
+            # by just 1.6%; the other 98.4% is positional baseline, which
+            # the blue ALREADY has in its own wall-distance features.  The
+            # coverage path would deliver almost nothing new.
+            #
+            # Weighting by staleness x searchable takes that share to 31%
+            # (19.7x) with zero parameters, and has the right limits: a
+            # uniform field gives uniform weights (correctly — no
+            # preference), a structured one concentrates on what is
+            # actually unexplored.  Uniform weights recover the plain mean
+            # and learned attention would contain both, so the three are
+            # nested and ablate cleanly.  (Measured with an UNTRAINED
+            # encoder: this is accessibility at initialisation, which is
+            # what decides whether the pathway can start learning.)
             if has_region:
                 h_send_gb = h_region.index_select(1, self.gb_src)
                 h_recv_gb = h_blue.index_select(1, self.gb_dst)
