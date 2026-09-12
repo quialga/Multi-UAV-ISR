@@ -294,22 +294,34 @@ class GNNEncoder(nn.Module):
             # magnitude would scale with R^2 — turning a RESOLUTION knob
             # into a gradient-scale knob.
             #
-            # A uniform MEAN fixes the scale but not the content.  Each message
-            # already carries its own direction (e_gb embeds rel_pos), so
-            # the mean is not direction-blind — it is direction-DOMINATED:
-            # the 25 messages differ mostly because their geometry differs,
-            # while staleness only modulates each one mildly through
-            # h_region.  Measured on the aggregate itself
-            # (scratch/region_agg_signal.py), replacing the real staleness
-            # field with a flat one changes a uniformly-averaged aggregate
-            # by just 1.6%; the other 98.4% is positional baseline, which
-            # the blue ALREADY has in its own wall-distance features.  The
-            # coverage path would deliver almost nothing new.
+            # A uniform MEAN fixes the scale but not the content, and the
+            # reason is sharper than "the signal gets diluted".  With
+            # EQUAL weights the aggregate is, to first order,
+            # A*mean(h_region) + B*mean(e_gb): it depends on the staleness
+            # field ONLY THROUGH ITS MEAN.  "Which region is stale" lives
+            # in the staleness x geometry INTERACTION, which a sum of
+            # per-edge MLP outputs can express only through its
+            # non-linearity — a small effect.
             #
-            # Weighting by staleness x searchable takes that share to 31%
-            # (19.7x) with zero parameters, and has the right limits: a
-            # uniform field gives uniform weights (correctly — no
-            # preference), a structured one concentrates on what is
+            # Measured (scratch/region_agg_mechanism.py), relative change
+            # in the aggregate under two probes:
+            #
+            #   probe     what changes           uniform   weighted
+            #   PERMUTE   WHICH region is stale   0.0059     0.2131
+            #   SHIFT     the overall LEVEL       0.1767     0.1555
+            #
+            # So a uniform mean sees the LEVEL of staleness and is blind
+            # to its LOCATION (36x less responsive to arrangement) — and
+            # location is the entire content a search policy needs.  The
+            # level it does see is itself redundant: the whole arena ages
+            # together, so it tracks elapsed time, which the blue already
+            # has in its time_col feature.
+            #
+            # Weighting puts staleness into the WEIGHTS, which multiply
+            # the geometry-carrying message, making that interaction
+            # explicit and first-order.  Zero parameters, and the limits
+            # are right: a uniform field gives uniform weights (correctly
+            # — no preference), a structured one concentrates on what is
             # actually unexplored.  Uniform weights recover the plain mean
             # and learned attention would contain both, so the three are
             # nested and ablate cleanly.  (Measured with an UNTRAINED

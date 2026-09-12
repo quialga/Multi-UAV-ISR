@@ -137,26 +137,46 @@ sheer count, with a magnitude scaling as R² — turning a RESOLUTION knob
 into a gradient-scale one.
 
 A uniform MEAN fixes the scale but not the content, and the reason is
-worth stating precisely because the obvious intuition is backwards. Each
-message already carries its own direction (`gb_edge_mlp` embeds
-`rel_pos`), so the mean is **not** direction-blind — it is
-direction-DOMINATED. The 25 messages differ mostly because their geometry
-differs, while staleness only modulates each one mildly through
-`h_region`.
+sharper than "the signal gets diluted".
 
-Measured on the aggregate itself (`scratch/region_agg_signal.py`), by
-replacing the real staleness field with a flat one and asking how much of
-the aggregate moves:
+With EQUAL weights the aggregate is, to first order,
+`A·mean(h_region) + B·mean(e_gb)` — it depends on the staleness field
+**only through its mean**. "Which region is stale" lives in the
+`staleness × geometry` INTERACTION, and a sum of per-edge MLP outputs can
+express that only through its non-linearity, which is a small effect.
 
-| weighting | share of the aggregate carrying coverage |
-|---|---|
-| uniform mean | **0.016** |
-| staleness × searchable | **0.309** (19.7×) |
+Measured with two probes chosen to separate the two (
+`scratch/region_agg_mechanism.py`), reporting the relative change in the
+aggregate:
 
-So under a uniform mean, 98.4% of what the coverage path delivers is
-positional baseline — and that part is **redundant**, since the blue
-already has its position in its own wall-distance features. The pathway
-would deliver almost nothing new.
+| probe | what changes | uniform | weighted |
+|---|---|---|---|
+| PERMUTE | **which** region is stale (mean held fixed) | 0.0059 | **0.2131** |
+| SHIFT | the overall **level** | 0.1767 | 0.1555 |
+
+**A uniform mean sees the LEVEL of staleness and is blind to its
+LOCATION** — 36× less responsive to arrangement than the weighted
+version. Location is the entire content a search policy needs.
+
+And the level it does respond to is itself redundant: the whole arena ages
+together, so the level tracks elapsed time, which the blue already has in
+its `time_col` feature. Under a uniform mean the coverage path would carry
+nothing the policy does not already have.
+
+Weighting puts staleness into the WEIGHTS, which multiply the
+geometry-carrying message — making that interaction explicit and
+first-order.
+
+*Two wrong explanations, recorded because the measurements that killed
+them are the useful part.* First: "the geometric contributions cancel near
+the arena centre and stop cancelling off centre" — falsified, the uniform
+share is flat across blue offset (`scratch/region_agg_signal.py`).
+Second: "a mean over K nodes attenuates what differs by 1/√K" —
+falsified, the share does not fall with R, it rises slightly
+(`scratch/region_agg_vs_R.py`). An earlier proxy that averaged raw
+`rel_pos` vectors (`scratch/region_mean_bias.py`) pointed the right way
+but could not establish anything, since the aggregate is a mean of
+MESSAGES through a non-linear MLP and `mean(f(x)) ≠ f(mean(x))`.
 
 The weights are `staleness × searchable`, normalised to sum to 1 over
 regions. Zero parameters, and the limits are right: a uniform field gives
@@ -173,13 +193,6 @@ attention), so the attention step ablates as a single variable.
 *Caveat, stated rather than buried:* measured with an UNTRAINED encoder,
 so this is accessibility at initialisation — what decides whether the
 pathway can start learning, not what training converges to.
-
-*Method note:* an earlier version of this measurement
-(`scratch/region_mean_bias.py`) used the mean of the raw `rel_pos`
-vectors as a proxy. It pointed the same way but could not establish the
-claim, since the aggregate is a mean of MESSAGES through a non-linear MLP
-and `mean(f(x)) ≠ f(mean(x))`. It is kept only as the input-side
-diagnostic it actually is.
 
 ## 6. What is built, and what is not
 
