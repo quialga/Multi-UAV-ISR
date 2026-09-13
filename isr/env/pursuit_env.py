@@ -377,12 +377,12 @@ class PursuitEnv(ParallelEnv):
                                    ``use_belief_maps``; costs one extra
                                    occlusion pass per step.
         staleness_regions          R: the staleness field is aggregated to
-                                   R x R REGION nodes for the graph.  Set
-                                   by physics, not taste — a region finer
-                                   than the sensor footprint is a
-                                   distinction the policy cannot act on.
-                                   Default 5 gives 26 m regions against a
-                                   40 m sensor radius.
+                                   R x R REGION nodes for the graph.
+                                   Default 5 gives 26 m regions, small
+                                   enough that a blue at a region's centre
+                                   sweeps all of it (half-diagonal 18 m <
+                                   40 m sensor radius).  R = 3 would also
+                                   satisfy that; 5 is a choice, not derived.
         use_belief_maps            When True, allocate and update the
                                    command-layer fused log-odds belief
                                    map every step (env-level latent;
@@ -2079,9 +2079,9 @@ class PursuitEnv(ParallelEnv):
         then the exact analytic occlusion test), computed here as a union
         over blues.  It is deliberately NOT refactored out of that method:
         the per-blue loop there interleaves the occlusion test with RNG
-        draws, and restructuring it would reorder the random stream and
-        break the bit-exactness its own tests rely on.  The duplication is
-        pinned instead by
+        draws, and restructuring it risks reordering the random stream
+        (not verified either way — left alone rather than find out).  The
+        duplication is pinned instead by
         ``test_observed_mask_matches_the_cells_the_belief_update_touches``.
         """
         centres = getattr(self, "_cell_centres", None)   # cached at reset
@@ -2105,26 +2105,29 @@ class PursuitEnv(ParallelEnv):
     def _update_staleness(self) -> None:
         """Age every cell by one step, reset the observed ones to zero.
 
-        Deliberately NOT Bayesian.  For a target never yet detected the
-        prior is uniform, so "probability it is here AND we have not seen
-        it" is monotone in the time since we last looked — the staleness
-        IS the sufficient statistic, with no gamma, no diffusion kernel
-        and no log-odds clip to tune.  Positive evidence is a different
-        question and belongs to the tracker, so the two never overlap and
-        the same target cannot be counted twice.
+        Deliberately NOT Bayesian: a plain proxy with nothing to tune (no
+        gamma, no diffusion kernel, no log-odds clip).  The intuition is
+        that a target that can move into a cell is more likely to be there
+        the longer since anyone looked.  That is an approximation, not a
+        derivation — this red FLEES blues rather than wandering, so the
+        relation need not be monotone.  The only measured support: under a
+        scripted sweep, hidden reds sat in never-observed cells (median
+        staleness at the cap) while the cells they could have been hiding
+        in had a median of 66 steps (scratch/staleness_vs_search.py).
+        Positive evidence is meant to come from the tracker instead, so
+        the two do not double-count — once the tracker is wired in.
 
         Capped at ``max_steps`` so that dividing by it yields [0, 1], and
         so the initial "never observed" value is the natural maximum
         rather than an arbitrary sentinel.
 
-        One known limitation, measured as second-order: with ``p_TP``
-        below 1 a single look is not conclusive, and this resets to zero
-        regardless.  The belief map accumulates that ambiguity properly.
-        It is second-order here because the dominant failure is "nobody
-        has been near this region for ~70 steps" rather than "we looked
-        and were unlucky" (three looks leave a 0.15^3 = 0.3% miss), and
-        because the fix if it ever matters is to count CONSECUTIVE CLEAN
-        LOOKS instead — still one integer per cell, still no Bayes.
+        Known limitation, NOT measured: with ``p_TP`` below 1 a single look
+        is not conclusive, yet this resets to zero regardless; the belief
+        map accumulates that ambiguity properly.  Plausibly minor, since
+        invisibility gaps run ~70+ steps and three independent looks would
+        leave a 0.15^3 = 0.3% miss, but its effect was never quantified.
+        If it matters, count CONSECUTIVE CLEAN LOOKS instead — still one
+        integer per cell.
         """
         if self._staleness is None:
             return
@@ -2149,11 +2152,12 @@ class PursuitEnv(ParallelEnv):
     def _build_region_nodes(self) -> Tuple[np.ndarray, np.ndarray]:
         """Aggregate the staleness field into R x R REGION nodes.
 
-        Resolution is set by physics, not by taste: a region finer than
-        the sensor footprint is a distinction the policy cannot act on,
-        since arriving anywhere in it sweeps the whole thing.  With
-        sensor_radius 40 m in a 130 m arena, R = 5 gives 26 m regions —
-        about one footprint across.
+        Resolution: with sensor_radius 40 m in a 130 m arena, R = 5 gives
+        26 m regions, small enough that a blue at a region's centre sweeps
+        all of it (half-diagonal 18 m < 40 m).  Finer regions add
+        distinctions a single visit would not separate.  The criterion
+        allows anything up to ~56 m (R >= 3), so R = 5 is a choice within
+        that range, not a derived value.
 
         Two features per node, each answering something the other does
         not:
@@ -2217,13 +2221,13 @@ class PursuitEnv(ParallelEnv):
         ``gb_weight`` is an AGGREGATION weight, not a visibility mask —
         coverage is command-layer, so no region is hidden from any blue.
         It is ``staleness x searchable`` normalised to sum to 1 over
-        regions, so each blue receives a weighted MEAN.  See the
-        aggregation comment in ``GNNEncoder.forward`` for why a plain sum
-        or a uniform mean will not do: with equal weights the aggregate
-        depends on the staleness field only through its MEAN, so it sees
-        the LEVEL of staleness and is blind to its LOCATION — measured 36x
-        less responsive to which region is stale
-        (``scratch/region_agg_mechanism.py``).
+        regions, so each blue receives a weighted MEAN, identical for every
+        blue.  See the aggregation comment in ``GNNEncoder.forward`` for
+        the reasoning and what was measured.  In short: under equal
+        weights the aggregate depends on the staleness field only through
+        its mean at first order; this weighting lets the arrangement enter
+        directly.  Whether that — or coverage at all — improves search is
+        NOT established.
 
         Falls back to uniform weights when nothing is stale, which is the
         honest answer: with no coverage signal there is no preference.

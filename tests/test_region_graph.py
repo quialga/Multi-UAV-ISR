@@ -14,7 +14,7 @@ Two things carry the risk:
   mismatch silently pairs each region with the wrong blue and still
   trains, just badly.
 * **Non-regression.** With the coverage path off, the encoder must be
-  bit-identical to the version that scores 3.00/3.
+  bit-identical to the proven pre-coverage encoder.
 
 Run:
     pytest tests/test_region_graph.py -v
@@ -173,7 +173,7 @@ def test_coverage_path_is_off_by_default():
 
 
 def test_disabled_encoder_is_bit_identical_to_the_pre_coverage_version():
-    """Non-regression against the architecture that scores 3.00/3: passing
+    """Non-regression against the proven pre-coverage encoder: passing
     region tensors to an encoder built with n_region=0 must change
     nothing, and neither must omitting them."""
     enc = _enc(0)

@@ -109,31 +109,36 @@ it does NOT change recall (§3).
 
 ## 5. Why F cannot be fixed, and the recall budget
 
-> **CONFIRMED — see §11.** This section was briefly retracted on the
-> strength of a measurement that turned out to have two bugs in the
-> measuring apparatus, not in the claim. Re-measured correctly, a good
-> motion model takes recall from 0.35 to **0.51–0.61**, and the learned
-> model reaches the same place. One condition has to be added, though:
-> the gain only exists once `max_misses` is raised. At the default coast
-> budget of 5 steps, no motion model changes anything.
+> **PARTLY CONFIRMED, with corrected numbers — see §11.** The original
+> text below claimed the true policy "roughly DOUBLES recall" and a budget
+> of 0.30 → 0.64; neither 0.64 nor a doubling was reproduced. What was
+> re-measured (§11.1, stochastic red, `max_misses=80`): at a 5 m gate,
+> constant velocity 0.346 → learned model 0.509 (true-policy oracle
+> 0.481); at a 20 m gate, 0.441 → 0.609. A real gain, but ~1.4× rather than
+> 2×. It exists **only once `max_misses` is raised**: at the default coast
+> budget of 5 steps every motion model scores ~0.33. The paragraph and
+> table below are kept as originally written except where marked.
 
 `F` is a LINEAR, state-INDEPENDENT transition. The red's motion is a
 NON-LINEAR function of a state `F` does not even see (nearest blue,
 obstacles, walls). No constant 4×4 matrix can represent "flee the nearest
-blue". Evidence: swapping in the TRUE policy as the motion model
-(`motion_model` plug point) roughly DOUBLES recall.
+blue". ~~Evidence: swapping in the TRUE policy as the motion model
+(`motion_model` plug point) roughly DOUBLES recall.~~ *(Not reproduced;
+see the banner.)*
 
-Recall budget:
+Recall budget — note the rows were measured under DIFFERENT settings and
+are not directly comparable:
 
-| stage | recall | limited by |
-|---|---|---|
-| today (constant velocity) | 0.30 | at the detectability ceiling; bridges no gaps |
-| + learned motion model (step b) | **0.58** (§11, learned; 0.61 with oracle association) | still capped by detection |
-| + directed search (step c) | > 0.61 | targets never yet detected |
+| stage | recall | settings | limited by |
+|---|---|---|---|
+| today (constant velocity) | 0.30 | 5 m gate, `max_misses=5` | the detectability ceiling |
+| + learned motion model (step b) | **0.58** (0.61 with oracle association) | 20 m gate, `max_misses=80` | still capped by detection |
+| + directed search (step c) | > 0.61 *(expected, not measured)* | — | targets never yet detected |
 
-The remaining 0.36 at stage 2 are targets **never detected**, so no track
-is even born — unfixable by any filter; it needs SEARCH (the grid as birth
-intensity, and the planner).
+Like-for-like, the motion-model gain is the §11.1 table: 0.346 → 0.509 at
+5 m and 0.441 → 0.609 at 20 m, both with `max_misses=80`. The remainder
+at stage 2 are largely targets never detected, so no track is born — that
+needs SEARCH (`docs/search_design.md`).
 
 ## 6. Clutter (`clutter_rate`) — the real cost of association
 
@@ -736,25 +741,25 @@ Recall by match gate, at three coast budgets:
 | TRUE policy | 80 | 0.481 | 0.584 | 0.597 | 0.597 |
 | **LEARNED** | 80 | **0.509** | 0.568 | **0.609** | 0.609 |
 
-Two conditions, both necessary, neither sufficient:
+Two factors, which play different roles:
 
-* **The coast budget.** At `max_misses=5` every motion model scores 0.331,
-  including a perfect one. Measured invisibility gaps last a median **74
-  steps** (deterministic) / **88** (stochastic), and only 14% / 0% are
-  within 5 steps — so a 5-step budget can cover at most a few percent of a
-  gap no matter how good the prediction is. This is a CONFIGURATION
-  change, and it is what unlocks everything else.
-* **The match gate.** 5 m is a MOT evaluation convention, not an
-  operational requirement. What a blue needs is "point me somewhere that
-  puts the target inside my sensor disk", and the sensor radius is 40 m.
-  Relaxing the gate lifts even constant velocity (0.346 → 0.509).
+* **The coast budget is necessary.** At `max_misses=5` every motion model
+  scores 0.331, including a perfect one. Measured invisibility gaps last a
+  median **74 steps** (deterministic) / **88** (stochastic), and only
+  14% / 0% are within 5 steps — so a 5-step budget can cover at most a few
+  percent of a gap no matter how good the prediction is. This is a
+  CONFIGURATION change, and without it nothing else registers.
+* **The match gate changes what is being measured, not whether the model
+  helps.** The learned model gains at the tight 5 m gate too (0.346 →
+  0.509). 5 m is a MOT evaluation convention; what a blue needs is closer
+  to "put the target inside my sensor disk" (40 m radius). Relaxing the
+  gate lifts constant velocity as well (0.346 → 0.509 at 40 m).
 
 The learned model reaches, and at the tight gate slightly exceeds, the
-TRUE-policy oracle (0.509 vs 0.481 at 5 m). Not a paradox: the oracle
-queries the policy at the red's TRUE position but applies the answer to a
-component that has already drifted, so it is internally inconsistent. The
-learned model queries its OWN estimated state, which is exactly the
-question a motion model should answer.
+TRUE-policy oracle (0.509 vs 0.481 at 5 m, one 6-episode run). A possible
+reason, not verified: the oracle queries the policy at the red's TRUE
+position but applies the answer to a component that may already have
+drifted, whereas the learned model queries its own estimated state.
 
 Drift while coasting, stochastic red, `max_misses=80`:
 
@@ -768,31 +773,38 @@ The error SATURATES rather than growing. This is worth stating because an
 earlier argument here was that bridging an N-step gap within tolerance D
 requires velocity accuracy better than `D/N` — 0.068 m/s for N = 74,
 against the tracker's 0.35–0.40 — and therefore that no model could
-bridge. That reasoning assumed the error integrates from a fixed initial
-velocity error. It does not: a motion model that reproduces the policy
-re-derives the correct velocity every step, so the error stays at whatever
-it was when the coast began. The arithmetic only describes constant
-velocity, which is precisely the model that has no way to correct itself.
+bridge. The measured drift contradicts that argument. The likely reason
+is that it assumed the error integrates from a fixed initial velocity
+error, whereas a motion model that tracks the policy keeps pulling the
+velocity back toward the right one. Caveat on the TRUE-policy row: the
+oracle reads the red's true position every step, so its bounded drift is
+partly because it is fed truth; the LEARNED row has no such access and
+still stays around 5 m.
 
 ### 11.2 Three adapter bugs, and why each was invisible in one step
 
 **(a) Top-k cells are not modes.** Training uses SOFT LABELS that smear
-mass onto adjacent bins, so the k most probable cells are one mode sampled
-k times. The tracker's merge gate correctly folded them into a single
-component: measured mean **1.01 components per track**, i.e. the entire
-Gaussian-Sum machinery inert. Compounding it, with 181 classes and a ~7%
-peak the top 4 cells hold only ~20% of the mass, so a 0.9 mass threshold
-was never reachable and ~80% of the distribution — all of it tail — was
-discarded. Branch covariances then described a far narrower belief than
-the model had predicted: NEES 6.6 against a target of 4.0.
+mass onto adjacent bins, so the k most probable cells tend to be one mode
+sampled k times. And with 181 classes and a ~7% peak, truncating to the
+top k (with `max_branches` binding before the 0.9 mass threshold) discards
+most of the distribution — an estimate, the top-k mass was never measured
+directly. Branch covariances then described a narrower belief than the
+model predicted: NEES 6.6 against a target of 4.0.
 
 Fixed by splitting the categorical into BASINS around local maxima of the
 heading marginal and assigning every heading bin to its nearest kept peak.
 Nothing is discarded; `max_branches` now controls how finely modes are
-resolved, not how much of the distribution survives. NEES 6.6 → 5.0.
-Heading defines the modes because this adversary's multimodality is a
-left/right commitment; magnitude is ordinal and unimodal within a
-direction, so splitting on it would manufacture near-duplicates.
+resolved, not how much of the distribution survives. Measured, with
+everything else unchanged: NEES 6.6 → 5.0. Heading defines the modes
+because the multimodality seen for this adversary is a split in direction
+(nearest-blue ties, §11.4; commitment side); magnitude is ordinal, so
+splitting on it would manufacture near-duplicates.
+
+*Correction:* an earlier version of this paragraph blamed top-k for the
+**1.01 components per track** measured at the time. That was wrong — with
+basins it was still 1.02. The collapse has a different cause, found later
+(§11.4): branches are only ~0.3 m apart after one step, inside each
+component's own spread, so they are merged whatever the branching rule.
 
 **(b) The wrong integration gain.** `PursuitEnv._integrate` advances the
 position with the NEW velocity:
@@ -835,10 +847,10 @@ excuses anything):
 | tracker estimate (what really happens) | 14.5° | 32.4° | 113.7° |
 
 The tracker's state costs +6.5°, of which ~4.9° comes from VELOCITY error
-(0.35–0.40 m/s) and only ~1.6° from position. Notably, the red policy does
-not read velocity at all — the network uses it as the only observable
-trace of the adversary's hidden state (AR(1) phase, commitment), so a
-better velocity estimate should pay off directly.
+(0.35–0.40 m/s) and only ~1.6° from position (measured with model v2).
+The red policy itself does not read velocity, so whatever the network
+extracts from it is presumably a trace of the adversary's hidden state
+(AR(1) phase, commitment) — plausible, not verified.
 
 **And the model supplies that itself.** A track is born with velocity from
 DOPPLER fusion — weighted least squares on the radial components, so with
@@ -869,10 +881,10 @@ perfect inputs on a perfectly predictable target**.
 
 Training 3× longer (120 epochs, val loss 3.928 → 3.736, converged — train
 3.62 vs val 3.75, plateaued from epoch ~104) sharpened the median 8.0° →
-7.1° and made the p90 **worse**, 100° → 121°. That rules out underfitting:
-the model is not hesitant on those states, it is confidently wrong, and
-more training makes it more confident. Downstream, v3 buys tighter
-localisation (MOTP 3.07 → 2.65) and no extra recall.
+7.1° and made the p90 **worse**, 100° → 121°. So the tail is not simply
+underfitting: on those states the model is confidently wrong, and more
+training made it more so. Downstream, v3 buys tighter localisation (MOTP
+3.07 → 2.65) and no extra recall.
 
 ### 11.4 The tail is the policy's discontinuity, and the mixture already holds the answer
 
@@ -890,18 +902,25 @@ the two nearest blues (`d2/d1`, so 1.0 is a perfect tie):
 | > 2.00 | 210 | 8.4° | 30.8° | 8.0° | 25.7° |
 | ALL | 4320 | 15.7° | 93.6° | 11.9° | 46.1° |
 
-The tail concentrates exactly where predicted, and that bucket is a THIRD
-of all samples. Two conclusions:
+(Measured with model v3 at TRUE positions, stochastic and deterministic
+reds pooled.) The tail concentrates at near-ties, and that bucket is a
+THIRD of all samples. What this does and does not show:
 
-* The tail is **irreducible pointwise**. No capacity predicts which side
-  of a tie you are on; the information is not in the state. It is not a
-  training defect and cannot be trained away — as the 120-epoch run
-  demonstrated by making it worse.
-* The mixture **already carries the right answer**: at a near-tie the best
-  branch is p90 37° against the top mode's 134°. This is the EPISTEMIC
-  multimodality §8.3 predicted, and it retroactively justifies the joint
-  categorical + basins + Gaussian Sum instead of a single regressed
-  heading.
+* It is **hard to learn, not impossible**. For a deterministic red the
+  nearest blue is a deterministic function of exact positions, so the
+  information *is* in the state; what makes it hard is that the answer
+  jumps discontinuously across the tie, which a smooth network fits
+  poorly. *(An earlier version said "the information is not in the state"
+  and "cannot be trained away" — both wrong for exact inputs; the
+  120-epoch run shows only that more of the same training did not help.)*
+  Where it genuinely becomes ambiguous is at inference: with ~1 m of
+  tracker position error, a near-tie can fall either way — epistemic
+  uncertainty in the §8.3 sense.
+* The predicted categorical **contains** the right direction: at a
+  near-tie the best branch is p90 37° against the top mode's 134°. That is
+  the kind of multimodality the joint categorical can represent — but, as
+  the rest of this section shows, the tracker's mixture does not currently
+  exploit it.
 
 Which raises the question of why the mixture is not visibly doing this
 work:
@@ -969,22 +988,22 @@ saturating the cap — and the metrics do not move: MOTA 0.52 → 0.52, recall
 0.580 → 0.581. Only IDF1 (0.60 → 0.62), IDSW (27 → 24) and MOTP (2.65 →
 2.59) shift, all marginally.
 
-That closes the question the clean way: **merging was not destroying
-information**. Keeping 30 near-identical Gaussians costs 30× the compute
-and buys nothing, because the branches carry no distinguishable
-information at a one-step horizon. Note `max_components=32` makes MOTP
-*worse* (2.84 vs 2.59) — the readout is the dominant component, and among
-many near-identical ones the dominant can be a slightly worse branch.
-More hypotheses without real separation is noise, not information.
+So, in this setup, **merging was not destroying useful information**:
+keeping up to ~30 near-identical Gaussians multiplies the per-step work
+and buys essentially nothing, consistent with the branches being
+indistinguishable at a one-step horizon. `max_components=32` gave a worse
+MOTP (2.84 vs 2.59); one possible reason, not verified, is that the
+readout takes the dominant component, which among many near-identical
+ones can be a slightly worse branch.
 
-`merge_gate = 0.25` (merge only true duplicates) is the small free win:
-best MOTA and lowest IDSW at 1.54 components.
+`merge_gate = 0.25` scored marginally best (MOTA 0.53, IDSW 21 at 1.54
+components) — in a single 6-episode run, within noise of the others.
 
 An uncomfortable corollary: with 1.01 components per track the mixture has
-been **inert throughout**, so the entire measured gain (MOTA 0.19 → 0.52)
-comes from the better MEAN prediction, not from the Gaussian Sum. That is
-reassuring about the gain's robustness — it does not depend on the fragile
-part — but the branching machinery currently earns nothing.
+been essentially **inert**, so the measured gain (MOTA 0.19 → 0.52) is
+attributable to the better MEAN prediction rather than to the Gaussian
+Sum. The gain therefore does not depend on the branching machinery — which
+currently earns nothing measurable.
 
 ### 11.5 Tuning: sigma_a_model, and the coast budget
 
@@ -1054,19 +1073,19 @@ on the budget. At a long budget the current setting is conservative.
   Disabling merging entirely lets the hypotheses persist (1.01 → 28.8
   components) and changes recall by 0.001. The branches are not
   distinguishable at a one-step horizon, so neither `merge_gate` tuning
-  nor an IMM has a measured case behind it. All of the gain is the mean
-  prediction. `merge_gate = 0.25` is a small free win (best MOTA, lowest
-  IDSW) and the only change indicated here.
+  nor an IMM has a measured case behind it. The measured gain is
+  attributable to the mean prediction. `merge_gate = 0.25` was marginally
+  best in one 6-episode run, within noise.
 * ~~`sigma_a_model`~~ and ~~`max_misses`~~ — measured in §11.5. Adopted
   0.35 and 80. Neither is applied as a DEFAULT yet: `max_misses` is a
   tracker-wide default that the belief-map and policy paths also consume,
   so changing it is a production decision, not a diagnostics one.
 * **Velocity estimation** is worth attention: it contributes ~4.9° of the
-  +6.5° input penalty (§11.3), and the red policy does not even read
-  velocity — the network uses it only as the observable trace of the
-  adversary's hidden state.
-* More network capacity is NOT indicated. It converged, and the remaining
-  error is epistemic (§11.4).
+  +6.5° input penalty (§11.3), even though the red policy itself does not
+  read velocity.
+* More of the same training is not indicated: the model converged (§11.3).
+  Whether more capacity or a representation better suited to the
+  nearest-blue discontinuity would reduce the tail was not tested (§11.4).
 * Obstacle geometry is ground truth in these rows; deployment reads the
   obstacle tracker.
 * **The remaining budget is SEARCH**, and it is a separate line of work:

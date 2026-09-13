@@ -288,45 +288,41 @@ class GNNEncoder(nn.Module):
             # and they ride the same per-edge multiply slot the masks use
             # so the aggregation mechanism itself is untouched.
             #
-            # Why weights at all: there are ~25 region nodes against 14
-            # other edges, so a plain index_add_ SUM would let coverage
-            # dominate the blue's aggregate by sheer count, and its
-            # magnitude would scale with R^2 — turning a RESOLUTION knob
-            # into a gradient-scale knob.
+            # Why normalise: there are K = R*R region nodes per blue
+            # against 11 other edges (4 bb + 3 rb + 4 ob in the
+            # 5-blue/3-red/4-obstacle configuration), so an unnormalised
+            # index_add_ SUM would grow with K — making the resolution R
+            # also a scale knob on this pathway.
             #
-            # A uniform MEAN fixes the scale but not the content, and the
-            # reason is sharper than "the signal gets diluted".  With
+            # Side effect, measured and NOT a deliberate choice: with
+            # weights summing to 1 the coverage term is a convex
+            # combination (about one message's worth) while bb/rb/ob are
+            # raw sums of 3-4 messages each, so at initialisation it is
+            # only ~9% of the aggregate's norm (scratch/type_balance.py).
+            # Weights also depend only on the REGION, not on the receiving
+            # blue, so every blue gets the same mixture.
+            #
+            # Why staleness x searchable rather than uniform 1/K:  with
             # EQUAL weights the aggregate is, to first order,
-            # A*mean(h_region) + B*mean(e_gb): it depends on the staleness
-            # field ONLY THROUGH ITS MEAN.  "Which region is stale" lives
-            # in the staleness x geometry INTERACTION, which a sum of
-            # per-edge MLP outputs can express only through its
-            # non-linearity — a small effect.
+            # A*mean(h_region) + B*mean(e_gb), i.e. it depends on the
+            # staleness field only through its MEAN; "which region is
+            # stale" can enter only via the MLP's non-linearity.  Measured
+            # at initialisation (scratch/region_agg_mechanism.py), shuffling
+            # WHICH regions are stale moves the uniformly-averaged
+            # aggregate by 0.6%, while shifting the overall LEVEL moves it
+            # by 17.7%.  Multiplying by staleness makes the arrangement
+            # enter at first order — the weighted aggregate's larger
+            # response to that shuffle (21%) follows by construction and is
+            # not evidence of usefulness.
             #
-            # Measured (scratch/region_agg_mechanism.py), relative change
-            # in the aggregate under two probes:
-            #
-            #   probe     what changes           uniform   weighted
-            #   PERMUTE   WHICH region is stale   0.0059     0.2131
-            #   SHIFT     the overall LEVEL       0.1767     0.1555
-            #
-            # So a uniform mean sees the LEVEL of staleness and is blind
-            # to its LOCATION (36x less responsive to arrangement) — and
-            # location is the entire content a search policy needs.  The
-            # level it does see is itself redundant: the whole arena ages
-            # together, so it tracks elapsed time, which the blue already
-            # has in its time_col feature.
-            #
-            # Weighting puts staleness into the WEIGHTS, which multiply
-            # the geometry-carrying message, making that interaction
-            # explicit and first-order.  Zero parameters, and the limits
-            # are right: a uniform field gives uniform weights (correctly
-            # — no preference), a structured one concentrates on what is
-            # actually unexplored.  Uniform weights recover the plain mean
-            # and learned attention would contain both, so the three are
-            # nested and ablate cleanly.  (Measured with an UNTRAINED
-            # encoder: this is accessibility at initialisation, which is
-            # what decides whether the pathway can start learning.)
+            # NOT ESTABLISHED: that this weighting, or the coverage path at
+            # all, improves search.  The staleness weight is a function of
+            # the region's own two features, so it adds no information, only
+            # a different inductive bias.  Downstream decodability probes
+            # were inconclusive (docs/search_design.md §5).  Only training
+            # can settle it.  Uniform weights recover the plain mean and
+            # learned attention would contain both, so they ablate as one
+            # variable.
             if has_region:
                 h_send_gb = h_region.index_select(1, self.gb_src)
                 h_recv_gb = h_blue.index_select(1, self.gb_dst)

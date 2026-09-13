@@ -336,32 +336,36 @@ class LearnedRedMotion:
                                                       np.ndarray]]:
         """Split the categorical into MODES, keeping ALL of the mass.
 
-        Two things make the obvious "take the top-k cells" wrong, and both
-        were measured rather than reasoned about:
+        Why not "take the top-k cells":
 
-        * Training uses SOFT LABELS that deliberately smear mass onto
-          neighbouring bins, so the k most probable cells are almost always
-          ONE mode sampled k times, not k modes.  Fed to the tracker they
-          are near-duplicates, the merge gate correctly folds them into a
-          single component, and the mixture machinery does nothing at all
-          (measured: mean 1.01 components per track).
-        * With 181 classes and a peak around 7%, the top 4 cells hold only
-          ~20% of the mass.  Truncating there discards the tails, so the
-          branch covariance reflects a far narrower distribution than the
-          model actually predicted — measured NEES 6.6 against a target of
-          4.0, i.e. badly overconfident, which is the direction that kills
-          tracks.
+        * Training uses SOFT LABELS that smear mass onto neighbouring bins,
+          so the k most probable cells tend to be ONE mode sampled k times
+          rather than k modes.
+        * Top-k with a mass threshold throws away whatever lies outside the
+          k cells.  With 181 classes and a ~7% peak that is most of the
+          distribution (estimated, not measured), so the branch covariance
+          describes a narrower belief than the model predicted.  Measured
+          effect of switching from top-k to basins, everything else fixed:
+          NEES 6.6 -> 5.0 against a target of 4.0.
+
+        What this change did NOT fix, contrary to the first reading: the
+        tracker still averaged ~1.0 components per track afterwards (1.02).
+        The collapse is not caused by top-k.  Branches whose accelerations
+        differ are still only ~0.3 m apart after one step, inside every
+        component's own spread, so the merge gate folds them whatever the
+        branching rule (docs/tracking_diagnostics.md §11.4).
 
         So: find local maxima of the HEADING marginal, keep the strongest
         ``max_branches`` of them, and assign EVERY heading bin to its
-        nearest kept peak.  No mass is discarded; each branch is a genuine
-        mode carrying its own basin's weight, mean and spread.
+        nearest kept peak.  No mass is discarded; each branch carries its
+        own basin's weight, mean and spread.
 
         Heading, not the joint grid, defines the modes: the multimodality
-        this adversary actually produces is a left/right commitment, which
-        is a split in DIRECTION.  Magnitude is ordinal and unimodal within
-        a direction, so splitting on it would manufacture branches that
-        differ only in effort — exactly the near-duplicates to avoid.
+        seen for this adversary is a split in DIRECTION (e.g. which blue is
+        nearest near a distance tie, or which side a commitment deflects
+        to).  Magnitude is ordinal and unimodal within a direction, so
+        splitting on it would manufacture branches differing only in
+        effort.
         """
         grid = probs[:ZERO_CLASS].reshape(N_HEADING_BINS, N_MAGNITUDE_BINS)
         ph = grid.sum(axis=1)                       # heading marginal
@@ -412,9 +416,9 @@ class LearnedRedMotion:
         The velocity cap is AXIS-WISE (matching the env, which clips the
         components, not the magnitude) and is what stops a coasting track
         accelerating without bound: applied every step, an uncapped unit
-        acceleration reaches 80 m/s over an 80-step coast and throws the
-        estimate a thousand metres outside a 130 m arena.  Measured
-        exactly that before the cap was added.
+        acceleration reaches 80 m/s over an 80-step coast.  The evaluation
+        oracle, which had the same missing cap, measured a median drift of
+        ~1170 m at 51-80 misses in a 130 m arena.
 
         Arena clipping is deliberately NOT applied.  It is a hard
         non-linearity that would bias the mixture at the boundary, and a

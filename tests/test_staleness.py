@@ -7,7 +7,7 @@ Two things carry real risk here and are pinned accordingly.
 1. The geometry must be the SAME geometry the belief update uses.
    ``_observed_cells_mask`` deliberately duplicates it rather than
    refactoring the proven per-blue loop (which interleaves occlusion with
-   RNG draws, so restructuring would reorder the random stream).  A
+   RNG draws, so restructuring risks reordering the random stream).  A
    duplicate that can drift silently is worse than no duplicate, so the
    agreement is asserted directly.
 

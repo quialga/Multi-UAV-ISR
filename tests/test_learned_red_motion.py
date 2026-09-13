@@ -180,9 +180,10 @@ def test_branch_weights_sum_to_one_so_no_weight_flows_between_parents():
 
 def test_branches_keep_all_of_the_probability_mass():
     """The defining property of basin splitting over top-k: NOTHING is
-    discarded.  Truncating to the k most probable cells threw away ~80% of
-    the distribution and made the branch covariance badly overconfident
-    (measured NEES 6.6 against a target of 4.0)."""
+    discarded.  Truncating to the k most probable cells throws away the
+    tails (most of the mass, by estimate) and made the branch covariance
+    overconfident: measured NEES 6.6 with top-k vs 5.0 with basins, target
+    4.0."""
     ad = _adapter(max_branches=3)
     ad.set_context(blue_pos=np.array([[45.0, 45.0]]), blue_vel=np.zeros((1, 2)))
     probs = ad.predict_probs(np.array([65.0, 65.0]), np.array([0.3, 0.2]))
@@ -255,9 +256,10 @@ def test_prediction_matches_the_env_integration_exactly():
     ``p' = p + v'*dt`` -- so the position gain is dt^2, not the textbook
     dt^2/2, and the velocity is capped AXIS-WISE.  Getting either wrong is
     invisible in a single step and ruinous over a coast: the textbook gain
-    predicts half a metre short per step, and an uncapped velocity reaches
-    80 m/s over an 80-step coast, throwing the estimate a thousand metres
-    outside a 130 m arena.  Both were measured before this test existed.
+    predicts half a metre short per step at full acceleration, and an
+    uncapped velocity reaches 80 m/s over an 80-step coast.  The evaluation
+    oracle, which shared both bugs, drifted ~1170 m (median) at 51-80
+    misses before they were fixed.
     """
     from isr.env.entities import RED_TARGET
 

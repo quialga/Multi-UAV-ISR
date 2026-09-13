@@ -274,12 +274,13 @@ def main() -> None:
             print(f"  components per track: mean {branches.mean():.2f}  "
                   f"p90 {np.percentile(branches, 90):.0f}  "
                   f"max {branches.max()}")
-        print("  NEES above 4.0 means the branches are OVERCONFIDENT: raise")
-        print("  sigma_a_model.  Overconfidence here is the dangerous")
-        print("  direction -- a tight gate rejects true detections, tracks")
-        print("  die, and recall falls BELOW the constant-velocity rows,")
-        print("  which reads as 'the learned model is worse' when the real")
-        print("  fault is an untuned covariance.")
+        print("  NEES above 4.0 means the branches are OVERCONFIDENT (raise")
+        print("  sigma_a_model); below 4.0, under-confident (lower it).")
+        print("  Overconfidence is the dangerous direction -- a tight gate")
+        print("  rejects true detections and tracks die.  If the learned rows")
+        print("  lose to constant velocity, check calibration AND the branch")
+        print("  kinematics before blaming the model: an earlier negative")
+        print("  result here was entirely an integration bug.")
         print("  Obstacle geometry is ground truth in these rows; in")
         print("  deployment it comes from the obstacle tracker.")
 
