@@ -267,6 +267,51 @@ configuration shows fewer FP with clutter (559) than the same tracker
 without it (709). Occlusion used true obstacle geometry. Not yet
 re-checked with the learned motion model.
 
+### 6.2 The chosen configuration with the learned model, and its cost
+
+Chosen configuration: 3-of-4 with `confirm_deadline`, coverage-aware
+misses with an in-view budget of 3, `max_coast_steps` 80, clutter 0.2.
+Same 8 episodes × 150 steps (`scratch/tracker_timing.py`), both trackers
+stepping on the same detections:
+
+| motion model | MOTA | recall | FP | IDSW | Frag |
+|---|---|---|---|---|---|
+| constant velocity | 0.16 | 0.338 | 602 | 47 | 32 |
+| **learned (v3)** | **0.28** | **0.387** | **332** | 47 | 31 |
+
+The learned model holds up under clutter: MOTA +0.12, recall +15%, false
+positives −45%.
+
+Cost per env step, single torch thread (the relevant setting for env
+worker processes):
+
+| | mean | p95 |
+|---|---|---|
+| `env.step` | 2.30 ms | 3.29 ms |
+| `raw_detections` + `track_coverage` | 0.34 ms | — |
+| tracker, constant velocity | 0.69 ms | 1.76 ms |
+| tracker, learned | 6.13 ms | 11.89 ms |
+
+The learned tracker makes 3.1 motion-model calls per step (one per
+component, ~3.1 tracks alive), 1.6 ms each, and **81% of its time is inside
+those calls**. For a ~100k-parameter network that per-call cost is mostly
+per-sample Python overhead (building a feature dict, `featurize_shard` on
+one sample, tensor creation), so batching every call of a step into one
+featurise-and-forward is the obvious optimisation — expected to be
+several-fold, not measured.
+
+At the Stage 4 training configuration (16 envs × 320 steps × 1000
+rollouts = 5.12 M env steps), the learned tracker adds ~31 s of CPU per
+rollout — **~8.7 h over a run if envs step in-process** (`--n-workers 0`,
+the default), or roughly a sixteenth of that with 16 env workers. The CV
+tracker adds ~3.5 s per rollout. Policy inference and PPO update time were
+not measured, so these are added costs, not shares of the total.
+
+Caveats: a Windows laptop CPU, and noisy — the same run with torch's
+default 4 threads showed `env.step` at 4.4 ms, although `env.step` does not
+use torch, so run-to-run variance is large and the benefit of one thread
+cannot be cleanly separated from it. Random blue actions throughout.
+
 ## 7. The red is now STOCHASTIC (a scope decision)
 
 Everything from here assumes a stochastic evader — a deterministic one is
