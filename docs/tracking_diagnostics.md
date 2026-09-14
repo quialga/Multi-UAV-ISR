@@ -225,6 +225,29 @@ Checks that it does no harm: without clutter the coverage rows are
 identical to their counterparts on every metric, and with clutter IDSW and
 Frag go *down* — no sign of real tracks being killed on `p_TP` bad luck.
 
+**Confirmation deadline vs a tentative miss budget.** The two rules for
+tentatives overlap: M-of-N only PROMOTES, the miss budget only DELETES,
+but the budget's sensible value is fixed by the window (after N−1
+consecutive misses every earlier hit has left it), and set independently
+they can clash — a budget of 0 silently turns 3-of-4 into 3-of-3. They
+also leave a gap: a tentative that ALTERNATES hit and miss never confirms
+and never chains enough misses to die. `confirm_deadline` replaces the
+budget with "one full window to confirm, otherwise delete". Same sweep,
+coverage-aware, 3 in view:
+
+| | clutter | MOTA | FP | IDSW | tentatives / step | tentatives past their window / step |
+|---|---|---|---|---|---|---|
+| 3-of-4 + miss budget 3 | 0.2 | 0.17 | 559 | 47 | 2.05 | 0.227 |
+| 3-of-4 + deadline | 0.2 | 0.16 | 602 | 47 | 1.49 | 0.000 |
+| 3-of-4 + miss budget 3 | 0.5 | 0.06 | 925 | 51 | 5.26 | 1.224 |
+| 3-of-4 + deadline | 0.5 | 0.10 | 780 | 43 | 3.74 | 0.000 |
+
+The gap was real (0.23 lingering tentatives per step at 0.2, 1.2 at 0.5)
+and the deadline removes it entirely. At the operating point the two are
+close, the deadline slightly behind (FP +8%, one seed set — not
+distinguishable from noise here); under stress the deadline is clearly
+better. Without clutter they are identical.
+
 Caveats. The in-view budget is sharply sensitive: 6 gives back almost all
 of the gain, far more than doubling a phantom's lifetime would explain; a
 plausible but unverified reason is that a longer-lived phantom gets more

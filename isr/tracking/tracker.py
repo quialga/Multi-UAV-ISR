@@ -266,6 +266,7 @@ class MultiTargetTracker:
         doppler_gating: bool = False,
         gate_chi2_doppler: float = CHI2_99[3],
         max_coast_steps: Optional[int] = None,
+        confirm_deadline: bool = False,
     ) -> None:
         # Plug point for a LEARNED transition model.  A callable
         # (x, P) -> [(rel_weight, x_pred, P_pred), ...] — one branch per
@@ -422,6 +423,23 @@ class MultiTargetTracker:
         # steps_since_hit are then the same counter).
         self.max_coast_steps = (None if max_coast_steps is None
                                 else int(max_coast_steps))
+        # CONFIRMATION DEADLINE: a tentative track gets exactly one full
+        # confirmation window.  If it has not confirmed by the step its
+        # history first fills the window (age confirm_window - 1), it is
+        # deleted; a target still there is simply re-born from its next
+        # detection.  That is "evaluate M-of-N once, on the first window".
+        #
+        # Why it beats a consecutive-miss budget for tentatives:
+        # * no free parameter — the deadline IS the window, so it cannot
+        #   silently disagree with confirm_hits/confirm_window (a too-small
+        #   miss budget turns 3-of-4 into 3-of-3; a too-large one keeps
+        #   hopeless tentatives alive);
+        # * it closes a gap the miss budget cannot: a tentative that
+        #   ALTERNATES hit and miss never gathers enough hits to confirm
+        #   and never chains enough misses to die, so under any miss budget
+        #   >= 1 it lives indefinitely.
+        # Off by default.
+        self.confirm_deadline = bool(confirm_deadline)
         self.birth_cluster_dist = float(birth_cluster_dist)
         # Gaussian-Sum bookkeeping.  Inert under the default motion model
         # (which never branches, so no track ever holds >1 component) —
@@ -784,6 +802,11 @@ class MultiTargetTracker:
             alive = tr.misses <= budget
             if (self.max_coast_steps is not None
                     and tr.steps_since_hit > self.max_coast_steps):
+                alive = False
+            # Checked AFTER promotion, so the step that completes the first
+            # window is still the track's last chance to confirm.
+            if (self.confirm_deadline and not tr.confirmed
+                    and self.t - tr.born_at >= self.confirm_window - 1):
                 alive = False
             if alive:
                 survivors.append(tr)

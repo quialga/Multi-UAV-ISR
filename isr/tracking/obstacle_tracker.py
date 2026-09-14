@@ -153,6 +153,7 @@ class ObstacleTracker:
         oracle_association: bool = False,
         motion_model=None,
         max_misses_tentative: Optional[int] = None,
+        confirm_deadline: bool = False,
     ) -> None:
         # Plug point for a learned/explicit motion model (e.g. one that
         # predicts a wall bounce) — see the module docstring.  A callable
@@ -201,6 +202,9 @@ class ObstacleTracker:
         self.max_misses_tentative = (self.max_misses if max_misses_tentative
                                      is None else int(max_misses_tentative))
         assert self.max_misses_tentative >= 0
+        # Confirmation deadline — see MultiTargetTracker's identical
+        # parameter: one full window to confirm, otherwise delete.
+        self.confirm_deadline = bool(confirm_deadline)
         self.birth_cluster_dist = float(birth_cluster_dist)
 
         self.F = np.eye(5)
@@ -388,7 +392,11 @@ class ObstacleTracker:
                 tr.confirmed = True
             budget = (self.max_misses if tr.confirmed
                       else self.max_misses_tentative)
-            if tr.misses <= budget:
+            alive = tr.misses <= budget
+            if (self.confirm_deadline and not tr.confirmed
+                    and self.t - tr.born_at >= self.confirm_window - 1):
+                alive = False
+            if alive:
                 survivors.append(tr)
         self.tracks = survivors
 
