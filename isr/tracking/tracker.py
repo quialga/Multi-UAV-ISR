@@ -81,7 +81,7 @@ from isr.tracking.assignment import solve_gated
 from isr.tracking.kalman import joseph_update
 
 # Chi-square 99% quantiles.
-CHI2_99 = {1: 6.635, 2: 9.210, 4: 13.277}
+CHI2_99 = {1: 6.635, 2: 9.210, 3: 11.345, 4: 13.277}
 
 # A motion model may return several weighted branches per component:
 # (relative_weight, x_pred, P_pred).  Relative weights need not sum to 1 —
@@ -257,6 +257,8 @@ class MultiTargetTracker:
         min_component_weight: float = 1e-3,
         merge_gate: float = 4.0,
         max_misses_tentative: Optional[int] = None,
+        doppler_gating: bool = False,
+        gate_chi2_doppler: float = CHI2_99[3],
     ) -> None:
         # Plug point for a LEARNED transition model.  A callable
         # (x, P) -> [(rel_weight, x_pred, P_pred), ...] — one branch per
@@ -377,6 +379,34 @@ class MultiTargetTracker:
         self.max_misses_tentative = (self.max_misses if max_misses_tentative
                                      is None else int(max_misses_tentative))
         assert self.max_misses_tentative >= 0
+        # Gate (and cost) on POSITION + DOPPLER jointly, instead of position
+        # alone.  The radial velocity is already fused in the UPDATE; this
+        # also uses it to decide WHETHER a return belongs to a track.
+        # Clutter carries a meaningless Doppler, so a false plot must now
+        # match the track's predicted radial speed as well as its position
+        # — which both protects real tracks from having a clutter plot
+        # assigned to them on a scan where the real return was missed, and
+        # makes a clutter-born tentative need one more coincidence to
+        # confirm.
+        #
+        # The discrimination is only as good as the PREDICTED velocity, and
+        # with the constant-velocity model it is none at all: the calibrated
+        # process noise gives Q_vv = sigma_a^2 = 2.0 per axis after every
+        # predict (sd ~1.41 m/s), while clutter Doppler lies in [-1, 1], so
+        # the Doppler term can add at most ~2.9 to d^2 against a threshold
+        # of 11.3.  That is physics rather than tuning — the red accelerates
+        # up to 1 m/s^2 each step, so its radial speed really can change
+        # that much between scans.  It can only help with a motion model
+        # whose velocity prediction is confident, and then only as safely
+        # as that confidence is calibrated (an overconfident model would
+        # reject a real manoeuvre).  See tests/test_doppler_gating.py.
+        #
+        # Joint 3-D innovation [px, py, radial] with the full cross
+        # covariance, gated at chi^2 with 3 dof; returns without usable
+        # Doppler fall back to the 2-D position gate.  Off by default, so
+        # existing behaviour and the bit-exact non-regression tests hold.
+        self.doppler_gating = bool(doppler_gating)
+        self.gate_chi2_doppler = float(gate_chi2_doppler)
         self.birth_cluster_dist = float(birth_cluster_dist)
         # Gaussian-Sum bookkeeping.  Inert under the default motion model
         # (which never branches, so no track ever holds >1 component) —
@@ -481,18 +511,23 @@ class MultiTargetTracker:
 
     def _gate_pos(self, tr: Track, det: Dict):
         """Mahalanobis d^2 and the NLL cost of pairing a track with a
-        POSITION return, evaluated at the prediction — the BEST (minimum
-        cost) match over the track's components, so a multimodal track is
-        gated in if ANY of its hypotheses is consistent with the return.
-        For a single-component track this is the only candidate, so the
-        result is identical to the pre-Gaussian-Sum implementation.
+        return, evaluated at the prediction — on POSITION, or on position +
+        DOPPLER when ``doppler_gating`` is on (see ``_gate_measurement``).
+        Takes the BEST (minimum cost) match over the track's components, so
+        a multimodal track is gated in if ANY of its hypotheses is
+        consistent with the return.  With gating off and a single component
+        the result is identical to the pre-Gaussian-Sum implementation.
+
+        Costs of different dimension (2-D vs 3-D) are not comparable, but
+        within one blue's Hungarian problem every return has the same
+        Doppler availability in practice (a line of sight, and one shared
+        ``sensor_vel_noise_std``), so the columns stay homogeneous.
         """
-        R = np.eye(2) * det["sigma_pos"] ** 2
-        z = det["z_pos"].astype(np.float64)
+        H, R, z = self._gate_measurement(det)
         best_d2, best_cost = None, None
         for c in tr.components:
-            y = z - self.H_pos @ c.x
-            S = self.H_pos @ c.P @ self.H_pos.T + R
+            y = z - H @ c.x
+            S = H @ c.P @ H.T + R
             Si = np.linalg.inv(S)
             d2 = float(y @ Si @ y)
             # cost = d^2 + ln|S|: the log-determinant stops very uncertain
@@ -503,6 +538,35 @@ class MultiTargetTracker:
             if best_cost is None or cost < best_cost:
                 best_d2, best_cost = d2, cost
         return best_d2, best_cost
+
+    def _gate_measurement(self, det: Dict):
+        """(H, R, z) for gating: position only, or position + Doppler.
+
+        The joint form stacks the position rows with the radial row
+        ``[0, 0, u_x, u_y]``, so ``H P H^T`` carries the position-velocity
+        cross covariance — a track whose position and velocity errors are
+        correlated is scored consistently rather than as two independent
+        tests.  Doppler is used only when the return has a line of sight
+        and a positive radial sigma, the same condition the update uses.
+        """
+        sp2 = float(det["sigma_pos"]) ** 2
+        z_pos = det["z_pos"].astype(np.float64)
+        u = np.asarray(det["los"], dtype=np.float64)
+        if (self.doppler_gating and np.linalg.norm(u) > 1e-6
+                and det["sigma_radial"] > 0.0):
+            H = np.zeros((3, 4))
+            H[0, 0] = H[1, 1] = 1.0
+            H[2, 2:] = u
+            R = np.diag([sp2, sp2, float(det["sigma_radial"]) ** 2])
+            z = np.array([z_pos[0], z_pos[1], float(det["z_radial"])])
+            return H, R, z
+        return self.H_pos, np.eye(2) * sp2, z_pos
+
+    def _gate_threshold(self, det: Dict) -> float:
+        """chi^2 threshold matching the dimension ``_gate_measurement``
+        chose for this return."""
+        H, _, _ = self._gate_measurement(det)
+        return self.gate_chi2_doppler if H.shape[0] == 3 else self.gate_chi2
 
     def _update_track(self, tr: Track, det: Dict) -> None:
         """Update EVERY component with this detection, then Bayes-reweight
@@ -637,11 +701,12 @@ class MultiTargetTracker:
                 n, m = len(self.tracks), len(idxs)
                 cost = np.zeros((n, m))
                 gate = np.zeros((n, m), dtype=bool)
+                thresh = [self._gate_threshold(dets[k]) for k in idxs]
                 for i, tr in enumerate(self.tracks):
                     for j, k in enumerate(idxs):
                         d2, c = self._gate_pos(tr, dets[k])
                         cost[i, j] = c
-                        gate[i, j] = d2 <= self.gate_chi2
+                        gate[i, j] = d2 <= thresh[j]
                 for i, j in solve_gated(cost, gate):
                     assignments.append((i, idxs[j]))
 
