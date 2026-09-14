@@ -1072,6 +1072,24 @@ class PursuitEnv(ParallelEnv):
                         self.sensor_vel_noise_std * scale, truth_id=-1))
         return out
 
+    def track_coverage(self, k_sigma: float = 2.0):
+        """This scan's sensor coverage for the tracker's miss accounting
+        (``MultiTargetTracker.step(..., coverage=...)``).
+
+        Mirrors the detection chain in ``raw_detections``: range, then —
+        when ``track_occlusion`` is on — the exact occlusion test.  Uses the
+        blues' CURRENT positions, so call it after ``step()``, alongside
+        ``raw_detections()``.  Obstacle geometry here is ground truth; a
+        deployed system would use the obstacle tracker's estimates.
+        """
+        from isr.tracking.coverage import sensor_coverage
+        if self.sensor_radius is None:
+            return None
+        occluded = (self._rays_occluded_by_obstacles
+                    if self.track_occlusion else None)
+        return sensor_coverage(self._blue_pos.copy(), self.sensor_radius,
+                               occluded=occluded, k_sigma=k_sigma)
+
     def _make_return(self, b, bp, z_pos, los, z_rad, s_pos, s_rad, truth_id):
         return {
             "blue": int(b),

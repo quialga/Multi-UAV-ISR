@@ -195,7 +195,13 @@ class Track:
         self.components: List[_Component] = [_Component(w, x, P)]
         self.born_at = t
         self.history: List[bool] = []      # hit / miss, most recent last
-        self.misses = 0                    # CONSECUTIVE misses
+        # CONSECUTIVE misses that COUNT toward death.  Without a coverage
+        # model every miss counts; with one, a confirmed track's misses
+        # count only when it should have been seen (see step()).
+        self.misses = 0
+        # Steps since the last hit, counting EVERY miss — the track's plain
+        # staleness, whatever the coverage model decided about each miss.
+        self.steps_since_hit = 0
         self.confirmed = False
 
     @property
@@ -259,6 +265,7 @@ class MultiTargetTracker:
         max_misses_tentative: Optional[int] = None,
         doppler_gating: bool = False,
         gate_chi2_doppler: float = CHI2_99[3],
+        max_coast_steps: Optional[int] = None,
     ) -> None:
         # Plug point for a LEARNED transition model.  A callable
         # (x, P) -> [(rel_weight, x_pred, P_pred), ...] — one branch per
@@ -407,6 +414,14 @@ class MultiTargetTracker:
         # existing behaviour and the bit-exact non-regression tests hold.
         self.doppler_gating = bool(doppler_gating)
         self.gate_chi2_doppler = float(gate_chi2_doppler)
+        # Absolute cap on steps since the last hit, whatever the coverage
+        # model decides.  Needed once a coverage model is in use: a
+        # confirmed track coasting OUT of coverage then accrues no counted
+        # misses at all and would otherwise live forever.  None = no cap,
+        # which without a coverage model is redundant anyway (misses and
+        # steps_since_hit are then the same counter).
+        self.max_coast_steps = (None if max_coast_steps is None
+                                else int(max_coast_steps))
         self.birth_cluster_dist = float(birth_cluster_dist)
         # Gaussian-Sum bookkeeping.  Inert under the default motion model
         # (which never branches, so no track ever holds >1 component) —
@@ -661,7 +676,17 @@ class MultiTargetTracker:
 
     # ---------------- the per-step loop ---------------- #
 
-    def step(self, detections: Sequence[Dict]) -> None:
+    def step(self, detections: Sequence[Dict], coverage=None) -> None:
+        """One scan.
+
+        ``coverage`` — optional callable ``(pos (2,), P_pos (2,2)) -> bool``
+        answering "would a target here certainly have been in some sensor's
+        view this scan?" (see ``isr.tracking.coverage``).  When given, a
+        CONFIRMED track's miss counts toward death only if the answer is
+        yes; a miss where nobody could have seen it says nothing about
+        whether the track exists.  None keeps the original behaviour, in
+        which every miss counts.
+        """
         self.t += 1
         self.last_nis = []
 
@@ -734,15 +759,21 @@ class MultiTargetTracker:
         # 6. COAST / DIE / PROMOTE.
         survivors: List[Track] = []
         for i, tr in enumerate(self.tracks):
-            if tr.born_at == self.t:          # just born this step
+            if tr.born_at == self.t or i in hit_tracks:   # born or hit
                 tr.history.append(True)
                 tr.misses = 0
-            elif i in hit_tracks:
-                tr.history.append(True)
-                tr.misses = 0
+                tr.steps_since_hit = 0
             else:
                 tr.history.append(False)
-                tr.misses += 1
+                tr.steps_since_hit += 1
+                # A confirmed track's miss counts only where it should have
+                # been seen.  Tentative tracks always count: the tentative
+                # budget already kills them in a few steps, and one that
+                # left coverage right after birth would otherwise freeze —
+                # never confirming, never dying.
+                if (coverage is None or not tr.confirmed
+                        or coverage(tr.pos, tr.P[:2, :2])):
+                    tr.misses += 1
             tr.history = tr.history[-self.confirm_window:]
             if not tr.confirmed and tr.hits >= self.confirm_hits:
                 tr.confirmed = True
@@ -750,7 +781,11 @@ class MultiTargetTracker:
             # confirm_hits on a step it was hit, which also reset misses to 0.
             budget = (self.max_misses if tr.confirmed
                       else self.max_misses_tentative)
-            if tr.misses <= budget:
+            alive = tr.misses <= budget
+            if (self.max_coast_steps is not None
+                    and tr.steps_since_hit > self.max_coast_steps):
+                alive = False
+            if alive:
                 survivors.append(tr)
         self.tracks = survivors
 
