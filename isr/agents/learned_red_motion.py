@@ -45,7 +45,7 @@ import numpy as np
 import torch
 
 from isr.agents.red_motion_features import (
-    ACCEL_SCALE, N_HEADING_BINS, N_MAGNITUDE_BINS, V_NORM, ZERO_CLASS,
+    ACCEL_SCALE, N_BINS, N_HEADING_BINS, N_MAGNITUDE_BINS, V_NORM, ZERO_CLASS,
     accel_to_bin, bin_to_accel, featurize_shard,
 )
 from isr.agents.red_motion_gnn import RedMotionGNN
@@ -282,11 +282,9 @@ class LearnedRedMotion:
         red->red edges (``run_from_nearest_uav`` provably never reads
         another red's state), so the computation factorises per red.
 
-        The assertion guards the natural optimisation of this method.  The
-        tracker calls the motion model once per COMPONENT, so this runs a
-        batch-of-one forward pass many times per step; batching the
-        components would be a real speedup, and a bare ``[0, 0]`` would
-        then silently return the first one instead of failing.
+        The assertion stops a bare ``[0, 0]`` from silently returning only
+        the first sample if this is ever handed a batch; batched callers
+        use ``predict_probs_batch``.
         """
         if self._ctx is None:
             raise RuntimeError(
@@ -301,8 +299,42 @@ class LearnedRedMotion:
                 raise RuntimeError(
                     f"expected one sample and one red node, got "
                     f"{tuple(logits.shape)}; [0, 0] would silently drop the "
-                    f"rest — batch the callers instead of indexing here")
+                    f"rest — use predict_probs_batch for batches")
             return torch.softmax(logits[0, 0], dim=-1).numpy().astype(np.float64)
+
+    def predict_probs_batch(self, red_pos: np.ndarray, red_vel: np.ndarray
+                            ) -> np.ndarray:
+        """The categorical for K query states at once, shape (K, N_BINS).
+
+        Exists for speed.  The tracker asks one question per COMPONENT per
+        step, and answering them one by one cost 1.6 ms each — mostly
+        per-sample overhead (building a feature dict, featurising one row,
+        creating tensors, dispatching a batch-of-one forward), not the
+        network's arithmetic.  Here every sample is still packed by the same
+        ``_pack`` and featurised by the same ``featurize_shard`` as the
+        single path — only concatenated first — so the train/serve
+        guarantee is unchanged, and there is one featurise and one forward.
+        """
+        if self._ctx is None:
+            raise RuntimeError(
+                "set_context() must be called before predicting: the red's "
+                "action depends on where the blues are this step")
+        red_pos = np.asarray(red_pos, dtype=np.float64).reshape(-1, 2)
+        red_vel = np.asarray(red_vel, dtype=np.float64).reshape(-1, 2)
+        K = len(red_pos)
+        if K == 0:
+            return np.zeros((0, N_BINS))
+        packs = [self._pack(red_pos[i], red_vel[i]) for i in range(K)]
+        batch = {k: np.concatenate([p[k] for p in packs], axis=0)
+                 for k in packs[0]}
+        f = featurize_shard(batch, arena_size=self.L)
+        with torch.no_grad():
+            logits = self.model(*[torch.from_numpy(f[k]) for k in _INPUT_KEYS])
+            if logits.shape[:2] != (K, 1):
+                raise RuntimeError(
+                    f"expected {K} samples and one red node, got "
+                    f"{tuple(logits.shape)}")
+            return torch.softmax(logits[:, 0], dim=-1).numpy().astype(np.float64)
 
     # ----------------------------------------------------------------- #
 
@@ -428,10 +460,10 @@ class LearnedRedMotion:
         v = np.clip(x[2:] + accel * self.dt, -self.v_max, self.v_max)
         return np.concatenate([x[:2] + v * self.dt, v])
 
-    def __call__(self, x: np.ndarray, P: np.ndarray
-                 ) -> List[Tuple[float, np.ndarray, np.ndarray]]:
-        """One Gaussian-Sum branch per MODE of the predicted categorical."""
-        probs = self.predict_probs(x[:2], x[2:])
+    def _branches(self, x: np.ndarray, P: np.ndarray, probs: np.ndarray
+                  ) -> List[Tuple[float, np.ndarray, np.ndarray]]:
+        """Branches for one component, given its categorical.  Shared by the
+        single and batched paths, so they cannot drift apart."""
         FPFt = self.F @ P @ self.F.T
         out: List[Tuple[float, np.ndarray, np.ndarray]] = []
         for w, accel, cov_a in self._basins(probs):
@@ -443,3 +475,24 @@ class LearnedRedMotion:
             P_pred = FPFt + self.G @ cov_a @ self.G.T
             out.append((float(w), x_pred, P_pred))
         return out
+
+    def __call__(self, x: np.ndarray, P: np.ndarray
+                 ) -> List[Tuple[float, np.ndarray, np.ndarray]]:
+        """One Gaussian-Sum branch per MODE of the predicted categorical."""
+        return self._branches(x, P, self.predict_probs(x[:2], x[2:]))
+
+    def predict_batch(self, xs, Ps
+                      ) -> List[List[Tuple[float, np.ndarray, np.ndarray]]]:
+        """``__call__`` for many components at once: one list of branches
+        per ``(x, P)``, in order.
+
+        The tracker uses this when present, making ONE network call per
+        step for every component of every track instead of one call each.
+        """
+        xs = [np.asarray(x, dtype=np.float64) for x in xs]
+        if not xs:
+            return []
+        states = np.stack(xs)
+        probs = self.predict_probs_batch(states[:, :2], states[:, 2:])
+        return [self._branches(x, P, probs[i])
+                for i, (x, P) in enumerate(zip(xs, Ps))]

@@ -312,6 +312,40 @@ default 4 threads showed `env.step` at 4.4 ms, although `env.step` does not
 use torch, so run-to-run variance is large and the benefit of one thread
 cannot be cleanly separated from it. Random blue actions throughout.
 
+**Batching the motion-model calls.** The tracker now calls
+`predict_batch(xs, Ps)` once per step for every component of every track
+when the model provides it (`MultiTargetTracker._predict_all`); the
+adapter packs each sample exactly as before, concatenates, and runs one
+featurise and one forward. Same run, same detections, one torch thread
+(`scratch/batching_timing.py`):
+
+| learned tracker | mean | vs `env.step` |
+|---|---|---|
+| one call per component | 12.80 ms | 3.0× |
+| one batched call per step | 7.17 ms | 1.7× |
+
+**1.79× faster**, with identical tracking (MOTA 0.28, recall 0.387, FP 332,
+IDSW 47 either way; equivalence pinned in `tests/test_motion_batching.py`).
+That is less than the several-fold expected above, and the breakdown says
+why — the batched cost still grows with the number of components
+predicted:
+
+| components / step | one call each | batched |
+|---|---|---|
+| 1–2 | 6.12 ms | 4.40 ms |
+| 3–5 | 15.61 ms | 8.05 ms |
+| 6+ | 27.83 ms | 16.02 ms |
+
+A single batched forward would be nearly flat in that count, so most of
+what remains is per-component work outside the network: packing each
+sample, basin splitting, branch construction, and the tracker's own
+reduce. Not profiled. Absolute timings in this run were slower than the
+previous one (`env.step` 4.3 ms against 2.3 ms), again machine noise, so
+the within-run ratios are what to rely on: applied to the estimate above,
+the learned tracker's added cost over a 1000-rollout run falls from ~8.7 h
+to roughly 5 h in-process, or on the order of 20 minutes with 16 env
+workers.
+
 ## 7. The red is now STOCHASTIC (a scope decision)
 
 Everything from here assumes a stochastic evader — a deterministic one is

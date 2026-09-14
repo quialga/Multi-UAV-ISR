@@ -519,6 +519,40 @@ class MultiTargetTracker:
                 c.w /= tot
         return comps
 
+    def _predict_all(self) -> None:
+        """PREDICT every track.
+
+        A motion model that also exposes ``predict_batch(xs, Ps)`` — one
+        list of branches per ``(x, P)``, in order — is asked about every
+        component of every track in a SINGLE call.  The branches, their
+        order and the per-track reduce are exactly those of the one-call-
+        per-component path below; only the number of calls changes.  That
+        matters for the learned model, where each individual call costs
+        far more in per-sample overhead than in arithmetic.
+        """
+        batch = getattr(self.motion_model, "predict_batch", None)
+        if batch is None or not self.tracks:
+            for tr in self.tracks:
+                self._predict_track(tr)
+            return
+        owner, xs, Ps = [], [], []
+        for ti, tr in enumerate(self.tracks):
+            for c in tr.components:
+                owner.append((ti, c.w))
+                xs.append(c.x)
+                Ps.append(c.P)
+        branch_lists = batch(xs, Ps)
+        if len(branch_lists) != len(xs):
+            raise RuntimeError(
+                f"predict_batch returned {len(branch_lists)} branch lists "
+                f"for {len(xs)} components")
+        children: List[List[_Component]] = [[] for _ in self.tracks]
+        for (ti, w_parent), branches in zip(owner, branch_lists):
+            for rel_w, xb, Pb in branches:
+                children[ti].append(_Component(w_parent * rel_w, xb, Pb))
+        for tr, comps in zip(self.tracks, children):
+            tr.components = self._reduce(comps)
+
     def _predict_track(self, tr: Track) -> None:
         new_components: List[_Component] = []
         for c in tr.components:
@@ -699,8 +733,7 @@ class MultiTargetTracker:
         self.last_nis = []
 
         # 1. PREDICT (per component, then reduce) -------------------------
-        for tr in self.tracks:
-            self._predict_track(tr)
+        self._predict_all()
 
         dets = list(detections)
         assigned_det = set()
