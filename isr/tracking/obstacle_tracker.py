@@ -152,7 +152,6 @@ class ObstacleTracker:
         birth_cluster_dist: float = 6.0,
         oracle_association: bool = False,
         motion_model=None,
-        max_misses_tentative: Optional[int] = None,
         confirm_deadline: bool = False,
     ) -> None:
         # Plug point for a learned/explicit motion model (e.g. one that
@@ -192,18 +191,14 @@ class ObstacleTracker:
         self.confirm_hits = int(confirm_hits)
         self.confirm_window = int(confirm_window)
         self.max_misses = int(max_misses)
-        # Separate TENTATIVE budget — see MultiTargetTracker's identical
-        # parameter.  The split matters even more here than for reds: a
-        # confirmed obstacle should essentially never be forgotten (it does
-        # not move, or patrols predictably, and its covariance barely grows
-        # with Q_r = 0), so the policy-facing config wants a very large
-        # max_misses — which under a shared budget would keep every
-        # clutter-born tentative alive just as long.  None = shared budget.
-        self.max_misses_tentative = (self.max_misses if max_misses_tentative
-                                     is None else int(max_misses_tentative))
-        assert self.max_misses_tentative >= 0
         # Confirmation deadline — see MultiTargetTracker's identical
-        # parameter: one full window to confirm, otherwise delete.
+        # parameter: one full window to confirm, otherwise delete, and when
+        # on it is the only rule that deletes a tentative.  It matters even
+        # more here than for reds: a confirmed obstacle should essentially
+        # never be forgotten (it does not move, or patrols predictably, and
+        # its covariance barely grows with Q_r = 0), so the policy-facing
+        # config wants a very large max_misses — which, without the
+        # deadline, would keep every spurious tentative alive just as long.
         self.confirm_deadline = bool(confirm_deadline)
         self.birth_cluster_dist = float(birth_cluster_dist)
 
@@ -390,12 +385,10 @@ class ObstacleTracker:
             tr.history = tr.history[-self.confirm_window:]
             if not tr.confirmed and tr.hits >= self.confirm_hits:
                 tr.confirmed = True
-            budget = (self.max_misses if tr.confirmed
-                      else self.max_misses_tentative)
-            alive = tr.misses <= budget
-            if (self.confirm_deadline and not tr.confirmed
-                    and self.t - tr.born_at >= self.confirm_window - 1):
-                alive = False
+            if tr.confirmed or not self.confirm_deadline:
+                alive = tr.misses <= self.max_misses
+            else:
+                alive = self.t - tr.born_at < self.confirm_window - 1
             if alive:
                 survivors.append(tr)
         self.tracks = survivors

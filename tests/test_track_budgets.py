@@ -1,16 +1,22 @@
 """
-tests/test_track_budgets.py — separate miss budgets for TENTATIVE and
-CONFIRMED tracks, in both the red and the obstacle tracker.
+tests/test_track_budgets.py — how tentative and confirmed tracks are deleted,
+in both the red and the obstacle tracker.
 
-Why the split exists: a confirmed track should coast long (the learned
-motion model holds a coasting red ~5 m from truth after 51-80 misses), a
-tentative one — most often born from a single clutter plot — should die
-fast.  A single shared budget cannot do both.
+Two rules, deliberately separate:
 
-The scenario that matters most is the last red-tracker test: under a long
-shared budget, a stale tentative track sits in the arena with an
-ever-growing gate and ABSORBS the first real detection that wanders into
-it, so a real target is tracked by a phantom's identity.
+* CONFIRMED tracks die on ``max_misses`` (with a coverage model, counting
+  only misses where they should have been seen), bounded by
+  ``max_coast_steps``.  They should coast long.
+* TENTATIVE tracks, with ``confirm_deadline``, get exactly one confirmation
+  window and are deleted if they have not confirmed by its end.  They
+  should die fast: most are born from a single clutter plot.
+
+The deadline replaced a separate consecutive-miss budget for tentatives,
+which overlapped with M-of-N (its sensible value is fixed by the window, and
+set independently it could turn 3-of-4 into 3-of-3) and left a gap: a
+tentative ALTERNATING hit and miss never confirmed and never died.  Both
+are pinned below, as is the failure that motivated treating tentatives
+differently at all: a stale phantom absorbing a real target.
 
 Run:
     pytest tests/test_track_budgets.py -v
@@ -43,81 +49,53 @@ def _obs(**kw):
     return ObstacleTracker(**base)
 
 
+def _drive(trk, pattern, v=(0.5, 0.0)):
+    """Step a single target through a hit/miss PATTERN ('T' = both blues
+    detect it, 'F' = no detections).  Returns the tracker."""
+    p, v = np.array([40.0, 40.0]), np.array(v)
+    for ch in pattern:
+        p = p + v
+        dets = ([red_det(BLUE_A, p, v, blue=0), red_det(BLUE_B, p, v, blue=1)]
+                if ch == "T" else [])
+        trk.step(dets)
+    return trk
+
+
 # --------------------------------------------------------------------- #
-#  Defaults preserve existing behaviour
+#  Default: original behaviour, one shared budget
 # --------------------------------------------------------------------- #
 
 @pytest.mark.parametrize("make", [_red, _obs])
-def test_unset_tentative_budget_falls_back_to_the_shared_one(make):
-    trk = make(max_misses=7)
-    assert trk.max_misses_tentative == 7
+def test_deadline_is_off_by_default(make):
+    assert make().confirm_deadline is False
 
 
-@pytest.mark.parametrize("make", [_red, _obs])
-def test_negative_tentative_budget_is_rejected(make):
-    with pytest.raises(AssertionError):
-        make(max_misses_tentative=-1)
+def test_without_the_deadline_a_tentative_lives_as_long_as_max_misses():
+    trk = _red(max_misses=5)
+    trk.step([red_det(BLUE_A, [40.0, 40.0], [0.0, 0.0], truth_id=-1)])
+    for _ in range(5):
+        trk.step([])
+    assert len(trk.tracks) == 1
+    trk.step([])
+    assert len(trk.tracks) == 0
 
 
 # --------------------------------------------------------------------- #
-#  Red tracker
+#  The motivating failure
 # --------------------------------------------------------------------- #
 
-def test_red_tentative_track_dies_on_its_own_short_budget():
-    """One spurious return, then silence.  With a long shared budget the
-    phantom lingers; with a short tentative budget it is gone after
-    max_misses_tentative + 1 empty steps."""
-    spurious = red_det(BLUE_A, [40.0, 40.0], [0.0, 0.0], truth_id=-1)
-
-    shared = _red()
-    split = _red(max_misses_tentative=2)
-    for trk in (shared, split):
-        trk.step([spurious])
-        assert len(trk.tracks) == 1 and not trk.tracks[0].confirmed
-
-    for _ in range(3):
-        shared.step([])
-        split.step([])
-    assert len(shared.tracks) == 1, "shared budget should keep the phantom"
-    assert len(split.tracks) == 0, "tentative outlived its short budget"
-
-
-def test_red_confirmed_track_keeps_the_long_budget():
-    trk = _red(max_misses_tentative=2)
-    p, v = np.array([50.0, 50.0]), np.array([0.5, 0.0])
-    for _ in range(4):                                   # establish + confirm
-        p = p + v
-        trk.step([red_det(BLUE_A, p, v, blue=0), red_det(BLUE_B, p, v, blue=1)])
-    assert len(trk.tracks) == 1 and trk.tracks[0].confirmed
-    for _ in range(30):                                  # well past 2
-        trk.step([])
-    assert len(trk.tracks) == 1, "confirmed track died on the tentative budget"
-
-
-def test_red_confirmed_track_still_dies_past_the_long_budget():
-    trk = _red(max_misses=5, max_misses_tentative=2)
-    p, v = np.array([50.0, 50.0]), np.array([0.5, 0.0])
-    for _ in range(4):
-        p = p + v
-        trk.step([red_det(BLUE_A, p, v, blue=0), red_det(BLUE_B, p, v, blue=1)])
-    assert trk.tracks[0].confirmed
-    for _ in range(6):
-        trk.step([])
-    assert len(trk.tracks) == 0, "confirmed track outlived max_misses"
-
-
-def test_stale_phantom_absorbs_a_real_target_under_a_shared_budget():
-    """The motivating failure.  A single clutter plot at X births a
-    tentative track.  Ten steps later a real target arrives at X.  Under a
-    long shared budget the phantom is still alive, its gate has grown with
-    every predict, and it takes the real detection — the real target ends
-    up tracked under the phantom's identity.  With a short tentative budget
-    the phantom is long gone and the real target gets its own track."""
+def test_stale_phantom_absorbs_a_real_target_without_the_deadline():
+    """A single clutter plot at X births a tentative track.  Ten steps later
+    a real target arrives at X.  With a long shared budget the phantom is
+    still alive, its gate grown by every predict, and it takes the real
+    detection — the real target ends up tracked under the phantom's
+    identity.  With the deadline the phantom is long gone and the real
+    target gets a track of its own."""
     x = np.array([40.0, 40.0])
     t_arrival = 10
 
     def run(tracker):
-        tracker.step([red_det(BLUE_A, x, [0.0, 0.0], truth_id=-1)])   # t=0
+        tracker.step([red_det(BLUE_A, x, [0.0, 0.0], truth_id=-1)])   # t=1
         for _ in range(t_arrival - 1):
             tracker.step([])
         v = np.array([0.3, 0.0])
@@ -132,30 +110,18 @@ def test_stale_phantom_absorbs_a_real_target_under_a_shared_budget():
 
     phantom_owner = run(_red())
     assert phantom_owner.born_at == 1, (
-        "under a shared long budget the stale phantom should have taken "
-        "the real target (born at the clutter step)")
+        "without the deadline the stale phantom should have taken the real "
+        "target (born at the clutter step)")
 
-    own = run(_red(max_misses_tentative=2))
+    own = run(_red(confirm_deadline=True))
     assert own.born_at > t_arrival - 1, (
-        "with a short tentative budget the real target must get a track "
-        "born when it actually arrived, not inherit a phantom")
+        "with the deadline the real target must get a track born when it "
+        "actually arrived, not inherit a phantom")
 
 
 # --------------------------------------------------------------------- #
-#  Confirmation deadline
+#  The deadline
 # --------------------------------------------------------------------- #
-
-def _drive(trk, pattern, v=(0.5, 0.0)):
-    """Step a single target through a hit/miss PATTERN ('T' = both blues
-    detect it, 'F' = no detections).  Returns the tracker."""
-    p, v = np.array([40.0, 40.0]), np.array(v)
-    for ch in pattern:
-        p = p + v
-        dets = ([red_det(BLUE_A, p, v, blue=0), red_det(BLUE_B, p, v, blue=1)]
-                if ch == "T" else [])
-        trk.step(dets)
-    return trk
-
 
 @pytest.mark.parametrize("pattern", ["TTT", "TTFT", "TFTT"])
 def test_deadline_lets_every_3_of_4_pattern_confirm(pattern):
@@ -187,19 +153,32 @@ def test_deadline_on_2_of_3_falls_at_age_2():
                            confirm_deadline=True), "TFF").tracks) == 0
 
 
-def test_alternating_tentative_lingers_under_a_miss_budget_but_not_a_deadline():
-    """The gap a consecutive-miss budget cannot close.  Alternating hit and
-    miss never gathers 3 hits in 4 (no confirmation) and never chains more
-    than one miss (no death), so under max_misses_tentative = 3 it lives
-    indefinitely.  With the deadline, no tentative ever outlives its first
-    window."""
+def test_deadline_ignores_max_misses_for_tentatives():
+    """The clash the deadline exists to remove.  With max_misses = 0 applied
+    to tentatives, any miss kills one, so 3-of-4 silently becomes 3-of-3 and
+    TFTT can never confirm.  With the deadline, tentatives answer to the
+    window alone and TFTT confirms."""
+    legacy = _drive(_red(confirm_hits=3, confirm_window=4, max_misses=0), "TFTT")
+    assert not any(t.confirmed for t in legacy.tracks), (
+        "without the deadline max_misses=0 should have killed the tentative")
+
+    trk = _drive(_red(confirm_hits=3, confirm_window=4, max_misses=0,
+                      confirm_deadline=True), "TFTT")
+    assert len(trk.tracks) == 1 and trk.tracks[0].confirmed
+
+
+def test_alternating_tentative_lingers_without_the_deadline_but_not_with_it():
+    """The gap a miss budget cannot close.  Alternating hit and miss never
+    gathers 3 hits in 4 (no confirmation) and never chains more than one
+    miss (no death), so without the deadline it lives indefinitely.  With
+    it, no tentative ever outlives its first window."""
     window = 4
     pattern = "TF" * 12
 
-    budget = _drive(_red(confirm_hits=3, confirm_window=window,
-                         max_misses_tentative=3), pattern)
-    assert any(not t.confirmed and budget.t - t.born_at > window - 1
-               for t in budget.tracks), "expected a lingering tentative"
+    legacy = _drive(_red(confirm_hits=3, confirm_window=window, max_misses=3),
+                    pattern)
+    assert any(not t.confirmed and legacy.t - t.born_at > window - 1
+               for t in legacy.tracks), "expected a lingering tentative"
 
     trk = _red(confirm_hits=3, confirm_window=window, confirm_deadline=True)
     p, v = np.array([40.0, 40.0]), np.array([0.5, 0.0])
@@ -212,19 +191,16 @@ def test_alternating_tentative_lingers_under_a_miss_budget_but_not_a_deadline():
                 f"tentative aged {trk.t - t.born_at} outlived its window")
 
 
-def test_deadline_alone_bounds_tentatives_whatever_the_miss_budget():
-    trk = _red(confirm_hits=3, confirm_window=4, confirm_deadline=True,
-               max_misses_tentative=80)
-    trk.step([red_det(BLUE_A, [40.0, 40.0], [0.0, 0.0], truth_id=-1)])
-    for _ in range(3):
-        trk.step([])
-    assert len(trk.tracks) == 0
-
-
 def test_deadline_does_not_touch_confirmed_tracks():
     trk = _drive(_red(confirm_hits=3, confirm_window=4, confirm_deadline=True),
                  "TTT" + "F" * 30)
     assert len(trk.tracks) == 1 and trk.tracks[0].confirmed
+
+
+def test_confirmed_track_still_dies_past_max_misses():
+    trk = _drive(_red(confirm_hits=3, confirm_window=4, confirm_deadline=True,
+                      max_misses=5), "TTT" + "F" * 6)
+    assert len(trk.tracks) == 0, "confirmed track outlived max_misses"
 
 
 # --------------------------------------------------------------------- #
@@ -240,24 +216,21 @@ def test_obstacle_deadline_deletes_a_tentative_that_fails_its_first_window():
                  if ch == "T" else [])
     assert len(trk.tracks) == 0
 
-def test_obstacle_tentative_track_dies_on_its_own_short_budget():
-    spurious = obs_det(BLUE_A, [40.0, 40.0], [0.0, 0.0], 5.0, truth_id=-1)
-    shared = _obs()
-    split = _obs(max_misses_tentative=2)
-    for trk in (shared, split):
-        trk.step([spurious])
+
+def test_obstacle_spurious_tentative_dies_by_the_deadline_despite_huge_max_misses():
+    trk = _obs(max_misses=1000, confirm_deadline=True)
+    trk.step([obs_det(BLUE_A, [40.0, 40.0], [0.0, 0.0], 5.0, truth_id=-1)])
     for _ in range(3):
-        shared.step([])
-        split.step([])
-    assert len(shared.tracks) == 1
-    assert len(split.tracks) == 0
+        trk.step([])
+    assert len(trk.tracks) == 0
 
 
 def test_seen_obstacle_is_not_forgotten_during_a_long_absence():
     """A static obstacle does not go anywhere, so a confirmed one must
-    survive a long stretch unobserved even with a short tentative budget —
-    the policy-facing config for obstacles is 'remember what you saw'."""
-    trk = _obs(max_misses=1000, max_misses_tentative=2)
+    survive a long stretch unobserved — the policy-facing config for
+    obstacles is 'remember what you saw', while the deadline still clears
+    spurious tentatives quickly."""
+    trk = _obs(max_misses=1000, confirm_deadline=True)
     c = np.array([70.0, 70.0])
     for _ in range(3):
         trk.step([obs_det(BLUE_A, c, [0.0, 0.0], 8.0, blue=0),

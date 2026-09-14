@@ -198,10 +198,11 @@ the same detections.
 
 What each lever does:
 
-* **Separate tentative budget** (`max_misses_tentative`): alive tentatives
-  fall 5× (4.37 → 0.80 per step) but false positives only 9%. It fixes the
-  cost and the phantom-absorption failure (`tests/test_track_budgets.py`),
-  not the confirmation rate.
+* **Separate tentative miss budget** (the "split" rows; a
+  `max_misses_tentative` parameter since removed — superseded by the
+  confirmation deadline below): alive tentatives fall 5× (4.37 → 0.80 per
+  step) but false positives only 9%. It fixed the cost and the
+  phantom-absorption failure, not the confirmation rate.
 * **3-of-4 confirmation**: FP −34% against 2-of-3, at one step of latency
   (recall 0.369 → 0.348). 3-of-5 was slightly worse — a longer window gives
   clutter more scans to collect its hits.
@@ -247,6 +248,13 @@ and the deadline removes it entirely. At the operating point the two are
 close, the deadline slightly behind (FP +8%, one seed set — not
 distinguishable from noise here); under stress the deadline is clearly
 better. Without clutter they are identical.
+
+The miss budget was therefore **removed**. With `confirm_deadline` on, the
+deadline is the only rule that deletes a tentative, and `max_misses`
+governs confirmed tracks alone — otherwise a small `max_misses` (such as
+the in-view budget of 3) would cut tentatives before their window ends and
+reopen the same clash. Without the deadline, tentatives fall under
+`max_misses` as originally.
 
 Caveats. The in-view budget is sharply sensitive: 6 gives back almost all
 of the gain, far more than doubling a phantom's lifetime would explain; a

@@ -83,7 +83,7 @@ V = np.array([0.5, 0.0])
 
 def _tracker(**kw):
     base = dict(dt=1.0, a_max=1.0, vel_prior_std=1.0, confirm_hits=2,
-                confirm_window=3, max_misses=3, max_misses_tentative=2)
+                confirm_window=3, max_misses=3, confirm_deadline=True)
     base.update(kw)
     return MultiTargetTracker(**base)
 
@@ -138,9 +138,11 @@ def test_max_coast_steps_still_bounds_an_out_of_view_track():
 
 
 def test_tentative_tracks_count_every_miss_regardless_of_coverage():
-    """A tentative that left view right after birth must not freeze."""
+    """Without the confirmation deadline, a tentative that left view right
+    after birth must still die under max_misses rather than freeze.  (With
+    the deadline its misses are irrelevant — the window decides.)"""
     never_seen = lambda pos, P: False
-    trk = _tracker()
+    trk = _tracker(confirm_deadline=False, max_misses=2)
     trk.step([det(BLUE_A, [40.0, 40.0], V)])
     assert not trk.tracks[0].confirmed
     for _ in range(3):

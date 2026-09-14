@@ -262,7 +262,6 @@ class MultiTargetTracker:
         max_components: int = 8,
         min_component_weight: float = 1e-3,
         merge_gate: float = 4.0,
-        max_misses_tentative: Optional[int] = None,
         doppler_gating: bool = False,
         gate_chi2_doppler: float = CHI2_99[3],
         max_coast_steps: Optional[int] = None,
@@ -369,24 +368,6 @@ class MultiTargetTracker:
         self.confirm_hits = int(confirm_hits)
         self.confirm_window = int(confirm_window)
         self.max_misses = int(max_misses)
-        # Separate budget for TENTATIVE tracks.  One max_misses for both
-        # couples two things that want opposite values: a CONFIRMED track
-        # should coast long (the learned motion model keeps a coasting track
-        # ~5 m from truth after 51-80 misses, docs §11.1), while a tentative
-        # one — most often born from a single clutter plot — should die
-        # fast.  Under a shared budget of 80, one spurious return would
-        # live 80 steps: predicted every step (a network forward each, with
-        # the learned model), gated and assigned against real returns, able
-        # to steal a real target's detection or confirm as a phantom.
-        #
-        # None keeps the shared budget, so existing behaviour is unchanged.
-        # confirm_window - 1 is the natural value: after that many
-        # consecutive misses the birth hit has left the window, so the
-        # track would need a full fresh set of hits anyway and is no
-        # longer closer to confirmation than a new birth.
-        self.max_misses_tentative = (self.max_misses if max_misses_tentative
-                                     is None else int(max_misses_tentative))
-        assert self.max_misses_tentative >= 0
         # Gate (and cost) on POSITION + DOPPLER jointly, instead of position
         # alone.  The radial velocity is already fused in the UPDATE; this
         # also uses it to decide WHETHER a return belongs to a track.
@@ -429,16 +410,25 @@ class MultiTargetTracker:
         # deleted; a target still there is simply re-born from its next
         # detection.  That is "evaluate M-of-N once, on the first window".
         #
-        # Why it beats a consecutive-miss budget for tentatives:
+        # When on, the deadline is the ONLY rule that deletes a tentative —
+        # max_misses then governs confirmed tracks alone.  Letting max_misses
+        # also cut tentatives would reopen the clash this replaces: a small
+        # max_misses (e.g. the coverage-aware in-view budget of 3) would
+        # delete tentatives before their window ends, silently turning
+        # 3-of-4 into something stricter.
+        #
+        # Why it replaced a separate consecutive-miss budget for tentatives
+        # (docs/tracking_diagnostics.md §6.1):
         # * no free parameter — the deadline IS the window, so it cannot
-        #   silently disagree with confirm_hits/confirm_window (a too-small
-        #   miss budget turns 3-of-4 into 3-of-3; a too-large one keeps
-        #   hopeless tentatives alive);
-        # * it closes a gap the miss budget cannot: a tentative that
+        #   disagree with confirm_hits/confirm_window (a budget of 0 turned
+        #   3-of-4 into 3-of-3; a large one kept hopeless tentatives alive);
+        # * it closes a gap a miss budget cannot: a tentative that
         #   ALTERNATES hit and miss never gathers enough hits to confirm
-        #   and never chains enough misses to die, so under any miss budget
-        #   >= 1 it lives indefinitely.
-        # Off by default.
+        #   and never chains enough misses to die, so under any budget >= 1
+        #   it lived indefinitely — measured 0.23 such tentatives per step
+        #   at clutter 0.2, 1.2 at 0.5; zero with the deadline.
+        # Off by default: tentatives then fall under max_misses like every
+        # other track, the original behaviour.
         self.confirm_deadline = bool(confirm_deadline)
         self.birth_cluster_dist = float(birth_cluster_dist)
         # Gaussian-Sum bookkeeping.  Inert under the default motion model
@@ -785,28 +775,27 @@ class MultiTargetTracker:
                 tr.history.append(False)
                 tr.steps_since_hit += 1
                 # A confirmed track's miss counts only where it should have
-                # been seen.  Tentative tracks always count: the tentative
-                # budget already kills them in a few steps, and one that
-                # left coverage right after birth would otherwise freeze —
-                # never confirming, never dying.
+                # been seen.  Tentative tracks always count, so that without
+                # the deadline one that left coverage right after birth
+                # still dies under max_misses instead of freezing.
                 if (coverage is None or not tr.confirmed
                         or coverage(tr.pos, tr.P[:2, :2])):
                     tr.misses += 1
             tr.history = tr.history[-self.confirm_window:]
             if not tr.confirmed and tr.hits >= self.confirm_hits:
                 tr.confirmed = True
-            # Order vs promotion cannot matter: a track only reaches
-            # confirm_hits on a step it was hit, which also reset misses to 0.
-            budget = (self.max_misses if tr.confirmed
-                      else self.max_misses_tentative)
-            alive = tr.misses <= budget
+            # Promotion is checked first, so the step that completes the
+            # first window is still a tentative's last chance to confirm.
+            if tr.confirmed:
+                alive = tr.misses <= self.max_misses
+            elif self.confirm_deadline:
+                # The deadline alone — see __init__ for why max_misses must
+                # not also cut tentatives.
+                alive = self.t - tr.born_at < self.confirm_window - 1
+            else:
+                alive = tr.misses <= self.max_misses
             if (self.max_coast_steps is not None
                     and tr.steps_since_hit > self.max_coast_steps):
-                alive = False
-            # Checked AFTER promotion, so the step that completes the first
-            # window is still the track's last chance to confirm.
-            if (self.confirm_deadline and not tr.confirmed
-                    and self.t - tr.born_at >= self.confirm_window - 1):
                 alive = False
             if alive:
                 survivors.append(tr)
