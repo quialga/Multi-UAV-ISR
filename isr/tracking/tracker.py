@@ -256,6 +256,7 @@ class MultiTargetTracker:
         max_components: int = 8,
         min_component_weight: float = 1e-3,
         merge_gate: float = 4.0,
+        max_misses_tentative: Optional[int] = None,
     ) -> None:
         # Plug point for a LEARNED transition model.  A callable
         # (x, P) -> [(rel_weight, x_pred, P_pred), ...] — one branch per
@@ -358,6 +359,24 @@ class MultiTargetTracker:
         self.confirm_hits = int(confirm_hits)
         self.confirm_window = int(confirm_window)
         self.max_misses = int(max_misses)
+        # Separate budget for TENTATIVE tracks.  One max_misses for both
+        # couples two things that want opposite values: a CONFIRMED track
+        # should coast long (the learned motion model keeps a coasting track
+        # ~5 m from truth after 51-80 misses, docs §11.1), while a tentative
+        # one — most often born from a single clutter plot — should die
+        # fast.  Under a shared budget of 80, one spurious return would
+        # live 80 steps: predicted every step (a network forward each, with
+        # the learned model), gated and assigned against real returns, able
+        # to steal a real target's detection or confirm as a phantom.
+        #
+        # None keeps the shared budget, so existing behaviour is unchanged.
+        # confirm_window - 1 is the natural value: after that many
+        # consecutive misses the birth hit has left the window, so the
+        # track would need a full fresh set of hits anyway and is no
+        # longer closer to confirmation than a new birth.
+        self.max_misses_tentative = (self.max_misses if max_misses_tentative
+                                     is None else int(max_misses_tentative))
+        assert self.max_misses_tentative >= 0
         self.birth_cluster_dist = float(birth_cluster_dist)
         # Gaussian-Sum bookkeeping.  Inert under the default motion model
         # (which never branches, so no track ever holds >1 component) —
@@ -662,7 +681,11 @@ class MultiTargetTracker:
             tr.history = tr.history[-self.confirm_window:]
             if not tr.confirmed and tr.hits >= self.confirm_hits:
                 tr.confirmed = True
-            if tr.misses <= self.max_misses:
+            # Order vs promotion cannot matter: a track only reaches
+            # confirm_hits on a step it was hit, which also reset misses to 0.
+            budget = (self.max_misses if tr.confirmed
+                      else self.max_misses_tentative)
+            if tr.misses <= budget:
                 survivors.append(tr)
         self.tracks = survivors
 

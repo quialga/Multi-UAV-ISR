@@ -152,6 +152,7 @@ class ObstacleTracker:
         birth_cluster_dist: float = 6.0,
         oracle_association: bool = False,
         motion_model=None,
+        max_misses_tentative: Optional[int] = None,
     ) -> None:
         # Plug point for a learned/explicit motion model (e.g. one that
         # predicts a wall bounce) — see the module docstring.  A callable
@@ -190,6 +191,16 @@ class ObstacleTracker:
         self.confirm_hits = int(confirm_hits)
         self.confirm_window = int(confirm_window)
         self.max_misses = int(max_misses)
+        # Separate TENTATIVE budget — see MultiTargetTracker's identical
+        # parameter.  The split matters even more here than for reds: a
+        # confirmed obstacle should essentially never be forgotten (it does
+        # not move, or patrols predictably, and its covariance barely grows
+        # with Q_r = 0), so the policy-facing config wants a very large
+        # max_misses — which under a shared budget would keep every
+        # clutter-born tentative alive just as long.  None = shared budget.
+        self.max_misses_tentative = (self.max_misses if max_misses_tentative
+                                     is None else int(max_misses_tentative))
+        assert self.max_misses_tentative >= 0
         self.birth_cluster_dist = float(birth_cluster_dist)
 
         self.F = np.eye(5)
@@ -375,7 +386,9 @@ class ObstacleTracker:
             tr.history = tr.history[-self.confirm_window:]
             if not tr.confirmed and tr.hits >= self.confirm_hits:
                 tr.confirmed = True
-            if tr.misses <= self.max_misses:
+            budget = (self.max_misses if tr.confirmed
+                      else self.max_misses_tentative)
+            if tr.misses <= budget:
                 survivors.append(tr)
         self.tracks = survivors
 
