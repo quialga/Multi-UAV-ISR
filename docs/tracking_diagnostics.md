@@ -172,6 +172,70 @@ targets. This is the honest number the §1 headline table did not have
 non-zero rate and, if this collapse matters in practice, tighten
 `birth_cluster_dist` / `confirm_hits` against it specifically.
 
+### 6.1 Hardening for the long coast budget
+
+The tracker that will feed the policy coasts long (§11: `max_misses` 80),
+and that makes clutter far worse than the table above, which used 5: every
+phantom that manages to confirm now lives up to 80 steps. Operating point
+**0.2 plots / blue / scan** (a CFAR false-alarm rate of ~10⁻³ per
+resolution cell, with ~200 cells in a 40 m disk); **0.5** as a stress
+point.
+
+Measured (`scratch/clutter_sweep.py`): 8 episodes × 150 steps, stochastic
+red, random blues, **constant-velocity motion model**, 20 m gate, coasting
+bounded at 80 steps. Every configuration within a clutter level steps on
+the same detections.
+
+| config (clutter 0.2) | MOTA | recall | FP | IDSW | Frag | confirmed / step |
+|---|---|---|---|---|---|---|
+| one shared budget, 2-of-3 | −0.64 | 0.380 | 3604 | 56 | — | 4.14 |
+| tentative budget split, 2-of-3 | −0.56 | 0.369 | 3288 | 61 | 41 | 3.85 |
+| split, 3-of-4 | −0.27 | 0.348 | 2186 | 54 | 38 | 2.87 |
+| **coverage-aware misses, 3-of-4, 3 in view** | **0.17** | 0.339 | **559** | **47** | **32** | **1.48** |
+| coverage-aware, 2-of-3, 3 in view | 0.10 | 0.349 | 851 | 53 | 31 | 1.76 |
+| coverage-aware, 3-of-4, 6 in view | −0.24 | 0.346 | 2042 | 53 | 37 | 2.74 |
+| oracle association, split 2-of-3 | 0.17 | 0.414 | 819 | 45 | 32 | 1.92 |
+
+What each lever does:
+
+* **Separate tentative budget** (`max_misses_tentative`): alive tentatives
+  fall 5× (4.37 → 0.80 per step) but false positives only 9%. It fixes the
+  cost and the phantom-absorption failure (`tests/test_track_budgets.py`),
+  not the confirmation rate.
+* **3-of-4 confirmation**: FP −34% against 2-of-3, at one step of latency
+  (recall 0.369 → 0.348). 3-of-5 was slightly worse — a longer window gives
+  clutter more scans to collect its hits.
+* **Doppler gating**: not in the table because it provably cannot help
+  here. With the CV model's calibrated process noise the predicted velocity
+  has sd ~1.41 m/s, while clutter Doppler lies in [−1, 1], so the Doppler
+  term adds at most ~2.9 to d² against a threshold of 11.3. The red really
+  can change radial speed that much per scan. It could help only with a
+  motion model whose velocity prediction is confident
+  (`tests/test_doppler_gating.py`).
+* **Coverage-aware miss counting** (`step(..., coverage=...)`): a confirmed
+  track's miss counts only if some blue would certainly have had it in view
+  — in range with a 2σ margin, with line of sight. A confirmed phantom sits
+  where its plot appeared, so sensors keep looking at it and it dies in a
+  few steps; a real target that fled out of range accrues no counted misses
+  and coasts on, bounded by `max_coast_steps`. This is the dominant lever:
+  **FP ÷3.9 and MOTA −0.27 → 0.17** against split 3-of-4. Under stress
+  (0.5): MOTA −0.41 → 0.06, FP 2620 → 925.
+
+Checks that it does no harm: without clutter the coverage rows are
+identical to their counterparts on every metric, and with clutter IDSW and
+Frag go *down* — no sign of real tracks being killed on `p_TP` bad luck.
+
+Caveats. The in-view budget is sharply sensitive: 6 gives back almost all
+of the gain, far more than doubling a phantom's lifetime would explain; a
+plausible but unverified reason is that a longer-lived phantom gets more
+chances to absorb another clutter plot, resetting its counter. The
+coverage row showing fewer FP than the oracle row is **not** it beating
+perfect association — that oracle row lacks the coverage rule and keeps
+drifting CV tracks for 80 steps; nor is it established why the coverage
+configuration shows fewer FP with clutter (559) than the same tracker
+without it (709). Occlusion used true obstacle geometry. Not yet
+re-checked with the learned motion model.
+
 ## 7. The red is now STOCHASTIC (a scope decision)
 
 Everything from here assumes a stochastic evader — a deterministic one is
