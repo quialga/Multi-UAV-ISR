@@ -346,6 +346,93 @@ the learned tracker's added cost over a 1000-rollout run falls from ~8.7 h
 to roughly 5 h in-process, or on the order of 20 minutes with 16 env
 workers.
 
+### 6.3 At the training configuration: clutter-captured tracks
+
+**Setting** (`scratch/obs_k_sigma.py`). Everything above was measured at
+L=130 with 5 blues. This is the Stage 4 training geometry
+(`STAGE4_DEFAULTS`: L=200, 7 blues, 4 reds, 9 obstacles, 300 steps), clutter
+0.2, obstacle radius noise 2 m, random blues, and the TRAINING red mix
+(stationary / random / run, cycled per episode), 15 episodes. Chosen
+configuration from §6.2. The learned model (v3) takes its obstacle context
+from the obstacle tracker (confirmed tracks, estimated radius), as the
+actor path will. Evaluation labels: at every hit a track takes the nearest
+active red within 6 m, and keeps that label while it coasts.
+
+The purpose was sizing the graph slots K and a position-σ cut-off for the
+tracker-fed actor observation. It found this first.
+
+**A confirmed track can be confidently wrong.** Confirmed tracks with
+σ ≤ 10 m whose labelled red is more than 40 m away, per step (misleading /
+all σ ≤ 10 m):
+
+| | clutter 0 | clutter 0.2 |
+|---|---|---|
+| constant velocity | 0.00 / 1.17 | **0.24 / 1.46** (16%) |
+| learned | 0.00 / 1.27 | **0.07 / 1.37** (5%) |
+
+p90 error of confirmed tracks with σ in 2–5 m: 3.9 m → **109 m** (CV),
+6.3 m → **61 m** (learned). Without clutter σ tracks the error well — the
+learned model's labelled red is within 40 m in ≥ 99% of track-steps up to
+σ = 40 m — so the failure is clutter-specific. Mechanism: a coasting track's
+chi² gate grows with its predicted covariance; a false plot inside it counts
+as a hit, which resets the misses, shrinks the covariance and moves the
+estimate onto the plot, and the track lives on. Such a track reports a
+SMALL σ, so no σ cut-off can remove it from the actor's graph.
+
+**The kinematic reach gate** (`max_target_speed`, `tests/test_reach_gate.py`)
+bounds association by physics: a return joins a track only within
+`max_target_speed · scans_since_hit + 3·sqrt(σ_z² + σ_hit²)` of where the
+track stood at its last hit, with `max_target_speed = √2` (the env caps red
+velocity at 1 m/s per axis). Same 15 episodes, clutter 0.2:
+
+| | misleading / σ ≤ 10 m | p90 err, σ 2–5 m | MOTA stationary | MOTA random |
+|---|---|---|---|---|
+| CV | 0.24 / 1.46 | 109 m | 0.27 (FP 930) | 0.33 |
+| CV + reach gate | 0.10 / 1.33 | 61 m | 0.20 (FP 1736) | 0.39 |
+| learned | 0.07 / 1.37 | 61 m | 0.40 | 0.50 |
+| learned + reach gate | 0.06 / 1.38 | 52 m | 0.39 | 0.52 |
+
+It halves the problem for CV and barely moves it for the learned model.
+(The `run` red is seen too rarely by random blues — recall ≤ 0.07 — to say
+anything about it.) At clutter 0 it changes little (MOTA within 0.01 for
+both models). For CV the false positives rise, consistent with tracks that
+clutter no longer resets coasting on with large σ and drifting estimates:
+confirmed CV track-steps with σ > 40 m go from 148 to 2077.
+
+**Why a kinematic bound is not enough** (`scratch/reach_leak.py`, 8 episodes
+of stationary and random reds, reach gate on). Hits on confirmed tracks after
+which no red lies within 6 m of the track, taken as clutter hits, by the
+number of scans the track had coasted:
+
+| scans since last hit | CV clutter / real hits | clutter share | learned clutter / real | clutter share |
+|---|---|---|---|---|
+| 1 | 2 / 2949 | 0.001 | 0 / 2894 | 0.000 |
+| 2–3 | 9 / 344 | 0.025 | 3 / 353 | 0.008 |
+| 4–10 | 29 / 19 | **0.60** | 12 / 25 | **0.32** |
+| 11–30 | 74 / 11 | **0.87** | 35 / 9 | **0.80** |
+| 31–80 | 21 / 0 | 1.00 | 12 / 0 | 1.00 |
+
+After about four coasted scans a single return on a confirmed track is more
+likely clutter than the target, and by then the physically admissible reach
+(√2 m per scan) is legitimately large, so no bound on speed rejects it. The
+evidence that is missing is not WHERE the return is but HOW MUCH one return
+is worth against the clutter density when the track could be anywhere in a
+wide region. The reach gate stays in the code, off by default, and is not
+part of the chosen configuration; the long-coast re-acquisition problem is
+open.
+
+Two more results from the same run:
+
+* **Slots.** Confirmed red tracks per step: max 7, p99 6 (CV); max 6, p99 5
+  (learned), against at most 4 real reds. The excess is duplicates and the
+  clutter-captured tracks above, so K is to be re-measured once those are
+  fixed.
+* **The learned model out of its distribution.** v3 was trained at L=130 on
+  stochastic reds; here it sees L=200 and stationary / random reds. It still
+  beats CV at clutter 0.2 (MOTA 0.40 vs 0.27 stationary, 0.50 vs 0.33
+  random); at clutter 0 the two are close (0.40 vs 0.46 stationary, 0.49 vs
+  0.44 random).
+
 ## 7. The red is now STOCHASTIC (a scope decision)
 
 Everything from here assumes a stochastic evader — a deterministic one is
@@ -809,6 +896,52 @@ from 65 m to 62 m over 3 steps on `vx` noise alone and fragments the
 track; a second, non-collinear blue prevents it. Identical failure mode,
 and identical fix, to the red tracker's
 `test_single_blue_crossing_geometry_is_unobservable` (§ tracker.py).
+
+### 9.6 At the training configuration: drift, duplicates, and the static model
+
+Measured with real association at the Stage 4 training geometry (L=200,
+7 random blues, 9 obstacles, all static as in every stage4 config to date),
+radius noise 2 m, 3-of-4 confirmation with deadline and a policy-facing
+"never forget" miss budget. §9.3's insensitivity to `sigma_a` was measured
+with ORACLE association and does not cover this regime.
+
+With the default `sigma_a = 0.1` there were up to 13–14 confirmed tracks for
+9 obstacles. Following the duplicate events (`scratch/debug_obstacle_dups.py`)
+shows two populations:
+
+* **Drift.** Old tracks with velocity estimated from noise (up to 1.7 m/s for
+  a static obstacle), coasting unobserved and never deleted: centre error
+  p90 69 m, position sd p90 29 m, misses p90 51. When the obstacle is seen
+  again the return falls outside the drifted gate and a new track is born.
+* **Splits.** A new confirmed track beside a good one (centre error median
+  1.7 m). Likely mechanism, not traced return by return: the 99% gate
+  rejects ~1% of genuine returns, a rejected return starts a tentative, and
+  with several blues observing the same obstacle both tracks keep receiving
+  returns, so the tentative confirms.
+
+Variants on identical detections (`scratch/obstacle_variants.py`,
+10 episodes; "misleading" = a confirmed track more than 8 m from its
+labelled centre):
+
+| variant | confirmed mean / p99 / max | duplicates mean / max | misleading / step | centre err p50 / p90 / max | radius err p90 |
+|---|---|---|---|---|---|
+| current (`sigma_a` 0.1) | 7.78 / 13 / 14 | 1.46 / 5 | 1.04 | 1.19 / 11.2 / 373 m | 2.19 m |
+| static (`sigma_a` 0, `vel_prior_std` 0) | 7.31 / 10 / 11 | 0.34 / 2 | **0** | 0.21 / 0.96 / 4.1 m | 0.84 m |
+| **static + merge** | 7.14 / 10 / 10 | **0.18 / 1** | **0** | 0.20 / 0.75 / 3.6 m | 0.84 m |
+| current + merge | 6.14 / 10 / 11 | 0.20 / 2 | 0.27 | 0.86 / 4.19 / 186 m | 1.17 m |
+
+The **static model** (no process noise, velocity pinned at 0) removes the
+drift outright: a track that nobody observes keeps its estimate and its
+covariance. It is only valid when obstacles are known to be static; with
+patrolling obstacles `sigma_a = 0.1` is required (§9.3) and the drift comes
+back — the merge alone does not fix it (last row). The **duplicate merge**
+(`merge_chi2`, 3-dof χ² on `[px, py, r]`, `tests/test_obstacle_merge.py`)
+halves the remaining splits; two real obstacles cannot trigger it because
+the env places them with centres at least `r_a + r_b + 1 m` (≥ 11 m) apart.
+
+Cost is still open: in a quiet run the obstacle tracker took 2.8 ms per step
+against 2.1 ms for `env.step` (the per-variant timings in the table's
+script ran alongside other jobs and are not usable).
 
 ## 10. Red-motion dataset collector
 

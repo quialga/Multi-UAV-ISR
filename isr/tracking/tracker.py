@@ -109,6 +109,11 @@ def _dwna_Q(dt: float, sigma_a: float) -> np.ndarray:
     return Q * (sigma_a ** 2)
 
 
+def _max_sd(P_pos: np.ndarray) -> float:
+    """Standard deviation along the most uncertain axis of a 2x2 covariance."""
+    return float(np.sqrt(max(np.linalg.eigvalsh(P_pos).max(), 0.0)))
+
+
 # --------------------------------------------------------------------- #
 #  Gaussian Sum primitives
 # --------------------------------------------------------------------- #
@@ -203,6 +208,11 @@ class Track:
         # staleness, whatever the coverage model decided about each miss.
         self.steps_since_hit = 0
         self.confirmed = False
+        # Where the track stood at its last hit, and how sure it was then —
+        # the anchor of the kinematic reach gate (MultiTargetTracker
+        # max_target_speed).  Refreshed on every hit, never on a miss.
+        self.last_hit_pos = np.asarray(x, dtype=np.float64)[:2].copy()
+        self.last_hit_sd = _max_sd(np.asarray(P, dtype=np.float64)[:2, :2])
 
     @property
     def _dominant(self) -> _Component:
@@ -266,6 +276,8 @@ class MultiTargetTracker:
         gate_chi2_doppler: float = CHI2_99[3],
         max_coast_steps: Optional[int] = None,
         confirm_deadline: bool = False,
+        max_target_speed: Optional[float] = None,
+        reach_k_sigma: float = 3.0,
     ) -> None:
         # Plug point for a LEARNED transition model.  A callable
         # (x, P) -> [(rel_weight, x_pred, P_pred), ...] — one branch per
@@ -430,6 +442,33 @@ class MultiTargetTracker:
         # Off by default: tentatives then fall under max_misses like every
         # other track, the original behaviour.
         self.confirm_deadline = bool(confirm_deadline)
+        # KINEMATIC REACH GATE: a return can join a track only if the target
+        # could physically have got there since the track's last hit —
+        #     |z - last_hit_pos| <= max_target_speed * k * dt
+        #                           + reach_k_sigma * sqrt(sigma_z^2 + sd_hit^2)
+        # with k the scans since that hit, sigma_z the return's position sd
+        # and sd_hit the track's position sd right after the hit.  Applied
+        # ON TOP of the chi^2 gate, never instead of it.
+        #
+        # Why: the chi^2 gate is only as tight as the predicted covariance,
+        # and that grows much faster than any target can move — the CV model
+        # has sd 7 m after 3 coasted scans (gate ~22 m) for a red that can
+        # have moved at most ~4 m.  At clutter 0.2 a coasting track caught a
+        # false plot inside that gate, the hit reset its misses and shrank
+        # its covariance, and it lived on clutter alone: 16% of confirmed CV
+        # tracks with sd <= 10 m were more than 40 m from their target
+        # (learned model 5%), and none at clutter 0.  Such a track looks
+        # CONFIDENT, so no sd threshold can filter it
+        # (docs/tracking_diagnostics.md §6.3).
+        #
+        # max_target_speed is a SPEED, not a per-axis bound: PursuitEnv caps
+        # velocity axis-wise at v_max, so a red reaches sqrt(2) * v_max on a
+        # diagonal.  None disables the gate (the original behaviour).
+        if max_target_speed is not None and max_target_speed <= 0.0:
+            raise ValueError("max_target_speed must be positive or None")
+        self.max_target_speed = (None if max_target_speed is None
+                                 else float(max_target_speed))
+        self.reach_k_sigma = float(reach_k_sigma)
         self.birth_cluster_dist = float(birth_cluster_dist)
         # Gaussian-Sum bookkeeping.  Inert under the default motion model
         # (which never branches, so no track ever holds >1 component) —
@@ -619,6 +658,20 @@ class MultiTargetTracker:
             return H, R, z
         return self.H_pos, np.eye(2) * sp2, z_pos
 
+    def _within_reach(self, tr: Track, det: Dict) -> bool:
+        """Kinematic reach gate — see ``max_target_speed`` in __init__.
+        Called during association, BEFORE this scan's hits are booked, so
+        ``steps_since_hit + 1`` is the number of scans since the last hit."""
+        if self.max_target_speed is None:
+            return True
+        k = tr.steps_since_hit + 1
+        margin = self.reach_k_sigma * float(np.hypot(det["sigma_pos"],
+                                                     tr.last_hit_sd))
+        reach = self.max_target_speed * k * self.dt + margin
+        dist = float(np.linalg.norm(
+            det["z_pos"].astype(np.float64) - tr.last_hit_pos))
+        return dist <= reach
+
     def _gate_threshold(self, det: Dict) -> float:
         """chi^2 threshold matching the dimension ``_gate_measurement``
         chose for this return."""
@@ -772,7 +825,8 @@ class MultiTargetTracker:
                     for j, k in enumerate(idxs):
                         d2, c = self._gate_pos(tr, dets[k])
                         cost[i, j] = c
-                        gate[i, j] = d2 <= thresh[j]
+                        gate[i, j] = (d2 <= thresh[j]
+                                      and self._within_reach(tr, dets[k]))
                 for i, j in solve_gated(cost, gate):
                     assignments.append((i, idxs[j]))
 
@@ -804,6 +858,8 @@ class MultiTargetTracker:
                 tr.history.append(True)
                 tr.misses = 0
                 tr.steps_since_hit = 0
+                tr.last_hit_pos = tr.pos
+                tr.last_hit_sd = _max_sd(tr.P[:2, :2])
             else:
                 tr.history.append(False)
                 tr.steps_since_hit += 1

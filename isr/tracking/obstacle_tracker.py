@@ -76,7 +76,7 @@ import numpy as np
 from isr.tracking.assignment import solve_gated
 from isr.tracking.kalman import joseph_update
 
-CHI2_99 = {1: 6.635, 2: 9.210, 4: 13.277, 5: 15.086}
+CHI2_99 = {1: 6.635, 2: 9.210, 3: 11.345, 4: 13.277, 5: 15.086}
 
 
 def _dwna_Q5(dt: float, sigma_a: float) -> np.ndarray:
@@ -153,6 +153,7 @@ class ObstacleTracker:
         oracle_association: bool = False,
         motion_model=None,
         confirm_deadline: bool = False,
+        merge_chi2: Optional[float] = None,
     ) -> None:
         # Plug point for a learned/explicit motion model (e.g. one that
         # predicts a wall bounce) — see the module docstring.  A callable
@@ -177,6 +178,14 @@ class ObstacleTracker:
         # NOT predicted through — it is corrected only by the next few
         # updates disagreeing with the (temporarily wrong) prediction; see
         # the module docstring's VELOCITY note.
+        #
+        # That sweep used ORACLE association.  With real association and a
+        # budget that never forgets, 0.1 lets an unobserved STATIC obstacle's
+        # track drift on a velocity estimated from noise (centre error p90
+        # 11 m, duplicates when it is seen again).  When obstacles are known
+        # to be static, pass sigma_a=0 and vel_prior_std=0: velocity pinned
+        # at 0, no process noise, no drift (docs/tracking_diagnostics.md
+        # §9.6).
         self.sigma_a = float(sigma_a)
         # Gaussian speed prior for the velocity ridge at birth — same role
         # as the red tracker's vel_prior_std (the characteristic scale of
@@ -200,6 +209,24 @@ class ObstacleTracker:
         # config wants a very large max_misses — which, without the
         # deadline, would keep every spurious tentative alive just as long.
         self.confirm_deadline = bool(confirm_deadline)
+        # DUPLICATE MERGE: after the lifecycle step, two tracks whose
+        # [px, py, r] estimates are statistically the same obstacle —
+        # d^2 = D^T (P_a + P_b)^-1 D <= merge_chi2 — become one.  Two real
+        # obstacles are never that close: PursuitEnv places them without
+        # overlap (centres at least r_a + r_b + 1 m apart, so >= 11 m),
+        # while a duplicate converges onto the same centre.  The survivor is
+        # the confirmed one (the older if both are), and it keeps whichever
+        # estimate is more certain.  None = off.
+        #
+        # Why: duplicates confirm next to good tracks.  Likely mechanism —
+        # consistent with the diagnostic, not traced return by return: the
+        # 99% chi^2 gate rejects ~1% of genuine returns by construction, a
+        # rejected one starts a tentative beside the good track, and with
+        # several blues observing the same obstacle both tracks keep
+        # receiving returns, so the tentative can confirm.  Measured with static obstacles and velocity pinned at 0: 0.34
+        # duplicate tracks per step without the merge, 0.18 with it
+        # (docs/tracking_diagnostics.md §9.6).
+        self.merge_chi2 = None if merge_chi2 is None else float(merge_chi2)
         self.birth_cluster_dist = float(birth_cluster_dist)
 
         self.F = np.eye(5)
@@ -392,6 +419,31 @@ class ObstacleTracker:
             if alive:
                 survivors.append(tr)
         self.tracks = survivors
+
+        # 7. MERGE duplicates (see merge_chi2 in __init__).
+        if self.merge_chi2 is not None:
+            self.tracks = self._merge_duplicates(self.tracks)
+
+    _MERGE_IDX = np.array([0, 1, 4])        # px, py, r
+
+    def _merge_duplicates(self, tracks: List[ObstacleTrack]) -> List[ObstacleTrack]:
+        # Survivor preference: confirmed first, then older.
+        order = sorted(tracks, key=lambda t: (not t.confirmed, t.born_at, t.id))
+        kept: List[ObstacleTrack] = []
+        ix = np.ix_(self._MERGE_IDX, self._MERGE_IDX)
+        for tr in order:
+            for k in kept:
+                dv = tr.x[self._MERGE_IDX] - k.x[self._MERGE_IDX]
+                S = tr.P[ix] + k.P[ix]
+                if float(dv @ np.linalg.solve(S, dv)) <= self.merge_chi2:
+                    if np.trace(tr.P[ix]) < np.trace(k.P[ix]):
+                        k.x, k.P = tr.x.copy(), tr.P.copy()
+                    break
+            else:
+                kept.append(tr)
+        # Keep the original list order so iteration order stays stable.
+        keep_ids = {t.id for t in kept}
+        return [t for t in tracks if t.id in keep_ids]
 
     # ---------------- readout ---------------- #
 
