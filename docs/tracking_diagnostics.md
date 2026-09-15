@@ -433,6 +433,75 @@ Two more results from the same run:
   random); at clutter 0 the two are close (0.40 vs 0.46 stationary, 0.49 vs
   0.44 random).
 
+### 6.4 Re-acquisition with confirmation, and the observation's K and σ cut-off
+
+The two halves of track existence are now handled separately. The ABSENCE
+of a return counts toward deleting a confirmed track only where it should
+have been seen (coverage-aware misses, §6.1). The PRESENCE of a return after
+a long coast is no longer trusted on its own:
+
+`reacquire_after` (`tests/test_reacquisition.py`): a track that has gone
+this many scans without a hit is LOST for association, so no single return
+re-attaches to it. Returns near it start a tentative, which must pass the
+normal 3-of-4 with deadline; when it confirms, it absorbs the closest lost
+confirmed track consistent with it (χ² on both covariances, plus the reach
+gate when on) and takes over its id. Clutter rarely passes 3-of-4, so the
+single-plot capture of §6.3 disappears; a real re-acquisition reappears in
+the graph a few scans later. `reacquire_after = 4` is read off §6.3's
+clutter-share table (clutter < 3% of hits up to 3 scans, 32–60% at 4–10);
+other values were not swept.
+
+Same 15 episodes and seeds as §6.3; obstacle tracker in its static + merge
+configuration (§9.6) for every row, so the learned model's obstacle context
+is the same across rows.
+
+| clutter | variant | model | misleading / σ ≤ 10 m | p90 err, σ 2–5 m | MOTA stat. | MOTA random | FP stat. | IDSW stat. | confirmed p99 / max |
+|---|---|---|---|---|---|---|---|---|---|
+| 0.2 | chosen (§6.2) | CV | 0.24 / 1.46 | 109 m | 0.27 | 0.33 | 930 | 38 | 6 / 7 |
+| 0.2 | **+ reacquire 4** | CV | **0.00** / 1.13 | **4.0 m** | **0.44** | **0.44** | 569 | 25 | **4 / 5** |
+| 0.2 | + reacquire 4 + reach gate | CV | 0.00 / 1.13 | 4.0 m | 0.43 | 0.43 | 724 | 23 | 5 / 5 |
+| 0 | + reacquire 4 | CV | 0.00 / 1.13 | 3.7 m | 0.47 | 0.47 | 405 | 26 | 4 / 4 |
+| 0.2 | chosen (§6.2) | learned | 0.07 / 1.37 | 60 m | 0.40 | 0.50 | 462 | 39 | 5 / 6 |
+| 0.2 | **+ reacquire 4** | learned | **0.00** / 1.21 | **5.9 m** | **0.43** | **0.51** | 587 | 33 | 5 / 6 |
+| 0.2 | + reacquire 4 + reach gate | learned | 0.00 / 1.21 | 5.9 m | 0.41 | 0.50 | 692 | 30 | 5 / 6 |
+| 0 | + reacquire 4 | learned | 0.00 / 1.23 | 6.0 m | 0.43 | 0.52 | 606 | 41 | 4 / 5 |
+
+* **The clutter damage is essentially gone.** With re-acquisition, clutter
+  0.2 lands within 0.03 MOTA of clutter 0 for both models, and misleading
+  confirmed tracks with σ ≤ 10 m fall to 0.00 per step (at most one on a
+  rare step, for CV).
+* **The reach gate adds nothing on top** (same misleading count, slightly
+  lower MOTA, more FP). It stays off.
+* **The learned model's FP rise** (462 → 587) is consistent with lost
+  tracks now coasting on with a large, honest σ instead of being reset by
+  clutter: its track-steps with σ > 40 m go from 2 to 1634. MOT counts them
+  whatever their σ; the actor observation drops them by σ (below).
+* The `run` red remains too rarely seen by random blues (recall ≤ 0.16) to
+  judge; its IDSW are volatile across runs (learned: 9 to 46).
+
+**σ is honest again, which fixes the cut-off.** Share of confirmed
+track-steps whose labelled red is within 40 m (the sensor radius) of the
+readout, clutter 0.2 with re-acquisition:
+
+| σ (m) | 0–30 | 30–40 | > 40 |
+|---|---|---|---|
+| CV | ≥ 0.99 | 0.98 | 0.63 |
+| learned | 1.00 | 0.99 | 0.78 |
+
+**Adopted for the tracker-fed actor observation:**
+
+* **σ cut-off τ = 40 m** (largest eigen-sd of the moment-matched mixture's
+  position covariance): below it a blue flying to the readout has the red
+  within its sensor radius in ≥ 98% of track-steps; above it that drops to
+  63–78%.
+* **K = 8 red slots** (2 × `n_red`). After the cut-off: p99 4–5, max 5–6
+  confirmed tracks per step against at most 4 reds. Random blues; a trained
+  team that converges several blues on one red could raise duplicates, hence
+  the margin. Overflow keeps the smallest σ.
+* **K = 12 obstacle slots** (`n_obstacles` + 3). Confirmed obstacle tracks:
+  p99 10, max 10 for 9 obstacles. No σ cut-off is needed for static
+  obstacles: their covariance does not grow while unobserved.
+
 ## 7. The red is now STOCHASTIC (a scope decision)
 
 Everything from here assumes a stochastic evader — a deterministic one is

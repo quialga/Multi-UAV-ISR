@@ -278,6 +278,7 @@ class MultiTargetTracker:
         confirm_deadline: bool = False,
         max_target_speed: Optional[float] = None,
         reach_k_sigma: float = 3.0,
+        reacquire_after: Optional[int] = None,
     ) -> None:
         # Plug point for a LEARNED transition model.  A callable
         # (x, P) -> [(rel_weight, x_pred, P_pred), ...] — one branch per
@@ -469,6 +470,29 @@ class MultiTargetTracker:
         self.max_target_speed = (None if max_target_speed is None
                                  else float(max_target_speed))
         self.reach_k_sigma = float(reach_k_sigma)
+        # RE-ACQUISITION WITH CONFIRMATION: a track that has gone
+        # `reacquire_after` or more scans without a hit is LOST for
+        # association — no single return can re-attach to it.  Returns near
+        # it start a tentative instead, which must pass the normal M-of-N;
+        # when it confirms, it absorbs the closest lost confirmed track whose
+        # prediction it falls inside (chi^2 gate on both covariances, and the
+        # reach gate when that is on), taking over its id.  None = off.
+        #
+        # Why: after about four coasted scans a single return on a confirmed
+        # track is more likely clutter than the target (share of hits that
+        # were clutter at clutter 0.2: 60% CV / 32% learned at 4-10 scans,
+        # 80-100% beyond), and the physically admissible reach is by then too
+        # large for the reach gate to reject it (docs §6.3).  Clutter rarely
+        # passes M-of-N, so demanding it again on re-acquisition removes the
+        # single-plot capture at the price of a real re-acquisition
+        # reappearing a few scans later.  Measured with reacquire_after=4 at
+        # clutter 0.2: misleading confirmed tracks with sd <= 10 m 0.24 ->
+        # 0.00 per step (CV) and 0.07 -> 0.00 (learned); MOTA within 0.03 of
+        # clutter 0 for both (docs §6.4).
+        if reacquire_after is not None and reacquire_after < 1:
+            raise ValueError("reacquire_after must be >= 1 or None")
+        self.reacquire_after = (None if reacquire_after is None
+                                else int(reacquire_after))
         self.birth_cluster_dist = float(birth_cluster_dist)
         # Gaussian-Sum bookkeeping.  Inert under the default motion model
         # (which never branches, so no track ever holds >1 component) —
@@ -662,15 +686,54 @@ class MultiTargetTracker:
         """Kinematic reach gate — see ``max_target_speed`` in __init__.
         Called during association, BEFORE this scan's hits are booked, so
         ``steps_since_hit + 1`` is the number of scans since the last hit."""
+        return self._reach_ok(tr, det["z_pos"], float(det["sigma_pos"]),
+                              tr.steps_since_hit + 1)
+
+    def _reach_ok(self, tr: Track, z: np.ndarray, sigma_z: float,
+                  scans: int) -> bool:
+        """Is position ``z`` (1-sigma ``sigma_z``) within the distance the
+        target could have covered in ``scans`` scans since the track's last
+        hit?  Always True when the reach gate is off."""
         if self.max_target_speed is None:
             return True
-        k = tr.steps_since_hit + 1
-        margin = self.reach_k_sigma * float(np.hypot(det["sigma_pos"],
-                                                     tr.last_hit_sd))
-        reach = self.max_target_speed * k * self.dt + margin
+        margin = self.reach_k_sigma * float(np.hypot(sigma_z, tr.last_hit_sd))
+        reach = self.max_target_speed * scans * self.dt + margin
         dist = float(np.linalg.norm(
-            det["z_pos"].astype(np.float64) - tr.last_hit_pos))
+            np.asarray(z, dtype=np.float64) - tr.last_hit_pos))
         return dist <= reach
+
+    def _is_lost(self, tr: Track) -> bool:
+        """Excluded from association — see ``reacquire_after``.  Evaluated
+        during association, before this scan's hits are booked, so
+        ``steps_since_hit + 1`` is the number of scans since the last hit."""
+        return (self.reacquire_after is not None
+                and tr.steps_since_hit + 1 >= self.reacquire_after)
+
+    def _absorb_lost(self, just_confirmed: List[Track]) -> None:
+        """A tentative that just confirmed takes over the closest LOST
+        confirmed track it is consistent with: same id, the old track
+        removed.  Called after the lifecycle step, when a lost track's
+        ``steps_since_hit`` already counts this scan."""
+        lost = [t for t in self.tracks
+                if t.confirmed and t not in just_confirmed
+                and t.steps_since_hit >= self.reacquire_after]
+        for new in just_confirmed:
+            best, best_d2 = None, None
+            for old in lost:
+                dv = new.pos - old.pos
+                S = old.P[:2, :2] + new.P[:2, :2]
+                d2 = float(dv @ np.linalg.solve(S, dv))
+                if d2 > self.gate_chi2:
+                    continue
+                sd_new = _max_sd(new.P[:2, :2])
+                if not self._reach_ok(old, new.pos, sd_new, old.steps_since_hit):
+                    continue
+                if best_d2 is None or d2 < best_d2:
+                    best, best_d2 = old, d2
+            if best is not None:
+                new.id = best.id
+                lost.remove(best)
+                self.tracks.remove(best)
 
     def _gate_threshold(self, det: Dict) -> float:
         """chi^2 threshold matching the dimension ``_gate_measurement``
@@ -822,6 +885,8 @@ class MultiTargetTracker:
                 gate = np.zeros((n, m), dtype=bool)
                 thresh = [self._gate_threshold(dets[k]) for k in idxs]
                 for i, tr in enumerate(self.tracks):
+                    if self._is_lost(tr):
+                        continue                    # gate row stays False
                     for j, k in enumerate(idxs):
                         d2, c = self._gate_pos(tr, dets[k])
                         cost[i, j] = c
@@ -853,6 +918,7 @@ class MultiTargetTracker:
 
         # 6. COAST / DIE / PROMOTE.
         survivors: List[Track] = []
+        just_confirmed: List[Track] = []
         for i, tr in enumerate(self.tracks):
             if tr.born_at == self.t or i in hit_tracks:   # born or hit
                 tr.history.append(True)
@@ -873,6 +939,7 @@ class MultiTargetTracker:
             tr.history = tr.history[-self.confirm_window:]
             if not tr.confirmed and tr.hits >= self.confirm_hits:
                 tr.confirmed = True
+                just_confirmed.append(tr)
             # Promotion is checked first, so the step that completes the
             # first window is still a tentative's last chance to confirm.
             if tr.confirmed:
@@ -889,6 +956,10 @@ class MultiTargetTracker:
             if alive:
                 survivors.append(tr)
         self.tracks = survivors
+
+        # 7. RE-ACQUISITION: a newly confirmed track takes over a lost one.
+        if self.reacquire_after is not None and just_confirmed:
+            self._absorb_lost([t for t in just_confirmed if t in survivors])
 
     # ---------------- readout ---------------- #
 
