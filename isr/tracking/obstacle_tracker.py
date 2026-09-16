@@ -345,18 +345,27 @@ class ObstacleTracker:
                 tid = self._oracle_map.get(int(d["truth_id"]))
                 if tid is not None and tid in by_id:
                     assignments.append((by_id[tid], k))
-        else:
+        elif self.tracks:
+            # Every (track, return) pair of one blue at once: _gate_pos's
+            # arithmetic with the 2x2 inverse and determinant in closed form
+            # (it was ~half this tracker's time as a per-pair Python loop).
+            X = np.stack([tr.x[:2] for tr in self.tracks])          # (n, 2)
+            P = np.stack([tr.P[:2, :2] for tr in self.tracks])      # (n, 2, 2)
             for _blue, idxs in sorted(by_blue.items()):
-                if not self.tracks:
-                    break
-                n, m = len(self.tracks), len(idxs)
-                cost = np.zeros((n, m))
-                gate = np.zeros((n, m), dtype=bool)
-                for i, tr in enumerate(self.tracks):
-                    for j, k in enumerate(idxs):
-                        d2, c = self._gate_pos(tr, dets[k])
-                        cost[i, j] = c
-                        gate[i, j] = d2 <= self.gate_chi2
+                Z = np.stack([dets[k]["z_pos"] for k in idxs]).astype(np.float64)
+                r2 = np.array([dets[k]["sigma_pos"] ** 2 for k in idxs])
+                y = Z[None, :, :] - X[:, None, :]                   # (n, m, 2)
+                a = P[:, None, 0, 0] + r2[None, :]
+                b = P[:, None, 0, 1]
+                c = P[:, None, 1, 0]
+                dd = P[:, None, 1, 1] + r2[None, :]
+                det = a * dd - b * c
+                safe = np.where(np.abs(det) > 0.0, det, 1.0)
+                d2 = (y[..., 0] * (dd * y[..., 0] - b * y[..., 1])
+                      + y[..., 1] * (a * y[..., 1] - c * y[..., 0])) / safe
+                logdet = np.where(det > 0.0, np.log(np.where(det > 0.0, det, 1.0)), 0.0)
+                cost = d2 + logdet
+                gate = d2 <= self.gate_chi2
                 for i, j in solve_gated(cost, gate):
                     assignments.append((i, idxs[j]))
 

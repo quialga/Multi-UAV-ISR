@@ -207,6 +207,34 @@ STAGE4_DEFAULTS = {
     # (1 + g (r/R)^2); 1.0 = measurement noise doubles at max range.
     "sensor_noise_range_growth": 1.0,
 
+    # ----- Tracker path (docs/tracker_observation.md) --------------------
+    # Sensor realism of the IDENTITY-FREE returns the trackers consume
+    # (raw_detections / raw_obstacle_detections).  Neither touches the
+    # belief-map path, whose false alarms are per cell (p_FP below) and
+    # whose seen obstacles report the true radius.
+    #   clutter 0.2 false plots per blue per scan: a CFAR detector at
+    #   P_fa ~1e-3 per cell over the ~200 cells of a 40 m disk (5 m cells).
+    #   radius noise 2 m base, range-scaled like position.
+    "clutter_rate":              0.2,
+    "obstacle_radius_noise_std": 2.0,
+    # Source of the ACTOR's red and obstacle nodes: "belief" (the control,
+    # unchanged) or "tracker".  The critic's ground-truth graph is the same
+    # in both.  Stays "belief" until the tracker path has trained once;
+    # select it with --actor-obs tracker.
+    "actor_obs":                 "belief",
+    # Learned red motion model for the red tracker; None = constant
+    # velocity.  No default path: checkpoints live under the gitignored
+    # runs/, and a default that silently falls back would make laptop and
+    # cloud runs differ (same reasoning as warm_start_critic below).
+    "red_motion_ckpt":           None,
+    # Tracker observation parameters, measured at this geometry
+    # (docs/tracking_diagnostics.md §6.4): 2 x n_red red slots, n_obstacles
+    # + 3 obstacle slots, red tracks hidden above 40 m position sd (the
+    # sensor radius).
+    "tracker_red_slots":         8,
+    "tracker_obstacle_slots":    12,
+    "tracker_sigma_cutoff":      40.0,
+
     # ----- Sensor model --------------------------------------------------
     "p_TP":                0.85,
     "p_FP":                0.15,

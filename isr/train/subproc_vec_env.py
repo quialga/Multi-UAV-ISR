@@ -89,6 +89,10 @@ def _worker(
                     "blue_feat_dim": ve.blue_feat_dim,
                     "red_feat_dim":  ve.red_feat_dim,
                     "edge_feat_dim": ve.edge_feat_dim,
+                    "actor_n_red":        ve.actor_n_red,
+                    "actor_n_obstacles":  ve.actor_n_obstacles,
+                    "actor_red_feat_dim": ve.actor_red_feat_dim,
+                    "actor_obs_feat_dim": ve.actor_obs_feat_dim,
                 }))
             elif cmd == "stats_raw":
                 remote.send(("ok", {
@@ -172,6 +176,10 @@ class SubprocStage4VecEnv:
         self.blue_feat_dim = meta["blue_feat_dim"]
         self.red_feat_dim  = meta["red_feat_dim"]
         self.edge_feat_dim = meta["edge_feat_dim"]
+        self.actor_n_red        = meta["actor_n_red"]
+        self.actor_n_obstacles  = meta["actor_n_obstacles"]
+        self.actor_red_feat_dim = meta["actor_red_feat_dim"]
+        self.actor_obs_feat_dim = meta["actor_obs_feat_dim"]
 
         self._closed = False
 

@@ -98,3 +98,30 @@ def test_subproc_uneven_shards_and_close_idempotent():
     sub.reset(seed=0)
     sub.close()
     sub.close()   # second close must be a no-op, not an error
+
+
+def test_subproc_tracker_mode_matches_inproc_and_reports_actor_sizing():
+    """Tracker mode through the workers: same obs, and the actor graph
+    sizing the trainer builds the policy from."""
+    ek = dict(EK, use_belief_maps=False, actor_obs="tracker",
+              tracker_red_slots=5, tracker_obstacle_slots=6, clutter_rate=0.2)
+    ref = Stage4VectorPursuitEnv(n_envs=2, env_kwargs=ek, base_seed=0,
+                                 red_policy_mix=MIX)
+    sub = SubprocStage4VecEnv(n_envs=2, env_kwargs=ek, base_seed=0,
+                              red_policy_mix=MIX, n_workers=2)
+    try:
+        for attr in ("actor_n_red", "actor_n_obstacles",
+                     "actor_red_feat_dim", "actor_obs_feat_dim"):
+            assert getattr(sub, attr) == getattr(ref, attr), attr
+        assert (sub.actor_n_red, sub.actor_n_obstacles) == (5, 6)
+        obs_r, obs_s = ref.reset(seed=5), sub.reset(seed=5)
+        rng = np.random.default_rng(1)
+        for t in range(10):
+            acts = rng.uniform(-1, 1, size=(2, 3, 2)).astype(np.float32)
+            obs_r, _, _, _ = ref.step(acts)
+            obs_s, _, _, _ = sub.step(acts)
+            for k in obs_r:
+                np.testing.assert_array_equal(obs_r[k], obs_s[k],
+                                              err_msg=f"{k} t={t}")
+    finally:
+        sub.close()

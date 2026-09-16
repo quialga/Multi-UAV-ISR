@@ -68,6 +68,7 @@ def load_policy(
             n_msg_rounds      = int(args.get("n_msg_rounds", 2)),
             init_log_std      = STAGE4_DEFAULTS["init_log_std"],
             use_hidden_in_gnn = bool(args.get("share_hidden_via_gnn", True)),
+            **_actor_sizing(args),
         ).to(device)
     else:
         raise RuntimeError(
@@ -95,6 +96,21 @@ def build_trained_agent(
     if isinstance(policy, GNNStage4Policy):
         return TrainedStage4BlueAgent(policy, device, deterministic)
     raise TypeError(f"Unsupported policy class: {type(policy).__name__}")
+
+
+def _actor_sizing(args: dict) -> dict:
+    """Actor graph sizing a checkpoint was trained with.  Checkpoints from
+    before ``actor_obs`` existed are belief mode: same as the critic."""
+    if args.get("actor_obs", "belief") != "tracker":
+        return {}
+    from isr.tracking import actor_graph
+    return dict(
+        actor_n_red=int(args["tracker_red_slots"]),
+        actor_n_obs=(int(args["tracker_obstacle_slots"])
+                     if int(args.get("n_obstacles", 0)) > 0 else 0),
+        actor_red_feat_dim=actor_graph.RED_FEAT_DIM,
+        actor_obs_feat_dim=actor_graph.OBS_FEAT_DIM,
+    )
 
 
 def env_kwargs_from_checkpoint(train_args: dict) -> dict:
@@ -129,7 +145,7 @@ def env_kwargs_from_checkpoint(train_args: dict) -> dict:
         moving_obstacle_fraction = g("moving_obstacle_fraction", 0.0),
         obstacle_speed           = g("obstacle_speed", 0.0),
         obstacle_belief_decay    = g("obstacle_belief_decay", 1.0),
-        use_belief_maps          = True,
+        use_belief_maps          = g("actor_obs", "belief") == "belief",
         belief_grid_size         = g("belief_grid_size", 26),
         belief_channels          = g("belief_channels", 2),
         belief_clip              = g("belief_clip", 10.0),
@@ -160,7 +176,19 @@ def env_kwargs_from_checkpoint(train_args: dict) -> dict:
         step_cost                = g("step_cost", 0.05),
         uncaught_penalty         = g("uncaught_penalty", 5.0),
         action_cost_coef         = g("action_cost_coef", 0.01),
+        # Tracker path.  Defaults reproduce checkpoints that predate it:
+        # belief actor, no clutter, exact obstacle radius.
+        clutter_rate             = g("clutter_rate", 0.0),
+        obstacle_radius_noise_std= g("obstacle_radius_noise_std", 0.0),
+        actor_obs                = g("actor_obs", "belief"),
     )
+    if kw["actor_obs"] == "tracker":
+        kw.update(
+            red_motion_ckpt        = g("red_motion_ckpt", None),
+            tracker_red_slots      = g("tracker_red_slots", 8),
+            tracker_obstacle_slots = g("tracker_obstacle_slots", 12),
+            tracker_sigma_cutoff   = g("tracker_sigma_cutoff", 40.0),
+        )
     return kw
 
 

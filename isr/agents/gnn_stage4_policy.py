@@ -379,11 +379,27 @@ class GNNStage4Policy(nn.Module):
         n_msg_rounds:      int   = 2,
         init_log_std:      float = 0.0,
         use_hidden_in_gnn: bool  = True,
+        # ACTOR graph sizing when it differs from the critic's — the
+        # tracker observation (PursuitEnv actor_obs="tracker") has fixed
+        # slot capacities and wider uncertainty features, while the critic
+        # keeps one node per true red / obstacle.  None = same as the
+        # critic, which leaves the policy exactly as before.  Message and
+        # update weights do not depend on node counts, so only the actor's
+        # two input MLPs change shape.
+        actor_n_red:        Optional[int] = None,
+        actor_n_obs:        Optional[int] = None,
+        actor_red_feat_dim: Optional[int] = None,
+        actor_obs_feat_dim: Optional[int] = None,
     ) -> None:
         super().__init__()
         self.n_blue            = n_blue
         self.n_red             = n_red
         self.n_obs             = n_obs
+        self.actor_n_red = n_red if actor_n_red is None else int(actor_n_red)
+        self.actor_n_obs = n_obs if actor_n_obs is None else int(actor_n_obs)
+        if (self.actor_n_obs > 0) != (n_obs > 0):
+            raise ValueError("actor and critic must agree on whether "
+                             "obstacles exist")
         self.d_hidden          = d_hidden
         self.action_dim        = action_dim
         self.use_hidden_in_gnn = use_hidden_in_gnn
@@ -395,11 +411,13 @@ class GNNStage4Policy(nn.Module):
         # ---- Actor path ----------------------------------------------
         self.actor_encoder = GNNEncoder(
             n_blue        = n_blue,
-            n_red         = n_red,
-            n_obs         = n_obs,
+            n_red         = self.actor_n_red,
+            n_obs         = self.actor_n_obs,
             blue_feat_dim = actor_blue_feat_dim,
-            red_feat_dim  = red_feat_dim,
-            obs_feat_dim  = obs_feat_dim,
+            red_feat_dim  = (red_feat_dim if actor_red_feat_dim is None
+                             else int(actor_red_feat_dim)),
+            obs_feat_dim  = (obs_feat_dim if actor_obs_feat_dim is None
+                             else int(actor_obs_feat_dim)),
             edge_feat_dim = edge_feat_dim,
             d_hidden      = d_hidden,
             n_msg_rounds  = n_msg_rounds,

@@ -142,6 +142,33 @@ def _parse_args() -> argparse.Namespace:
                         "sigma_base * (1 + g (r/R)^2). The accuracy half of "
                         "the same SNR falloff as --track-conf-min. "
                         "0 = range-independent noise (pre-fix).")
+    # Tracker path (docs/tracker_observation.md)
+    p.add_argument("--clutter-rate", type=float,
+                   default=d["clutter_rate"],
+                   help="False plots per blue per scan in raw_detections() "
+                        "(tracker path only; the belief path models false "
+                        "alarms per cell with --p-fp).")
+    p.add_argument("--obstacle-radius-noise-std", type=float,
+                   default=d["obstacle_radius_noise_std"],
+                   help="Obstacle radius measurement noise (m, range-scaled) "
+                        "in raw_obstacle_detections() (tracker path only).")
+    p.add_argument("--actor-obs", choices=("belief", "tracker"),
+                   default=d["actor_obs"],
+                   help="Source of the ACTOR's red and obstacle nodes: the "
+                        "belief map (control) or the red/obstacle trackers. "
+                        "The critic's ground-truth graph is the same in both.")
+    p.add_argument("--red-motion-ckpt", type=str,
+                   default=d["red_motion_ckpt"],
+                   help="Learned red motion model for the red tracker "
+                        "(--actor-obs tracker); omit for constant velocity.")
+    p.add_argument("--tracker-red-slots", type=int,
+                   default=d["tracker_red_slots"])
+    p.add_argument("--tracker-obstacle-slots", type=int,
+                   default=d["tracker_obstacle_slots"])
+    p.add_argument("--tracker-sigma-cutoff", type=float,
+                   default=d["tracker_sigma_cutoff"],
+                   help="Red tracks with position sd above this (m) are "
+                        "not shown to the actor.")
     p.add_argument("--eval-interval", type=int, default=25,
                    help="Every N rollouts, DETERMINISTICALLY evaluate the "
                         "learned policy (the metric comparable to Stage 3; "
@@ -404,7 +431,8 @@ def main() -> None:
         obstacle_radius_min     = args.obstacle_radius_min,
         obstacle_radius_max     = args.obstacle_radius_max,
         obstacle_spawn_clearance= args.obstacle_spawn_clearance,
-        use_belief_maps         = True,
+        # The belief map is only computed when it is the actor's source.
+        use_belief_maps         = args.actor_obs == "belief",
         belief_grid_size        = args.belief_grid_size,
         belief_channels         = args.belief_channels,
         belief_clip             = args.belief_clip,
@@ -423,6 +451,13 @@ def main() -> None:
         sensor_vel_noise_std    = args.sensor_vel_noise_std,
         track_conf_min          = args.track_conf_min,
         sensor_noise_range_growth = args.sensor_noise_range_growth,
+        clutter_rate            = args.clutter_rate,
+        obstacle_radius_noise_std = args.obstacle_radius_noise_std,
+        actor_obs               = args.actor_obs,
+        red_motion_ckpt         = args.red_motion_ckpt,
+        tracker_red_slots       = args.tracker_red_slots,
+        tracker_obstacle_slots  = args.tracker_obstacle_slots,
+        tracker_sigma_cutoff    = args.tracker_sigma_cutoff,
         # Reward shape — config-only (no CLI flags: these define the task,
         # they are not per-run knobs).  Recorded in the saved args below so
         # a checkpoint still pins the reward it was trained under.
@@ -458,7 +493,11 @@ def main() -> None:
                                              "belief_grid_size", "belief_channels",
                                              "belief_clip", "p_TP", "p_FP",
                                              "ray_step_size",
-                                             "obstacle_spawn_clearance")}
+                                             "obstacle_spawn_clearance",
+                                             "actor_obs", "red_motion_ckpt",
+                                             "tracker_red_slots",
+                                             "tracker_obstacle_slots",
+                                             "tracker_sigma_cutoff")}
         log("Computing heuristic baselines for reference "
             "(NOTE: baselines use sensor_radius=None; belief-map "
             "training runs in partial-obs env)...")
@@ -508,6 +547,13 @@ def main() -> None:
         blue_feat_dim     = vec_env.blue_feat_dim,
         red_feat_dim      = 4,   # [conf, Sxx, Syy, Sxy]  (velocity cov)
         obs_feat_dim      = 5,   # [placed/conf, radius/L, Sxx, Syy, Sxy]
+        # The actor's graph sizing comes from the env: identical to the
+        # critic's in belief mode, fixed slots and wider uncertainty
+        # features in tracker mode.
+        actor_n_red        = vec_env.actor_n_red,
+        actor_n_obs        = vec_env.actor_n_obstacles,
+        actor_red_feat_dim = vec_env.actor_red_feat_dim,
+        actor_obs_feat_dim = vec_env.actor_obs_feat_dim,
         edge_feat_dim     = vec_env.edge_feat_dim,
         action_dim        = action_dim,
         d_hidden          = args.d_hidden,

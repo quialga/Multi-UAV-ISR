@@ -21,6 +21,10 @@ from gymnasium import spaces
 from pettingzoo.utils.env import ParallelEnv
 
 from isr.env.entities import BLUE_UAV, RED_TARGET
+from isr.tracking import actor_graph
+from isr.tracking.coverage import (
+    disk_occluder, segment_disk_occluded, sensor_coverage,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -298,6 +302,21 @@ class PursuitEnv(ParallelEnv):
         # behaviour), so raw_obstacle_detections stays noiseless unless
         # asked.
         obstacle_radius_noise_std: float = 0.0,
+        # ----- Actor observation source -----------------------------------
+        # "belief" (default): the belief-map path — _build_enemy_tracks /
+        # _build_obstacle_tracks — kept byte-identical as the CONTROL.
+        # "tracker": the red and obstacle TRACKERS, fed by raw_detections()
+        # / raw_obstacle_detections(), become the actor's red and obstacle
+        # nodes (isr.tracking.actor_graph, docs/tracker_observation.md).
+        # The critic's ground-truth keys are identical in both modes.
+        actor_obs:                str   = "belief",
+        # Learned red motion model checkpoint for the red tracker (tracker
+        # mode only); None = constant velocity.
+        red_motion_ckpt:          Optional[str] = None,
+        # Actor slots and the red position-sd cut-off (tracker mode only).
+        tracker_red_slots:        int   = 8,
+        tracker_obstacle_slots:   int   = 12,
+        tracker_sigma_cutoff:     float = 40.0,
         # ----- Crash penalties (per-agent shaped reward) ------------------
         # Both default 0.0 (off) so the shared-team-reward behaviour is
         # byte-preserved unless enabled.  When > 0, a crashing blue takes
@@ -493,6 +512,23 @@ class PursuitEnv(ParallelEnv):
         self.vel_prior_std             = float(vel_prior_std)
         self.clutter_rate              = float(clutter_rate)
         self.obstacle_radius_noise_std  = float(obstacle_radius_noise_std)
+        if actor_obs not in ("belief", "tracker"):
+            raise ValueError(f"actor_obs must be 'belief' or 'tracker', "
+                             f"got {actor_obs!r}")
+        self.actor_obs = actor_obs
+        self.red_motion_ckpt = red_motion_ckpt
+        self.tracker_red_slots = int(tracker_red_slots)
+        self.tracker_obstacle_slots = int(tracker_obstacle_slots)
+        self.tracker_sigma_cutoff = float(tracker_sigma_cutoff)
+        if actor_obs == "tracker":
+            if sensor_radius is None:
+                raise ValueError("actor_obs='tracker' needs a sensor_radius")
+            assert self.tracker_red_slots >= 1
+            assert self.tracker_obstacle_slots >= 1
+            assert self.tracker_sigma_cutoff > 0.0
+        elif red_motion_ckpt is not None:
+            raise ValueError("red_motion_ckpt is only used with "
+                             "actor_obs='tracker'")
         assert self.vel_prior_std > 0.0
         assert self.clutter_rate >= 0.0
         assert self.obstacle_radius_noise_std >= 0.0
@@ -613,6 +649,38 @@ class PursuitEnv(ParallelEnv):
         self.n_bb_edges = len(self.bb_edge_src)   # N_blue * (N_blue - 1)
         self.n_rb_edges = len(self.rb_edge_src)   # N_red * N_blue
 
+        # ---- Actor graph sizing (what the ACTOR encoder must be built for)
+        # Belief mode: one red slot per red and one obstacle slot per
+        # obstacle, [conf, Sxx, Syy, Sxy] and [conf, r/L, Sxx, Syy, Sxy].
+        # Tracker mode: fixed slot capacities decoupled from the true counts
+        # (isr.tracking.actor_graph).  The critic always uses n_red /
+        # n_obstacles with the belief-mode feature widths.
+        if self.actor_obs == "tracker":
+            self.actor_n_red = self.tracker_red_slots
+            self.actor_n_obstacles = (self.tracker_obstacle_slots
+                                      if self.n_obstacles > 0 else 0)
+            self.actor_red_feat_dim = actor_graph.RED_FEAT_DIM
+            self.actor_obs_feat_dim = actor_graph.OBS_FEAT_DIM
+        else:
+            self.actor_n_red = self.n_red
+            self.actor_n_obstacles = self.n_obstacles
+            self.actor_red_feat_dim = 4
+            self.actor_obs_feat_dim = 5
+
+        # Tracker-mode state: trackers are rebuilt at every reset; the
+        # learned motion model (if any) is loaded once.
+        self._red_tracker = None
+        self._obstacle_tracker = None
+        self._red_motion = None
+        if self.actor_obs == "tracker" and red_motion_ckpt is not None:
+            from isr.agents.learned_red_motion import (
+                LearnedRedMotion, load_red_motion_model,
+            )
+            model, blue_cap, obs_cap = load_red_motion_model(red_motion_ckpt)
+            self._red_motion = LearnedRedMotion(
+                model, blue_cap, obs_cap, arena_size=self.arena_size,
+                **actor_graph.LEARNED_MOTION_CONFIG)
+
         # Mutable state — initialised in reset().
         self._blue_pos:   Optional[np.ndarray] = None
         self._blue_vel:   Optional[np.ndarray] = None
@@ -725,6 +793,16 @@ class PursuitEnv(ParallelEnv):
             g = self.belief_grid_size
             self._staleness = np.full((g, g), self.max_steps, dtype=np.int32)
             self._staleness[self._observed_cells_mask()] = 0
+
+        # Tracker mode: fresh trackers, then the step-0 scan, so the first
+        # observation reflects what the blues see from their spawn points
+        # (exactly as the belief map is updated above).
+        if self.actor_obs == "tracker":
+            self._red_tracker = actor_graph.make_red_tracker(self._red_motion)
+            self._obstacle_tracker = actor_graph.make_obstacle_tracker(
+                static=not (self.moving_obstacle_fraction > 0.0
+                            and self.obstacle_speed > 0.0))
+            self._update_actor_trackers()
 
         obs = {a: self._build_obs(i) for i, a in enumerate(self.possible_agents)}
         info = {a: {} for a in self.possible_agents}
@@ -929,6 +1007,11 @@ class PursuitEnv(ParallelEnv):
         # "observed" means the footprint the blues occupy now.
         if self.use_staleness:
             self._update_staleness()
+        # Tracker mode: one scan per env step, here and only here — the
+        # observation builder only READS the trackers, so building the
+        # observation twice cannot advance them twice.
+        if self.actor_obs == "tracker":
+            self._update_actor_trackers()
 
         # 8. Pack the per-agent dicts:
         #        r_i = r_team + r_crash_i + r_clear_i - action_cost_i
@@ -1473,12 +1556,23 @@ class PursuitEnv(ParallelEnv):
         rel_pos = dst_pos - src_pos                           # (E, 2)
         rel_vel = dst_vel - src_vel                           # (E, 2)
         ranges  = np.linalg.norm(rel_pos, axis=1)             # (E,)
-        # Bearing in sender frame — reuse the same helper.
+        # Bearing in sender frame: _bearing_features' formula, one sender
+        # per edge, vectorised over edges.  The per-edge Python loop it
+        # replaces was ~20 ms per step at the training geometry; the result
+        # is bit-identical (checked on 154k random edges, zero velocities
+        # and zero ranges included).
+        eps = 1e-6
         bearing = np.zeros((rel_pos.shape[0], 2), dtype=np.float32)
-        for i in range(rel_pos.shape[0]):
-            bearing[i] = self._bearing_features(
-                src_vel[i], rel_pos[i:i + 1], ranges[i:i + 1],
-            )[0]
+        speed = np.linalg.norm(src_vel, axis=1)
+        moving = speed >= eps
+        vel_dir = src_vel / np.where(moving, speed, 1.0)[:, None]
+        safe_ranges = np.where(ranges > eps, ranges, 1.0)
+        rel_dir = rel_pos / safe_ranges[:, None]
+        cos_b = rel_dir[:, 0] * vel_dir[:, 0] + rel_dir[:, 1] * vel_dir[:, 1]
+        sin_b = vel_dir[:, 0] * rel_dir[:, 1] - vel_dir[:, 1] * rel_dir[:, 0]
+        m = moving & (ranges > eps)
+        bearing[m, 0] = cos_b[m]
+        bearing[m, 1] = sin_b[m]
         return np.concatenate([
             (rel_pos / L).astype(np.float32),
             (rel_vel / v_max).astype(np.float32),
@@ -1874,40 +1968,13 @@ class PursuitEnv(ParallelEnv):
         -------
         occluded : (K,) bool
         """
-        K = cell_centres.shape[0]
-        if self._obstacle_pos is None or len(self._obstacle_pos) == 0:
-            return np.zeros(K, dtype=bool)
-
-        d = cell_centres - uav_pos[None, :]                # (K, 2)
-        seg_len = np.linalg.norm(d, axis=-1)               # (K,)
-        seg_len = np.maximum(seg_len, 1e-6)
-
-        oc = self._obstacle_pos - uav_pos[None, :]         # (n_obs, 2)
-        oc_len2 = np.sum(oc * oc, axis=-1)                 # (n_obs,)
-        r = self._obstacle_r                               # (n_obs,)
-
-        # Closest-approach parameter of each obstacle centre along each
-        # ray: t_hat (K, n_obs) = (d · oc) / |d|².
-        dot = d @ oc.T                                     # (K, n_obs)
-        t_hat = dot / (seg_len ** 2)[:, None]
-
-        # Perpendicular (line-to-centre) distance squared.
-        proj_len2 = (t_hat * seg_len[:, None]) ** 2        # (K, n_obs)
-        perp2 = oc_len2[None, :] - proj_len2               # (K, n_obs)
-
-        disc = r[None, :] ** 2 - perp2                     # (K, n_obs)
-        intersects = disc > 0.0
-        sqrt_disc = np.sqrt(np.maximum(disc, 0.0))
-        half_chord_t = sqrt_disc / seg_len[:, None]        # in ray params
-        t1 = t_hat - half_chord_t                          # entry
-        t2 = t_hat + half_chord_t                          # exit
-
-        # Cut the ray ``ray_step_size`` metres before the cell centre so
-        # the first obstacle boundary cell stays observable.
-        t_cut = 1.0 - (self.ray_step_size / seg_len)       # (K,)
-
-        blocked = intersects & (t2 > 0.0) & (t1 < t_cut[:, None])
-        return np.any(blocked, axis=1)                     # (K,)
+        # The margin cuts the ray ``ray_step_size`` metres before the cell
+        # centre so the first obstacle boundary cell stays observable.  The
+        # math lives in isr.tracking.coverage so the actor path can run the
+        # same test on the obstacle tracker's estimates.
+        return segment_disk_occluded(uav_pos, cell_centres,
+                                     self._obstacle_pos, self._obstacle_r,
+                                     self.ray_step_size)
 
     def _predict_enemy_belief(self) -> None:
         """
@@ -3057,6 +3124,75 @@ class PursuitEnv(ParallelEnv):
                 edge_feat[o * N:(o + 1) * N] = 0.0
         return node_feat, edge_feat
 
+    # ------------------------------------------------------------------ #
+    #  Tracker mode (actor_obs="tracker")                                 #
+    # ------------------------------------------------------------------ #
+
+    def _update_actor_trackers(self) -> None:
+        """One scan of the actor-path trackers.
+
+        Order matters and removes every ground-truth dependency: the
+        obstacle tracker steps first, and its CONFIRMED estimates — centres,
+        velocities and noisy radii, never the true obstacles — then feed
+        both the learned red motion model's context and the occlusion test
+        of the red tracker's coverage-aware miss accounting.  The detections
+        themselves are physics (true geometry), as they must be.
+        """
+        self._obstacle_tracker.step(self.raw_obstacle_detections())
+        o_pos, o_vel, o_r = actor_graph.confirmed_obstacle_geometry(
+            self._obstacle_tracker.tracks)
+        if self._red_motion is not None:
+            has = len(o_pos) > 0
+            self._red_motion.set_context(
+                blue_pos=self._blue_pos, blue_vel=self._blue_vel,
+                obs_pos=o_pos if has else None,
+                obs_vel=o_vel if has else None,
+                obs_r=o_r if has else None)
+        occluded = (disk_occluder(o_pos, o_r, self.ray_step_size)
+                    if self.track_occlusion and len(o_pos) else None)
+        coverage = sensor_coverage(self._blue_pos.copy(), self.sensor_radius,
+                                   occluded=occluded,
+                                   k_sigma=actor_graph.COVERAGE_K_SIGMA)
+        self._red_tracker.step(self.raw_detections(), coverage=coverage)
+
+    def _slot_edges(self, pos: np.ndarray, vel: np.ndarray,
+                    present: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """7-D slot->blue edges, ordered ``for s in K: for b in N`` like
+        every other entity->blue edge set, and the binary visibility mask.
+        Padding slots get zero features and visibility 0."""
+        N = self.n_blue
+        K = pos.shape[0]
+        src_pos = np.repeat(pos, N, axis=0)
+        src_vel = np.repeat(vel, N, axis=0)
+        dst_pos = np.tile(self._blue_pos, (K, 1)).astype(np.float32)
+        dst_vel = np.tile(self._blue_vel, (K, 1)).astype(np.float32)
+        edge_vis = np.repeat(present, N).astype(np.float32)
+        edge_feat = self._edge_features_for(src_pos, src_vel, dst_pos, dst_vel)
+        edge_feat[edge_vis <= 0.0] = 0.0
+        return edge_feat, edge_vis
+
+    def _tracker_red_graph(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Actor red nodes / rb edges / rb visibility from the red tracker
+        (``isr.tracking.actor_graph.red_slots``)."""
+        s = actor_graph.red_slots(
+            self._red_tracker.tracks, self.tracker_red_slots,
+            self.tracker_sigma_cutoff, pos_scale=self.sensor_radius,
+            vel_scale=self.vel_prior_std,
+            max_coast_steps=self._red_tracker.max_coast_steps)
+        edge_feat, edge_vis = self._slot_edges(s["pos"], s["vel"], s["present"])
+        return s["feats"], edge_feat, edge_vis
+
+    def _tracker_obstacle_graph(self
+                                ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """Actor obstacle nodes / ob edges / ob visibility from the obstacle
+        tracker (``isr.tracking.actor_graph.obstacle_slots``)."""
+        s = actor_graph.obstacle_slots(
+            self._obstacle_tracker.tracks, self.tracker_obstacle_slots,
+            arena_size=self.arena_size, pos_scale=self.sensor_radius,
+            vel_scale=self.vel_prior_std)
+        edge_feat, edge_vis = self._slot_edges(s["pos"], s["vel"], s["present"])
+        return s["feats"], edge_feat, edge_vis
+
     def structured_belief_observation(self) -> Dict[str, np.ndarray]:
         """
         Stage 4 (v6) observation dict — the proven Stage 3 typed-GNN
@@ -3114,29 +3250,38 @@ class PursuitEnv(ParallelEnv):
             "true_rb_edge_features": base["rb_edge_features"],
         }
 
-        # ---- Actor enemy graph: DETECTION-SEEDED tracks ------------------
-        # Live tracks (visible reds) seeded directly from the sensor;
-        # remaining slots filled from belief-map memory peaks.  See
-        # _build_enemy_tracks.  Dead slots are conf-0 padded.
-        (track_pos, track_conf, track_red,
-         track_vel, track_vcov) = self._build_enemy_tracks()
-        red_node, rb_edge, rb_vis = self._enemy_graph_from_tracks(
-            track_pos, track_conf, track_red, track_vel, track_vcov,
-        )
+        # ---- Actor enemy graph ------------------------------------------
+        if self.actor_obs == "tracker":
+            # From the red tracker's confirmed tracks (read-only here; the
+            # trackers advance in step()).
+            red_node, rb_edge, rb_vis = self._tracker_red_graph()
+        else:
+            # DETECTION-SEEDED tracks: live tracks (visible reds) seeded
+            # directly from the sensor; remaining slots filled from
+            # belief-map memory peaks.  See _build_enemy_tracks.  Dead slots
+            # are conf-0 padded.
+            (track_pos, track_conf, track_red,
+             track_vel, track_vcov) = self._build_enemy_tracks()
+            red_node, rb_edge, rb_vis = self._enemy_graph_from_tracks(
+                track_pos, track_conf, track_red, track_vel, track_vcov,
+            )
         out["red_features"]    = red_node
         out["rb_edge_features"] = rb_edge
         out["rb_edge_visible"]  = rb_vis
 
         # ---- Obstacle graph (only when obstacles are configured) ---------
         if self.n_obstacles > 0:
-            # Live own-sensor position when a blue senses the obstacle,
-            # else the belief-map peak (command memory).  See
-            # _build_obstacle_tracks for the doctrine.
-            (obs_pos, obs_vel, obs_conf, obs_r,
-             _obs_idx, obs_vcov) = self._build_obstacle_tracks()
-            ob_node, ob_edge, ob_vis = self._obstacle_graph_from_tracks(
-                obs_pos, obs_vel, obs_conf, obs_r, obs_vcov,
-            )
+            if self.actor_obs == "tracker":
+                ob_node, ob_edge, ob_vis = self._tracker_obstacle_graph()
+            else:
+                # Live own-sensor position when a blue senses the obstacle,
+                # else the belief-map peak (command memory).  See
+                # _build_obstacle_tracks for the doctrine.
+                (obs_pos, obs_vel, obs_conf, obs_r,
+                 _obs_idx, obs_vcov) = self._build_obstacle_tracks()
+                ob_node, ob_edge, ob_vis = self._obstacle_graph_from_tracks(
+                    obs_pos, obs_vel, obs_conf, obs_r, obs_vcov,
+                )
             out["obstacle_features"] = ob_node
             out["ob_edge_features"]  = ob_edge
             out["ob_edge_visible"]   = ob_vis

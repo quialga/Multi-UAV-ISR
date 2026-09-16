@@ -89,10 +89,12 @@ class Stage4VectorPursuitEnv:
                 "Stage4VectorPursuitEnv requires env_kwargs['sensor_radius'] "
                 "to be set (belief update needs a defined sensor disk)."
             )
-        if not env_kwargs.get("use_belief_maps", False):
+        if (not env_kwargs.get("use_belief_maps", False)
+                and env_kwargs.get("actor_obs", "belief") != "tracker"):
             raise ValueError(
                 "Stage4VectorPursuitEnv requires "
-                "env_kwargs['use_belief_maps']=True."
+                "env_kwargs['use_belief_maps']=True unless "
+                "env_kwargs['actor_obs']='tracker'."
             )
         self.n_envs = int(n_envs)
 
@@ -133,6 +135,11 @@ class Stage4VectorPursuitEnv:
         self.n_blue        = e0.n_blue
         self.n_red         = e0.n_red
         self.n_obstacles   = e0.n_obstacles
+        # Actor graph sizing (differs from the critic's in tracker mode).
+        self.actor_n_red        = e0.actor_n_red
+        self.actor_n_obstacles  = e0.actor_n_obstacles
+        self.actor_red_feat_dim = e0.actor_red_feat_dim
+        self.actor_obs_feat_dim = e0.actor_obs_feat_dim
 
         # Per-env episode-tracking state.
         self._ep_return = np.zeros(self.n_envs, dtype=np.float32)

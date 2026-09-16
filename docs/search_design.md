@@ -236,10 +236,10 @@ Kept because the measurements that killed them are the useful part.
 | B — aggregation to region nodes (`staleness_regions`) | **done**, `tests/test_region_nodes.py` |
 | C — region node type + gb edges in `GNNEncoder` | **done**, `tests/test_region_graph.py` |
 | C2 — region features into `_build_obs` / the policy | not started |
-| D — tracker as the source for red/obstacle nodes | not started — next |
+| D — tracker as the source for red/obstacle nodes | **built, untrained**, `actor_obs="tracker"`, docs/tracker_observation.md |
 | E — learned attention over regions | not started |
 
-Nothing in A–C reaches the policy yet (C2). All of it is off by default:
+Nothing in A–C reaches the policy yet (C2); D does, behind its own flag. All of it is off by default:
 the env with `use_staleness=False` is unchanged step for step
 (`test_disabled_env_is_unchanged_step_for_step`), and the encoder with
 `n_region=0` is bit-identical to the pre-coverage version. C2 and D change
