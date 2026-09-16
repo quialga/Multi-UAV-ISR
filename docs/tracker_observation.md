@@ -27,10 +27,11 @@ Both node types come from `isr/tracking/actor_graph.py`.
 
 * **Only confirmed tracks.** A tentative track is a hypothesis the tracker
   itself has not accepted; it never becomes a node.
-* **A red track is dropped above a position-sd cut-off** (`σ ≤ 40 m`, the
-  sensor radius). Below it the red is within 40 m of the readout in ≥ 98%
-  of track-steps; above it that falls to 63–78%
-  (docs/tracking_diagnostics.md §6.4).
+* **A red track is dropped above a position-sd cut-off**
+  (`--tracker-sigma-cutoff`, 40 m, the sensor radius). Below it, a blue
+  flying to the readout very likely has the red inside its radar; above it,
+  no longer (§2.1). The tracker keeps the track internally — it can still
+  be re-acquired — and only deletes it after 80 scans without a hit.
 * **Overflow keeps the smallest σ.** K = 8 red slots (2 × `n_red`) and
   K = 12 obstacle slots (`n_obstacles` + 3) hold the measured maxima with
   margin.
@@ -58,6 +59,53 @@ Node features (all bounded; sds are `tanh(sd / scale)`, correlations in
 Edges are the usual 7-D `[rel_pos, rel_vel, range, bearing]` from each slot
 to each blue, zeroed on padding slots — the same layout and ordering as the
 belief path, so the GNN itself is untouched.
+
+### 2.1 What σ is, in metres, and what the cut-off does with it
+
+A track's uncertainty is a covariance MATRIX, not a distance. The cut-off
+turns it into one number:
+
+1. The state is `[px, py, vx, vy]` with a 4×4 covariance. Keep the 2×2
+   position block, in m²:
+
+   ```
+   P_pos = [ σx²       ρ·σx·σy ]
+           [ ρ·σx·σy   σy²     ]
+   ```
+
+   For a track holding several hypotheses, take the covariance of the whole
+   mixture first (weighted covariances plus the spread between the
+   components' means).
+2. That matrix describes an uncertainty ELLIPSE: its eigenvectors are the
+   ellipse's axes, its eigenvalues the variances along them.
+3. `σ = sqrt(largest eigenvalue)` — the standard deviation along the most
+   uncertain direction, in metres (`actor_graph.max_sd`).
+
+Why the largest eigenvalue and not σx or σy: the ellipse can be rotated,
+and then the axes mislead. With `σx = σy = 20 m` and correlation 0.9, the
+eigenvalues are 760 and 40 m², i.e. **27.6 m** along the diagonal and
+6.3 m across it — an ellipse stretched diagonally, which is what a red
+fleeing on a diagonal produces. The largest eigenvalue catches the worst
+case whatever the orientation.
+
+That single number is used for two things only: the cut-off, and choosing
+which tracks keep a slot when there are more tracks than slots. **The actor
+receives the full matrix** as three features (σx, σy, ρ), so the network
+does see the ellipse's shape and orientation.
+
+Two things worth keeping in mind:
+
+* **σ is one standard deviation, not a radius that "surely" contains the
+  red.** For an honest round 2-D Gaussian the red is within 1σ only ~39% of
+  the time. Measured, shown tracks do much better than that (≥ 91% within
+  40 m even in the 30–40 m σ band), because most shown tracks sit well
+  below the cut-off and because the covariance of coasting tracks is still
+  somewhat conservative (docs/tracking_diagnostics.md §11.6).
+* **The cut-off acts on the uncertainty the tracker DECLARES, not on its
+  actual error.** Calibrating `sigma_a_model` from 0.35 to 0.20 made the
+  declared σ honest, which lets slightly older tracks through the same
+  40 m cut-off — docs/tracking_diagnostics.md §11.6 explains why and gives
+  the numbers. Lowering the flag restores the stricter behaviour.
 
 ## 3. No ground truth anywhere in the actor path
 
@@ -140,5 +188,10 @@ oversubscription, not the observation.)
 * The learned model v3 was trained at L=130 on stochastic reds; training
   runs at L=200 with the stationary/random/run mix, so it is out of its
   distribution (docs/tracking_diagnostics.md §6.3).
+* **Moving obstacles are not ready.** The env switches the obstacle tracker
+  away from the static model automatically, but then drifting tracks come
+  back (0.27 misleading per step) and nothing can delete them yet; they
+  also make the duplicate merge riskier. docs/tracking_diagnostics.md §9.6
+  ("What changes with moving obstacles") lists what is needed first.
 * Region / coverage nodes (docs/search_design.md) are a separate stage and
   are not part of this one.

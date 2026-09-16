@@ -109,11 +109,6 @@ def _dwna_Q(dt: float, sigma_a: float) -> np.ndarray:
     return Q * (sigma_a ** 2)
 
 
-def _max_sd(P_pos: np.ndarray) -> float:
-    """Standard deviation along the most uncertain axis of a 2x2 covariance."""
-    return float(np.sqrt(max(np.linalg.eigvalsh(P_pos).max(), 0.0)))
-
-
 # --------------------------------------------------------------------- #
 #  Gaussian Sum primitives
 # --------------------------------------------------------------------- #
@@ -208,11 +203,6 @@ class Track:
         # staleness, whatever the coverage model decided about each miss.
         self.steps_since_hit = 0
         self.confirmed = False
-        # Where the track stood at its last hit, and how sure it was then —
-        # the anchor of the kinematic reach gate (MultiTargetTracker
-        # max_target_speed).  Refreshed on every hit, never on a miss.
-        self.last_hit_pos = np.asarray(x, dtype=np.float64)[:2].copy()
-        self.last_hit_sd = _max_sd(np.asarray(P, dtype=np.float64)[:2, :2])
 
     @property
     def _dominant(self) -> _Component:
@@ -276,8 +266,6 @@ class MultiTargetTracker:
         gate_chi2_doppler: float = CHI2_99[3],
         max_coast_steps: Optional[int] = None,
         confirm_deadline: bool = False,
-        max_target_speed: Optional[float] = None,
-        reach_k_sigma: float = 3.0,
         reacquire_after: Optional[int] = None,
     ) -> None:
         # Plug point for a LEARNED transition model.  A callable
@@ -443,49 +431,24 @@ class MultiTargetTracker:
         # Off by default: tentatives then fall under max_misses like every
         # other track, the original behaviour.
         self.confirm_deadline = bool(confirm_deadline)
-        # KINEMATIC REACH GATE: a return can join a track only if the target
-        # could physically have got there since the track's last hit —
-        #     |z - last_hit_pos| <= max_target_speed * k * dt
-        #                           + reach_k_sigma * sqrt(sigma_z^2 + sd_hit^2)
-        # with k the scans since that hit, sigma_z the return's position sd
-        # and sd_hit the track's position sd right after the hit.  Applied
-        # ON TOP of the chi^2 gate, never instead of it.
-        #
-        # Why: the chi^2 gate is only as tight as the predicted covariance,
-        # and that grows much faster than any target can move — the CV model
-        # has sd 7 m after 3 coasted scans (gate ~22 m) for a red that can
-        # have moved at most ~4 m.  At clutter 0.2 a coasting track caught a
-        # false plot inside that gate, the hit reset its misses and shrank
-        # its covariance, and it lived on clutter alone: 16% of confirmed CV
-        # tracks with sd <= 10 m were more than 40 m from their target
-        # (learned model 5%), and none at clutter 0.  Such a track looks
-        # CONFIDENT, so no sd threshold can filter it
-        # (docs/tracking_diagnostics.md §6.3).
-        #
-        # max_target_speed is a SPEED, not a per-axis bound: PursuitEnv caps
-        # velocity axis-wise at v_max, so a red reaches sqrt(2) * v_max on a
-        # diagonal.  None disables the gate (the original behaviour).
-        if max_target_speed is not None and max_target_speed <= 0.0:
-            raise ValueError("max_target_speed must be positive or None")
-        self.max_target_speed = (None if max_target_speed is None
-                                 else float(max_target_speed))
-        self.reach_k_sigma = float(reach_k_sigma)
         # RE-ACQUISITION WITH CONFIRMATION: a track that has gone
         # `reacquire_after` or more scans without a hit is LOST for
         # association — no single return can re-attach to it.  Returns near
         # it start a tentative instead, which must pass the normal M-of-N;
         # when it confirms, it absorbs the closest lost confirmed track whose
-        # prediction it falls inside (chi^2 gate on both covariances, and the
-        # reach gate when that is on), taking over its id.  None = off.
+        # prediction it falls inside (chi^2 gate on both covariances), taking
+        # over its id.  None = off.
         #
         # Why: after about four coasted scans a single return on a confirmed
         # track is more likely clutter than the target (share of hits that
         # were clutter at clutter 0.2: 60% CV / 32% learned at 4-10 scans,
-        # 80-100% beyond), and the physically admissible reach is by then too
-        # large for the reach gate to reject it (docs §6.3).  Clutter rarely
-        # passes M-of-N, so demanding it again on re-acquisition removes the
-        # single-plot capture at the price of a real re-acquisition
-        # reappearing a few scans later.  Measured with reacquire_after=4 at
+        # 80-100% beyond; docs §6.3).  Bounding association by how far the
+        # target could have moved does not fix it: by then that reach is
+        # legitimately large (a kinematic reach gate was built, measured and
+        # removed — it halved the problem for CV and added nothing on top of
+        # this; docs §6.3-§6.4).  Clutter rarely passes M-of-N, so demanding
+        # it again on re-acquisition removes the single-plot capture at the
+        # price of a real re-acquisition reappearing a few scans later.  Measured with reacquire_after=4 at
         # clutter 0.2: misleading confirmed tracks with sd <= 10 m 0.24 ->
         # 0.00 per step (CV) and 0.07 -> 0.00 (learned); MOTA within 0.03 of
         # clutter 0 for both (docs §6.4).
@@ -682,26 +645,6 @@ class MultiTargetTracker:
             return H, R, z
         return self.H_pos, np.eye(2) * sp2, z_pos
 
-    def _within_reach(self, tr: Track, det: Dict) -> bool:
-        """Kinematic reach gate — see ``max_target_speed`` in __init__.
-        Called during association, BEFORE this scan's hits are booked, so
-        ``steps_since_hit + 1`` is the number of scans since the last hit."""
-        return self._reach_ok(tr, det["z_pos"], float(det["sigma_pos"]),
-                              tr.steps_since_hit + 1)
-
-    def _reach_ok(self, tr: Track, z: np.ndarray, sigma_z: float,
-                  scans: int) -> bool:
-        """Is position ``z`` (1-sigma ``sigma_z``) within the distance the
-        target could have covered in ``scans`` scans since the track's last
-        hit?  Always True when the reach gate is off."""
-        if self.max_target_speed is None:
-            return True
-        margin = self.reach_k_sigma * float(np.hypot(sigma_z, tr.last_hit_sd))
-        reach = self.max_target_speed * scans * self.dt + margin
-        dist = float(np.linalg.norm(
-            np.asarray(z, dtype=np.float64) - tr.last_hit_pos))
-        return dist <= reach
-
     def _is_lost(self, tr: Track) -> bool:
         """Excluded from association — see ``reacquire_after``.  Evaluated
         during association, before this scan's hits are booked, so
@@ -724,9 +667,6 @@ class MultiTargetTracker:
                 S = old.P[:2, :2] + new.P[:2, :2]
                 d2 = float(dv @ np.linalg.solve(S, dv))
                 if d2 > self.gate_chi2:
-                    continue
-                sd_new = _max_sd(new.P[:2, :2])
-                if not self._reach_ok(old, new.pos, sd_new, old.steps_since_hit):
                     continue
                 if best_d2 is None or d2 < best_d2:
                     best, best_d2 = old, d2
@@ -890,8 +830,7 @@ class MultiTargetTracker:
                     for j, k in enumerate(idxs):
                         d2, c = self._gate_pos(tr, dets[k])
                         cost[i, j] = c
-                        gate[i, j] = (d2 <= thresh[j]
-                                      and self._within_reach(tr, dets[k]))
+                        gate[i, j] = d2 <= thresh[j]
                 for i, j in solve_gated(cost, gate):
                     assignments.append((i, idxs[j]))
 
@@ -924,8 +863,6 @@ class MultiTargetTracker:
                 tr.history.append(True)
                 tr.misses = 0
                 tr.steps_since_hit = 0
-                tr.last_hit_pos = tr.pos
-                tr.last_hit_sd = _max_sd(tr.P[:2, :2])
             else:
                 tr.history.append(False)
                 tr.steps_since_hit += 1

@@ -379,8 +379,8 @@ as a hit, which resets the misses, shrinks the covariance and moves the
 estimate onto the plot, and the track lives on. Such a track reports a
 SMALL σ, so no σ cut-off can remove it from the actor's graph.
 
-**The kinematic reach gate** (`max_target_speed`, `tests/test_reach_gate.py`)
-bounds association by physics: a return joins a track only within
+**The kinematic reach gate** (`max_target_speed`; removed from the code after
+§6.4 — last present in commit 8d026ab) bounded association by physics: a return joins a track only within
 `max_target_speed · scans_since_hit + 3·sqrt(σ_z² + σ_hit²)` of where the
 track stood at its last hit, with `max_target_speed = √2` (the env caps red
 velocity at 1 m/s per axis). Same 15 episodes, clutter 0.2:
@@ -417,9 +417,8 @@ likely clutter than the target, and by then the physically admissible reach
 (√2 m per scan) is legitimately large, so no bound on speed rejects it. The
 evidence that is missing is not WHERE the return is but HOW MUCH one return
 is worth against the clutter density when the track could be anywhere in a
-wide region. The reach gate stays in the code, off by default, and is not
-part of the chosen configuration; the long-coast re-acquisition problem is
-open.
+wide region. §6.4 solves this with re-acquisition; the reach gate adds
+nothing on top of it and was removed.
 
 Two more results from the same run:
 
@@ -444,8 +443,8 @@ a long coast is no longer trusted on its own:
 this many scans without a hit is LOST for association, so no single return
 re-attaches to it. Returns near it start a tentative, which must pass the
 normal 3-of-4 with deadline; when it confirms, it absorbs the closest lost
-confirmed track consistent with it (χ² on both covariances, plus the reach
-gate when on) and takes over its id. Clutter rarely passes 3-of-4, so the
+confirmed track consistent with it (χ² on both covariances) and takes over
+its id. Clutter rarely passes 3-of-4, so the
 single-plot capture of §6.3 disappears; a real re-acquisition reappears in
 the graph a few scans later. `reacquire_after = 4` is read off §6.3's
 clutter-share table (clutter < 3% of hits up to 3 scans, 32–60% at 4–10);
@@ -471,7 +470,10 @@ is the same across rows.
   confirmed tracks with σ ≤ 10 m fall to 0.00 per step (at most one on a
   rare step, for CV).
 * **The reach gate adds nothing on top** (same misleading count, slightly
-  lower MOTA, more FP). It stays off.
+  lower MOTA, more FP), so it was removed from the code. Without it, a
+  re-acquired track can inherit the id of a lost track further away than the
+  red could have travelled; that only affects ids (the MOT identity
+  metrics), never what the actor sees.
 * **The learned model's FP rise** (462 → 587) is consistent with lost
   tracks now coasting on with a large, honest σ instead of being reset by
   clutter: its track-steps with σ > 40 m go from 2 to 1634. MOT counts them
@@ -493,7 +495,9 @@ readout, clutter 0.2 with re-acquisition:
 * **σ cut-off τ = 40 m** (largest eigen-sd of the moment-matched mixture's
   position covariance): below it a blue flying to the readout has the red
   within its sensor radius in ≥ 98% of track-steps; above it that drops to
-  63–78%.
+  63–78%. (Measured with `sigma_a_model` 0.35. After calibrating it to 0.20
+  the 30–40 m band drops to 0.91 for the learned model; §11.6 explains why
+  and keeps the cut-off at 40 m.)
 * **K = 8 red slots** (2 × `n_red`). After the cut-off: p99 4–5, max 5–6
   confirmed tracks per step against at most 4 reds. Random blues; a trained
   team that converges several blues on one red could raise duplicates, hence
@@ -970,27 +974,36 @@ and identical fix, to the red tracker's
 
 Measured with real association at the Stage 4 training geometry (L=200,
 7 random blues, 9 obstacles, all static as in every stage4 config to date),
-radius noise 2 m, 3-of-4 confirmation with deadline and a policy-facing
-"never forget" miss budget. §9.3's insensitivity to `sigma_a` was measured
-with ORACLE association and does not cover this regime.
+radius noise 2 m, 3-of-4 confirmation with deadline, and a "never forget"
+policy for confirmed obstacles (they do not move, so there is no reason to
+delete one). §9.3's insensitivity to `sigma_a` was measured with ORACLE
+association and does not cover this regime.
 
-With the default `sigma_a = 0.1` there were up to 13–14 confirmed tracks for
-9 obstacles. Following the duplicate events (`scratch/debug_obstacle_dups.py`)
-shows two populations:
+With the default `sigma_a = 0.1` the tracker held up to 13–14 confirmed
+tracks for 9 obstacles, with a centre error p90 of 11 m. Following the
+duplicate events (`scratch/debug_obstacle_dups.py`) shows two separate
+mechanisms.
 
-* **Drift.** Old tracks with velocity estimated from noise (up to 1.7 m/s for
-  a static obstacle), coasting unobserved and never deleted: centre error
-  p90 69 m, position sd p90 29 m, misses p90 51. When the obstacle is seen
-  again the return falls outside the drifted gate and a new track is born.
-* **Splits.** A new confirmed track beside a good one (centre error median
-  1.7 m). Likely mechanism, not traced return by return: the 99% gate
-  rejects ~1% of genuine returns, a rejected return starts a tentative, and
-  with several blues observing the same obstacle both tracks keep receiving
-  returns, so the tentative confirms.
+**Drift.** An obstacle track's state includes a velocity. Measurements are
+noisy, so the estimated velocity is never exactly 0 — it reached 1.7 m/s
+for obstacles that do not move. While nobody is looking, the filter
+predicts `position + velocity · dt` every step, so the track slides away.
+On top of that, with `sigma_a = 0.1` its uncertainty keeps growing. Because
+confirmed obstacles are never forgotten, the drifting track stays alive
+(centre error p90 69 m, position sd p90 29 m, 51 scans unobserved at p90).
+When a blue sees the obstacle again, the return falls outside the drifted
+track's gate, and a second track is born.
+
+**Splits.** The 99% gate rejects about 1% of genuine returns by
+construction. A rejected return opens a tentative track next to the good
+one, and because several blues often see the same obstacle at once, both
+tracks keep receiving returns and the tentative confirms. (Likely
+mechanism, consistent with the diagnostic — new duplicates sit a median
+1.7 m from the centre — but not traced return by return.)
 
 Variants on identical detections (`scratch/obstacle_variants.py`,
-10 episodes; "misleading" = a confirmed track more than 8 m from its
-labelled centre):
+10 episodes; "misleading" = a confirmed track more than 8 m from the centre
+of its obstacle):
 
 | variant | confirmed mean / p99 / max | duplicates mean / max | misleading / step | centre err p50 / p90 / max | radius err p90 |
 |---|---|---|---|---|---|
@@ -999,18 +1012,56 @@ labelled centre):
 | **static + merge** | 7.14 / 10 / 10 | **0.18 / 1** | **0** | 0.20 / 0.75 / 3.6 m | 0.84 m |
 | current + merge | 6.14 / 10 / 11 | 0.20 / 2 | 0.27 | 0.86 / 4.19 / 186 m | 1.17 m |
 
-The **static model** (no process noise, velocity pinned at 0) removes the
-drift outright: a track that nobody observes keeps its estimate and its
-covariance. It is only valid when obstacles are known to be static; with
-patrolling obstacles `sigma_a = 0.1` is required (§9.3) and the drift comes
-back — the merge alone does not fix it (last row). The **duplicate merge**
-(`merge_chi2`, 3-dof χ² on `[px, py, r]`, `tests/test_obstacle_merge.py`)
-halves the remaining splits; two real obstacles cannot trigger it because
-the env places them with centres at least `r_a + r_b + 1 m` (≥ 11 m) apart.
+**The static model** (`sigma_a = 0`, `vel_prior_std = 0`) is configuration
+only, no code. With no process noise the covariance does not grow, and with
+the velocity prior at zero the filter pins the velocity at 0 with a tiny
+variance, so no update can move it. No velocity, no drift: a track nobody
+observes keeps exactly its estimate and its covariance.
 
-Cost is still open: in a quiet run the obstacle tracker took 2.8 ms per step
-against 2.1 ms for `env.step` (the per-variant timings in the table's
-script ran alongside other jobs and are not usable).
+**The duplicate merge** (`merge_chi2`, `tests/test_obstacle_merge.py`)
+compares pairs of tracks on position and radius with a 3-degree-of-freedom
+χ² test, and merges the pairs that are statistically the same obstacle
+(the survivor is the confirmed / older track, keeping the more certain
+estimate). Two real obstacles can never pass it, because the env places
+them without overlap: their centres are at least `r_a + r_b + 1 m` apart,
+i.e. 11 m or more. It halves the splits that remain with the static model.
+
+With both, the maximum is 10 confirmed tracks for 9 obstacles; the actor
+observation uses **K = 12** obstacle slots (`n_obstacles + 3`) for margin.
+
+#### What changes with moving obstacles
+
+The env already switches automatically: with `moving_obstacle_fraction` and
+`obstacle_speed` both above zero, `PursuitEnv` builds the obstacle tracker
+with `sigma_a = 0.1` instead of the static model. It has to — with the
+velocity pinned at 0 the filter cannot represent motion at all and would
+lose every moving obstacle.
+
+But then the drift comes back, and it is measured: with `sigma_a = 0.1`
+plus the merge (last row) there are still 0.27 misleading tracks per step
+and the worst centre error reaches 186 m. Two things are needed before
+training with moving obstacles (neither is built or measured yet):
+
+1. **A drifted track must be able to die.** Today it never does. The
+   natural fix is the logic the red tracker already uses (§6.1): count a
+   miss only where the obstacle should have been seen, with a finite
+   budget. If the track has drifted to a place the blues are looking at and
+   nothing is there, it dies.
+2. **The filter must tell a still obstacle from a patrolling one.** With a
+   mixed fraction the same assumption cannot hold for every obstacle. The
+   standard answer is an IMM (Interacting Multiple Model) filter: each
+   track runs a static model and a constant-velocity model in parallel, and
+   weighs which one explains the measurements better.
+
+One more risk to note (reasoning, not measured): the merge is safe today
+because, with the static model, covariances are small and the χ² test is
+strict. With `sigma_a = 0.1` and very uncertain tracks the test becomes
+permissive, and two different real obstacles could end up merged. The
+merge would then need a physical distance bound on top of the statistical
+test.
+
+Cost: 2.8 ms per step in a quiet run before the gating was batched; see
+docs/tracker_observation.md §5 for the current per-step cost.
 
 ## 10. Red-motion dataset collector
 
@@ -1478,19 +1529,42 @@ the whole sweep (MOTA within 0.05), so this is about honest uncertainty,
 not performance — which matters because the actor now consumes that
 uncertainty directly.
 
-The one cost, measured with `scratch/obs_k_sigma.py`: a smaller declared
-σ makes the observation's 40 m cut-off slightly less protective, since
-tracks that are equally wrong now report a smaller σ. Share of shown
-track-steps whose red is within 40 m of the readout:
+**Why the 40 m cut-off protects a little less with the calibrated value.**
+The actor is not shown red tracks whose position sd is above 40 m
+(`--tracker-sigma-cutoff`, docs/tracker_observation.md §2). That cut-off
+looks at the uncertainty the tracker DECLARES, not at the error it actually
+makes. Lowering `sigma_a_model` barely changes where the tracker thinks the
+red is; it changes how much uncertainty it admits to. Measured at both
+values (`scratch/obs_k_sigma.py`, medians over labelled tracks):
+
+| scans without a hit | declared σ at 0.35 | declared σ at 0.20 | actual error (either) |
+|---|---|---|---|
+| 20 | 26 m | 20 m | ~18 m |
+| 40 | 68 m | 51 m | ~26–28 m |
+
+With 0.35 the filter exaggerated: a track that had gone a long time without
+a detection declared a large σ and the 40 m cut-off removed it. After
+calibration, the same track with the same error declares a smaller σ and
+passes. The data show it: in the 30–40 m σ band, shown tracks had gone a
+median of 25 scans without a hit at 0.35, and 30 scans at 0.20 — older,
+and therefore more wrong, tracks carrying the same σ label.
+
+In other words, with the inflated σ the 40 m cut-off was in practice a
+stricter one. Now σ means what it says, and 40 cuts where it says. Share of
+shown track-steps whose red is within 40 m of the readout:
 
 | σ band | 0.35 | 0.20 | 0.15 |
 |---|---|---|---|
 | ≤ 26 m | 1.00 | 0.99 | 0.98 |
+| 26–30 m | 1.00 | 0.97 | 0.94 |
 | 30–40 m | 1.00 | 0.91 | 0.87 |
 
 Misleading tracks with σ ≤ 10 m stay at 0.00 per step and the slot counts
 do not change (p99 4–5, max 6), so 0.20 keeps the observation's guarantees
-while 0.15 starts to erode them.
+while 0.15 starts to erode them. The old protection can be had back by
+lowering the flag (e.g. to 30 m); the cut-off stays at 40 because lowering
+it to 30 removes only 0.07 nodes per step on average, and those nodes are
+right 91% of the time.
 
 **CV's own `sigma_a` is a separate, open question.** The same sweep says
 `a_max·√2 = 1.41` is over-cautious under the TRAINING red mix (NEES median

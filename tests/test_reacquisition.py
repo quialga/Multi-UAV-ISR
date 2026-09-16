@@ -132,18 +132,3 @@ def test_absorbs_only_a_consistent_lost_track_and_the_closest_one():
     assert near in trk.tracks, "only one lost track is absorbed"
     assert far in trk.tracks, "an inconsistent lost track is untouched"
 
-
-def test_reach_gate_limits_absorption():
-    """With the reach gate on, a new track outside the distance the target
-    could have covered since its last hit does not take over the id."""
-    far = (20.0 + 25.0, 0.0)             # 25 m after 7 scans: beyond reach
-    outcome = {}
-    for speed in (None, np.sqrt(2.0)):
-        trk = _tracker(reacquire_after=4, max_target_speed=speed, max_misses=40)
-        tr = _confirm(trk, pos=(20.0, 0.0))
-        _coast(trk, 4)
-        for _ in range(3):
-            trk.step([det(BLUE, far, STILL)])
-        outcome[speed is not None] = (tr in trk.tracks, len(trk.confirmed_tracks()))
-    assert outcome[False] == (False, 1), "control: the chi^2 gate alone absorbs"
-    assert outcome[True] == (True, 2), "the reach gate prevents it"
