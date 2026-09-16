@@ -307,3 +307,36 @@ def test_checkpoint_loader_reproduces_either_mode():
         actor_red_feat_dim=actor_graph.RED_FEAT_DIM,
         actor_obs_feat_dim=actor_graph.OBS_FEAT_DIM)
     PursuitEnv(**kw).reset(seed=0)
+
+
+# --------------------------------------------------------------------- #
+#  Training diagnostics (ground truth — log only)
+# --------------------------------------------------------------------- #
+
+def test_tracker_diagnostics_are_collected_and_drained():
+    e = _env("tracker", n_blue=7, n_red=4, n_obstacles=9, max_steps=300,
+             clutter_rate=0.2, seed=3)
+    rng = np.random.default_rng(0)
+    for _ in range(120):
+        e.step({a: rng.uniform(-1, 1, 2).astype(np.float32) for a in e.agents})
+    d = e.tracker_diagnostics()
+    assert d["n_scored"] > 0 and d["track_error_m"] > 0
+    assert np.isfinite(d["nees"]) and np.isfinite(d["nis"])
+    again = e.tracker_diagnostics()
+    assert again["n_scored"] == 0 and np.isnan(again["nees"]), "not drained"
+
+
+def test_belief_mode_has_no_tracker_diagnostics():
+    assert _env("belief").tracker_diagnostics() == {}
+
+
+def test_vector_env_serves_the_diagnostics():
+    ve = _vec("tracker")
+    ve.reset(seed=0)
+    acts = np.zeros((ve.n_envs, ve.n_blue, 2), dtype=np.float32)
+    for _ in range(5):
+        ve.step(acts)
+    diags = ve.tracker_diagnostics()
+    assert len(diags) == ve.n_envs and set(diags[0]) == {
+        "track_error_m", "nees", "nis", "n_scored"}
+    ve.close()

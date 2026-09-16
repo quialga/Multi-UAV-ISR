@@ -102,6 +102,8 @@ def _worker(
                     "obs_crashes":  list(ve.episode_obs_crashes),
                     "blue_crashes": list(ve.episode_blue_crashes),
                 }))
+            elif cmd == "tracker_diag":
+                remote.send(("ok", ve.tracker_diagnostics()))
             elif cmd == "track_err":
                 remote.send(("ok",
                              [e.belief_track_error() for e in ve.envs]))
@@ -270,6 +272,10 @@ class SubprocStage4VecEnv:
 
     def belief_track_errors(self) -> List[float]:
         raws = self._broadcast_gather("track_err", [None] * self.n_workers)
+        return [x for r in raws for x in r]
+
+    def tracker_diagnostics(self) -> List[Dict[str, float]]:
+        raws = self._broadcast_gather("tracker_diag", [None] * self.n_workers)
         return [x for r in raws for x in r]
 
     def close(self) -> None:

@@ -51,9 +51,13 @@ RED_TRACKER_CONFIG = dict(
 )
 # Coverage margin (k * sd) for the red tracker's miss accounting.
 COVERAGE_K_SIGMA = 2.0
-# Learned red motion model adapter, as measured in §6.2–§6.4.  sigma_a_model
-# is still the placeholder, to be calibrated against NEES (plan step 6).
-LEARNED_MOTION_CONFIG = dict(max_branches=4, sigma_a_model=0.35)
+# Learned red motion model adapter.  sigma_a_model CALIBRATED against NEES
+# at this configuration and FROZEN (docs/tracking_diagnostics.md §11.6):
+# with oracle association the mean NEES is 4.08 against a target of 4.0 for
+# a 4-D state (median 3.06 against 3.36).  The previous placeholder 0.35
+# was over-cautious (NEES 2.97 / 2.24).  Re-calibrate if the geometry, the
+# red policy mix or the model itself changes.
+LEARNED_MOTION_CONFIG = dict(max_branches=4, sigma_a_model=0.20)
 
 # Obstacle tracker (§9.6): 3-of-4 with deadline, never forgets a confirmed
 # obstacle, merges duplicates.  STATIC model when obstacles are known not to

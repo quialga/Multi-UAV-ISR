@@ -1443,7 +1443,66 @@ One coupling to note: the learned model's NEES FALLS as the coast budget
 rises (4.64 at coast 20 → 3.04 at 150), so the NEES-optimal sigma depends
 on the budget. At a long budget the current setting is conservative.
 
-### 11.6 What is still open
+### 11.6 sigma_a_model calibrated at the training configuration (frozen)
+
+`sigma_a_model` stands for the learned model's own error, on top of the
+within-bin quantisation spread. It had never been tuned — 0.35 was a
+placeholder. Calibrated now against NEES
+(`scratch/calibrate_sigma_a.py`) at the Stage 4 training geometry, clutter
+0.2, obstacle radius noise 2 m, the training red mix, through the ACTOR
+path (obstacle context and coverage occlusion from the obstacle tracker),
+with the chosen tracker configuration including re-acquisition.
+
+An honest filter's NEES averages the state dimension, 4. ORACLE
+association isolates the filter from association errors; the real-
+association means are inflated by a handful of mis-associated tracks (9.30
+at 0.35) while their medians match the oracle's, which is what "outliers,
+not the filter" looks like.
+
+| `sigma_a_model` | NEES mean | NEES median | coasting median | MOTA stat / rand |
+|---|---|---|---|---|
+| 0.10 | 5.36 | 3.90 | 3.24 | 0.47 / 0.50 |
+| 0.15 | 4.68 | 3.47 | 2.78 | 0.49 / 0.53 |
+| **0.20** | **4.08** | **3.06** | 2.28 | 0.47 / 0.53 |
+| 0.25 | 3.60 | 2.71 | 1.86 | 0.46 / 0.54 |
+| 0.35 (old) | 2.97 | 2.24 | 1.30 | 0.47 / 0.53 |
+| 0.50 | 2.49 | 1.75 | 0.80 | 0.51 / 0.53 |
+
+(Median target for χ²₄ is 3.36. "Coasting" = steps with no hit, where the
+process noise actually acts; it is consistently LOWER than the overall
+median, i.e. the coasted covariance is the over-cautious part while the
+post-update one is slightly overconfident.)
+
+**0.20 adopted**: mean 4.08, median 3.06. Tracking quality is flat across
+the whole sweep (MOTA within 0.05), so this is about honest uncertainty,
+not performance — which matters because the actor now consumes that
+uncertainty directly.
+
+The one cost, measured with `scratch/obs_k_sigma.py`: a smaller declared
+σ makes the observation's 40 m cut-off slightly less protective, since
+tracks that are equally wrong now report a smaller σ. Share of shown
+track-steps whose red is within 40 m of the readout:
+
+| σ band | 0.35 | 0.20 | 0.15 |
+|---|---|---|---|
+| ≤ 26 m | 1.00 | 0.99 | 0.98 |
+| 30–40 m | 1.00 | 0.91 | 0.87 |
+
+Misleading tracks with σ ≤ 10 m stay at 0.00 per step and the slot counts
+do not change (p99 4–5, max 6), so 0.20 keeps the observation's guarantees
+while 0.15 starts to erode them.
+
+**CV's own `sigma_a` is a separate, open question.** The same sweep says
+`a_max·√2 = 1.41` is over-cautious under the TRAINING red mix (NEES median
+1.05, coasting 0.14) and that smaller values track better there (MOTA 0.62
+vs 0.45 with stationary reds at σ_a 0.35). That value was calibrated
+against a stochastic evader fleeing at full acceleration (§4), which two of
+the three training policies are not. It is left unchanged: lowering it
+would help stationary/random reds and could hurt fleeing ones, and with
+random blues the fleeing case is seen too rarely (recall ≤ 0.15) to
+measure.
+
+### 11.7 What is still open
 
 * **The mixture earns nothing, and that is now settled** (§11.4).
   Disabling merging entirely lets the hypotheses persist (1.01 → 28.8

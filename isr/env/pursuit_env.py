@@ -26,6 +26,10 @@ from isr.tracking.coverage import (
     disk_occluder, segment_disk_occluded, sensor_coverage,
 )
 
+# Pairing gate (m) for the tracker NEES diagnostic — a track further than
+# this from every red is scored for ERROR but not for consistency.
+TRACKER_DIAG_GATE = 20.0
+
 
 # ---------------------------------------------------------------------------
 # Default Stage 1 red policy: every red flees its nearest blue UAV.
@@ -672,6 +676,11 @@ class PursuitEnv(ParallelEnv):
         self._red_tracker = None
         self._obstacle_tracker = None
         self._red_motion = None
+        # Tracker diagnostics accumulated per step, drained by
+        # tracker_diagnostics() (training log only — ground truth).
+        self._track_err: List[float] = []
+        self._nees: List[float] = []
+        self._nis: List[float] = []
         if self.actor_obs == "tracker" and red_motion_ckpt is not None:
             from isr.agents.learned_red_motion import (
                 LearnedRedMotion, load_red_motion_model,
@@ -798,6 +807,7 @@ class PursuitEnv(ParallelEnv):
         # observation reflects what the blues see from their spawn points
         # (exactly as the belief map is updated above).
         if self.actor_obs == "tracker":
+            self._track_err, self._nees, self._nis = [], [], []
             self._red_tracker = actor_graph.make_red_tracker(self._red_motion)
             self._obstacle_tracker = actor_graph.make_obstacle_tracker(
                 static=not (self.moving_obstacle_fraction > 0.0
@@ -3154,6 +3164,56 @@ class PursuitEnv(ParallelEnv):
                                    occluded=occluded,
                                    k_sigma=actor_graph.COVERAGE_K_SIGMA)
         self._red_tracker.step(self.raw_detections(), coverage=coverage)
+        self._accumulate_tracker_diagnostics()
+
+    def _accumulate_tracker_diagnostics(self) -> None:
+        """Per-step tracking diagnostics for the training log — GROUND TRUTH,
+        never part of any observation.  Replaces ``belief_track_error`` when
+        the actor reads the trackers.
+
+        * error: distance from each shown red node to the nearest active
+          red.  NOT comparable in level with ``belief_track_error``: that
+          one always has a peak per red, while this one only counts
+          CONFIRMED tracks under the sd cut-off, i.e. the targets the
+          tracker currently claims to hold;
+        * NEES: against that red, with the MIXTURE covariance the actor is
+          shown, for pairs within ``TRACKER_DIAG_GATE`` — the honest-
+          uncertainty check ``sigma_a_model`` is calibrated with;
+        * NIS: this step's innovations, whatever the tracks are.
+        """
+        self._nis.extend(self._red_tracker.last_nis)
+        active = np.where(self._red_active)[0]
+        if len(active) == 0:
+            return
+        gt = self._red_pos[active]
+        for tr in self._red_tracker.confirmed_tracks():
+            P = actor_graph.mixture_covariance(tr)
+            if actor_graph.max_sd(P[:2, :2]) > self.tracker_sigma_cutoff:
+                continue                      # not shown to the actor
+            d = np.linalg.norm(gt - tr.pos, axis=1)
+            j = int(d.argmin())
+            self._track_err.append(float(d[j]))
+            if d[j] > TRACKER_DIAG_GATE:
+                continue                      # scored against no target
+            r = int(active[j])
+            err = np.concatenate([self._red_pos[r], self._red_vel[r]]) - tr.x
+            try:
+                self._nees.append(float(err @ np.linalg.inv(P) @ err))
+            except np.linalg.LinAlgError:
+                pass
+
+    def tracker_diagnostics(self) -> Dict[str, float]:
+        """Mean error / NEES / NIS since the last call, and reset.  NaN where
+        nothing was collected.  ``{}`` when the actor is not tracker-fed."""
+        if self.actor_obs != "tracker":
+            return {}
+        def _mean(xs):
+            return float(np.mean(xs)) if xs else float("nan")
+        out = {"track_error_m": _mean(self._track_err),
+               "nees": _mean(self._nees), "nis": _mean(self._nis),
+               "n_scored": float(len(self._nees))}
+        self._track_err, self._nees, self._nis = [], [], []
+        return out
 
     def _slot_edges(self, pos: np.ndarray, vel: np.ndarray,
                     present: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:

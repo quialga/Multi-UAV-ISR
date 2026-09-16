@@ -328,6 +328,12 @@ class Stage4VectorPursuitEnv:
         same diagnostic remotely."""
         return [env.belief_track_error() for env in self.envs]
 
+    def tracker_diagnostics(self) -> List[Dict[str, float]]:
+        """Per-env tracking diagnostics since the last call (tracker mode
+        only; empty dicts in belief mode).  See
+        ``PursuitEnv.tracker_diagnostics``."""
+        return [env.tracker_diagnostics() for env in self.envs]
+
     def close(self) -> None:
         for env in self.envs:
             env.close()

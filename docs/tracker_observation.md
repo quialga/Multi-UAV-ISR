@@ -95,9 +95,13 @@ obstacles: 3-of-4 with deadline, never forgets, duplicate merge, static
 model when the scenario has no moving obstacles).
 
 In tracker mode the belief map is **not computed at all**
-(`use_belief_maps` follows `--actor-obs`); `belief_track_error` therefore
-logs `nan`. A tracker-side diagnostic belongs with the NEES/NIS logging of
-the calibration step, which is not built yet.
+(`use_belief_maps` follows `--actor-obs`), so `belief_track_error` no longer
+applies.  `PursuitEnv.tracker_diagnostics()` replaces it, drained once per
+rollout by the trainer: mean distance from each SHOWN red node to the
+nearest active red, plus NEES (honest uncertainty, target 4.0) and NIS.
+The error is not comparable in LEVEL with the belief map's: that one always
+has a peak per red, this one only counts confirmed tracks under the sd
+cut-off.
 
 ## 5. Cost
 
@@ -129,8 +133,10 @@ oversubscription, not the observation.)
 
 * **Nothing is trained yet.** Whether the tracker observation trains
   better than the belief map is exactly the open question.
-* `sigma_a_model` for the learned motion model is still the placeholder
-  0.35 (plan step 6: calibrate against NEES, then freeze).
+* `sigma_a_model` is calibrated and frozen at **0.20** (was 0.35;
+  docs/tracking_diagnostics.md §11.6).  Training logs NEES and NIS per
+  rollout (`tracker/nees`, `tracker/nis`), so drift away from 4.0 shows up
+  during the run.
 * The learned model v3 was trained at L=130 on stochastic reds; training
   runs at L=200 with the stationary/random/run mix, so it is out of its
   distribution (docs/tracking_diagnostics.md §6.3).

@@ -720,12 +720,23 @@ def main() -> None:
 
         ep_stats = vec_env.recent_episode_stats()
 
-        # Belief tracking diagnostic: mean peak-to-true-red distance (m)
-        # across envs.  Directly measures whether the belief map is
-        # tracking or lagging the targets.
-        _errs = vec_env.belief_track_errors()
-        _errs = [t for t in _errs if not np.isnan(t)]
-        track_err = float(np.mean(_errs)) if _errs else float("nan")
+        # Tracking diagnostic, from whichever source the actor reads.
+        #   belief mode : mean belief-peak-to-true-red distance (m);
+        #   tracker mode: the same distance for the tracks the actor is
+        #     shown, plus NEES (honest uncertainty; 4.0 = calibrated for a
+        #     4-D state) and NIS over the rollout.
+        def _mean_of(vals):
+            vals = [v for v in vals if not np.isnan(v)]
+            return float(np.mean(vals)) if vals else float("nan")
+
+        nees = nis = float("nan")
+        if args.actor_obs == "tracker":
+            diags = [d for d in vec_env.tracker_diagnostics() if d]
+            track_err = _mean_of([d["track_error_m"] for d in diags])
+            nees = _mean_of([d["nees"] for d in diags])
+            nis = _mean_of([d["nis"] for d in diags])
+        else:
+            track_err = _mean_of(vec_env.belief_track_errors())
 
         if (rollout + 1) % args.log_interval == 0:
             elapsed = time.time() - t_start
@@ -740,6 +751,8 @@ def main() -> None:
                 f"  crash(o={ep_stats['mean_obstacle_crashes']:.2f}"
                 f"/a={ep_stats['mean_blue_crashes']:.2f})"
                 if crash_on else "")
+            cons_str = (f"  nees={nees:4.1f}  nis={nis:4.1f}"
+                        if args.actor_obs == "tracker" else "")
             log(
                 f"[rollout {rollout+1:>4d}/{args.n_rollouts}]  "
                 f"steps={global_step:>9d}  sps={sps:>6.0f}  "
@@ -751,7 +764,7 @@ def main() -> None:
                 f"kl={update_metrics['approx_kl']:.4f}  "
                 f"clip={update_metrics['clip_frac']:.3f}  "
                 f"eps={update_metrics['n_epochs_run']}  "
-                f"trk={track_err:5.1f}m"
+                f"trk={track_err:5.1f}m{cons_str}"
                 f"{crash_str}{aux_str}{lr_str}"
             )
 
@@ -773,7 +786,12 @@ def main() -> None:
             writer.add_scalar("ppo/aux_hidden_loss",
                               update_metrics["aux_hidden_loss"], global_step)
         if not np.isnan(track_err):
-            writer.add_scalar("belief/track_error_m", track_err, global_step)
+            tag = "tracker" if args.actor_obs == "tracker" else "belief"
+            writer.add_scalar(f"{tag}/track_error_m", track_err, global_step)
+        if not np.isnan(nees):
+            writer.add_scalar("tracker/nees", nees, global_step)
+        if not np.isnan(nis):
+            writer.add_scalar("tracker/nis", nis, global_step)
 
         # Deterministic evaluation of the LEARNED policy — the metric
         # comparable to Stage 3 (the training `caught` above is
