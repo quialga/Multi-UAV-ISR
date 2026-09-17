@@ -97,8 +97,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from isr.env.entities import BLUE_UAV, RED_TARGET
 from isr.env.pursuit_env import PursuitEnv
-from isr.agents.heuristics import GreedyPursuer, RandomAgent
-from isr.agents.red_motion_features import ACCEL_SCALE
+from isr.agents.heuristics import (
+    GreedyPursuer, RandomAgent, random_red, run_from_nearest_uav,
+    stationary_red,
+)
+from isr.agents.red_motion_features import ACCEL_SCALE, ACCEL_SCALE_BOX
 from isr.agents.stochastic_red import StochasticRed
 
 V_NORM = BLUE_UAV.v_max     # shared velocity normaliser (blue and obstacle)
@@ -170,6 +173,24 @@ class MixedStochasticRed:
 #  Blue: scripted, no trained checkpoint needed (see module docstring)
 # --------------------------------------------------------------------- #
 
+# The red policies the Stage 4 trainer actually runs (--red-policy-mix,
+# uniform over the three).  A model meant for THAT distribution has to be
+# trained on it: a stationary or randomly-walking red is nothing like the
+# fleeing evader StochasticRed produces, and no state tells the model which
+# of the three it is looking at, so it has to learn the mixture.
+TRAINING_MIX = ("stationary", "random", "run")
+
+
+def _training_red(name: str, rng: np.random.Generator):
+    if name == "stationary":
+        return stationary_red
+    if name == "random":
+        return random_red(seed=int(rng.integers(1 << 31)))
+    if name == "run":
+        return run_from_nearest_uav
+    raise ValueError(f"unknown training red policy {name!r}")
+
+
 _SHARED_GREEDY = GreedyPursuer()          # stateless: one instance suffices
 
 
@@ -191,7 +212,9 @@ def _sample_blue_heuristics(agent_names, rng: np.random.Generator) -> Dict:
 def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
                     n_blue_range, n_red_range, n_obs_range,
                     blue_cap: int, obs_cap: int, arena_size: float,
-                    p_deterministic: float, red_policy=None) -> List[Dict]:
+                    p_deterministic: float, red_policy=None,
+                    red_mix: str = "stochastic",
+                    accel_scale: float = ACCEL_SCALE_BOX) -> List[Dict]:
     n_blue = int(rng.integers(n_blue_range[0], n_blue_range[1] + 1))
     n_red = int(rng.integers(n_red_range[0], n_red_range[1] + 1))
     n_obs = int(rng.integers(n_obs_range[0], n_obs_range[1] + 1))
@@ -201,7 +224,13 @@ def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
     # red_policy is an override for tests; production always uses the
     # domain-randomised mixture.
     if red_policy is None:
-        red_policy = MixedStochasticRed(n_red, rng, p_deterministic)
+        if red_mix == "training":
+            # One policy per episode for every red, exactly as
+            # Stage4VectorPursuitEnv resamples it.
+            red_policy = _training_red(
+                TRAINING_MIX[int(rng.integers(len(TRAINING_MIX)))], rng)
+        else:
+            red_policy = MixedStochasticRed(n_red, rng, p_deterministic)
     # No n_obstacles_min: team sizes are already varied ACROSS episodes
     # (n_blue/n_red/n_obs sampled above); adding the env's OWN within-
     # capacity placed-count randomness on top would be a redundant second
@@ -209,7 +238,11 @@ def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
     env = PursuitEnv(
         n_blue=n_blue, n_red=n_red, n_obstacles=n_obs,
         arena_size=arena_size, max_steps=steps + 5, capture_radius=3.0,
-        sensor_radius=40.0, use_belief_maps=True,
+        sensor_radius=40.0,
+        # No belief map: nothing in the labels or in any policy here reads
+        # it, and maintaining the log-odds grid every step is most of the
+        # env's cost at this arena size.
+        use_belief_maps=False,
         red_policy=red_policy, seed=seed,
     )
     obs_d, _info = env.reset(seed=seed)
@@ -258,13 +291,13 @@ def collect_episode(rng: np.random.Generator, ep_id: int, steps: int,
         # loudly at collection time rather than after training.
         worst = float(np.linalg.norm(act_a[pre["red_active"]], axis=1).max(
             initial=0.0))
-        if worst > ACCEL_SCALE + 1e-5:
+        if worst > accel_scale + 1e-5:
             raise ValueError(
-                f"red action |a| = {worst:.4f} exceeds ACCEL_SCALE="
-                f"{ACCEL_SCALE}; accel_to_bin would clip it into the top "
-                f"magnitude bin and bias the labels. Raise ACCEL_SCALE in "
-                f"red_motion_features (and re-collect) before training on "
-                f"a red that accelerates this hard.")
+                f"red action |a| = {worst:.4f} exceeds the grid scale "
+                f"{accel_scale}; accel_to_bin would clip it into the top "
+                f"magnitude bin and bias the labels. Collect (and train) "
+                f"with ACCEL_SCALE_BOX for a red that uses the env's whole "
+                f"action box, e.g. random_red or a learned one.")
         placed = 0 if pre["obs_pos"] is None else len(pre["obs_pos"])
         for r in np.where(pre["red_active"])[0]:
             rp, rv = pre["red_pos"][r], pre["red_vel"][r]
@@ -340,7 +373,26 @@ def main() -> None:
     p.add_argument("--n-obs-max", type=int, default=5)
     p.add_argument("--arena-size", type=float, default=130.0)
     p.add_argument("--p-deterministic", type=float, default=0.15,
-                   help="fraction of REDS with no stochasticity at all")
+                   help="fraction of REDS with no stochasticity at all "
+                        "(--red-mix stochastic only)")
+    p.add_argument("--red-mix", choices=("stochastic", "training"),
+                   default="stochastic",
+                   help="stochastic: domain-randomised StochasticRed per red "
+                        "(the original dataset).  training: one of "
+                        "stationary / random / run per episode, the Stage 4 "
+                        "trainer's own mix.")
+    p.add_argument("--accel-scale", type=float, default=ACCEL_SCALE_BOX,
+                   help="grid scale the labels will be binned with; the "
+                        "collector fails if a red exceeds it. sqrt(2) (the "
+                        "env's action box) by default, 1.0 for the unit "
+                        "disk every checkpoint up to v3 used.")
+    p.add_argument("--episode-offset", type=int, default=0,
+                   help="added to every episode_id, so shards collected by "
+                        "parallel processes keep distinct episodes (the "
+                        "train/val split is BY episode).")
+    p.add_argument("--shard-prefix", type=str, default="shard",
+                   help="shard filename prefix, so parallel processes can "
+                        "write into one directory.")
     p.add_argument("--seed", type=int, default=0)
     a = p.parse_args()
 
@@ -354,13 +406,15 @@ def main() -> None:
     t0 = time.time()
     for ep in range(a.episodes):
         buf.extend(collect_episode(
-            rng, ep, a.steps,
+            rng, ep + a.episode_offset, a.steps,
             (a.n_blue_min, a.n_blue_max), (a.n_red_min, a.n_red_max),
             (a.n_obs_min, a.n_obs_max), a.n_blue_max, a.n_obs_max,
-            a.arena_size, a.p_deterministic))
+            a.arena_size, a.p_deterministic, red_mix=a.red_mix,
+            accel_scale=a.accel_scale))
         while len(buf) >= a.shard_size:
             shard, buf = buf[:a.shard_size], buf[a.shard_size:]
-            _write_shard(shard, out_dir / f"shard_{shard_idx:05d}.npz")
+            _write_shard(shard,
+                         out_dir / f"{a.shard_prefix}_{shard_idx:05d}.npz")
             n_total += len(shard)
             shard_idx += 1
         if (ep + 1) % max(1, a.episodes // 20) == 0:
@@ -369,7 +423,7 @@ def main() -> None:
                   f"{n_total + len(buf)} samples so far, {elapsed:.0f}s")
 
     if buf:
-        _write_shard(buf, out_dir / f"shard_{shard_idx:05d}.npz")
+        _write_shard(buf, out_dir / f"{a.shard_prefix}_{shard_idx:05d}.npz")
         n_total += len(buf)
         shard_idx += 1
 

@@ -125,28 +125,40 @@ def test_cell_accelerations_round_trip_through_the_discretiser():
     """The adapter's per-cell accelerations must be the ones the LABELS
     were built from, cell for cell.
 
-    bin_to_accel already returns PHYSICAL units, because the magnitude
-    axis is defined against ACCEL_SCALE, which mirrors the env's own clip
-    on the red action. Rescaling them again in the adapter (by an a_max
-    that looks like a free knob but is not) would emit accelerations the
-    model was never trained to predict, and would break this round trip.
+    bin_to_accel returns PHYSICAL units, because the magnitude axis is
+    defined against the grid scale in the env's own units. Rescaling them
+    again in the adapter would emit accelerations the model was never
+    trained to predict, and would break this round trip.
     """
-    from isr.agents.red_motion_features import ACCEL_SCALE, accel_to_bin
+    from isr.agents.red_motion_features import accel_to_bin
 
     ad = _adapter()
     cells = np.arange(ZERO_CLASS)
-    assert np.array_equal(accel_to_bin(ad._cell_accel), cells), (
+    assert np.array_equal(accel_to_bin(ad._cell_accel, ad.accel_scale), cells), (
         "adapter cell accelerations do not map back to their own cells")
-    assert np.max(np.linalg.norm(ad._cell_accel, axis=1)) <= ACCEL_SCALE
+    assert np.max(np.linalg.norm(ad._cell_accel, axis=1)) <= ad.accel_scale
 
 
-def test_a_max_disagreeing_with_the_discretiser_is_rejected():
-    """a_max is not a free knob: the grid and every training label assume
-    ACCEL_SCALE, so a mismatch must fail loudly rather than silently
-    emitting untrained accelerations."""
-    model = RedMotionGNN(n_blue=BLUE_CAP, n_red=1, n_obs=OBS_CAP)
-    with pytest.raises(ValueError, match="ACCEL_SCALE"):
-        LearnedRedMotion(model, BLUE_CAP, OBS_CAP, arena_size=L, a_max=2.0)
+def test_the_grid_scale_comes_from_the_model_not_from_the_caller():
+    """Every label was binned with the model's own grid scale, so the
+    adapter must read it off the model: a caller re-declaring it could only
+    get it wrong. A model without the attribute predates it and used the
+    unit disk."""
+    from isr.agents.red_motion_features import ACCEL_SCALE, ACCEL_SCALE_BOX
+
+    legacy = RedMotionGNN(n_blue=BLUE_CAP, n_red=1, n_obs=OBS_CAP)
+    del legacy.accel_scale
+    ad_legacy = LearnedRedMotion(legacy, BLUE_CAP, OBS_CAP, arena_size=L)
+    assert ad_legacy.accel_scale == ACCEL_SCALE
+
+    box = RedMotionGNN(n_blue=BLUE_CAP, n_red=1, n_obs=OBS_CAP,
+                       accel_scale=ACCEL_SCALE_BOX)
+    ad_box = LearnedRedMotion(box, BLUE_CAP, OBS_CAP, arena_size=L)
+    assert ad_box.accel_scale == ACCEL_SCALE_BOX
+    # The cells and the within-bin spread scale with it.
+    assert (np.max(np.linalg.norm(ad_box._cell_accel, axis=1))
+            > np.max(np.linalg.norm(ad_legacy._cell_accel, axis=1)))
+    assert ad_box._sd_radial > ad_legacy._sd_radial
 
 
 def test_branch_weights_sum_to_one_so_no_weight_flows_between_parents():

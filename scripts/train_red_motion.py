@@ -60,8 +60,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from isr.agents.red_motion_features import (
-    N_BINS, N_HEADING_BINS, N_MAGNITUDE_BINS, ZERO_CLASS,
-    featurize_shard, soft_targets,
+    ACCEL_SCALE, ACCEL_SCALE_BOX, N_BINS, N_HEADING_BINS, N_MAGNITUDE_BINS,
+    ZERO_CLASS, featurize_shard, soft_targets,
 )
 from isr.agents.red_motion_gnn import RedMotionGNN
 
@@ -73,15 +73,21 @@ _INPUT_KEYS = ("red_feats", "blue_feats", "b2r_edge_feats",
 #  Data
 # --------------------------------------------------------------------- #
 
-def load_dataset(data_dir: str, max_shards: int = 0) -> Dict[str, torch.Tensor]:
-    files = sorted(glob.glob(str(Path(data_dir) / "shard_*.npz")))
+def load_dataset(data_dir: str, max_shards: int = 0,
+                 accel_scale: float = ACCEL_SCALE,
+                 arena_size: float = 130.0) -> Dict[str, torch.Tensor]:
+    # Recursive, so a dataset collected by several processes into
+    # subdirectories loads as one.
+    files = sorted(glob.glob(str(Path(data_dir) / "**" / "*.npz"),
+                             recursive=True))
     if not files:
         raise SystemExit(f"no shards found in {data_dir}")
     if max_shards:
         files = files[:max_shards]
     parts: List[Dict[str, np.ndarray]] = []
     for f in files:
-        parts.append(featurize_shard(dict(np.load(f))))
+        parts.append(featurize_shard(dict(np.load(f)), arena_size=arena_size,
+                                     accel_scale=accel_scale))
     out = {}
     for k in _INPUT_KEYS + ("target", "episode_id"):
         arr = np.concatenate([p[k] for p in parts], axis=0)
@@ -207,10 +213,20 @@ def main() -> None:
     p.add_argument("--msg-rounds", type=int, default=2)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--out", type=str, default="runs/red_motion/model.pt")
+    p.add_argument("--accel-scale", type=float, default=ACCEL_SCALE,
+                   help="grid scale to bin the labels with; must match how "
+                        "the data was collected. 1.0 (unit disk) keeps the "
+                        f"pre-v4 behaviour, {ACCEL_SCALE_BOX:.4f} covers the "
+                        "env's whole action box.")
+    p.add_argument("--arena-size", type=float, default=130.0,
+                   help="arena the data was collected in (only the features "
+                        "that are not pre-normalised depend on it).")
     a = p.parse_args()
 
     torch.manual_seed(a.seed)
-    data = load_dataset(a.data, a.max_shards)
+    data = load_dataset(a.data, a.max_shards, accel_scale=a.accel_scale,
+                        arena_size=a.arena_size)
+    print(f"label grid scale: {a.accel_scale:.4f}")
     tr_idx, va_idx = split_by_episode(data["episode_id"], a.val_frac, a.seed)
     n_ep = len(torch.unique(data["episode_id"]))
     print(f"split by EPISODE: {len(tr_idx)} train / {len(va_idx)} val samples "
@@ -225,7 +241,8 @@ def main() -> None:
     blue_cap = data["blue_feats"].shape[1]
     obs_cap = data["obs_feats"].shape[1]
     model = RedMotionGNN(n_blue=blue_cap, n_red=1, n_obs=obs_cap,
-                        d_hidden=a.d_hidden, n_msg_rounds=a.msg_rounds)
+                        d_hidden=a.d_hidden, n_msg_rounds=a.msg_rounds,
+                        accel_scale=a.accel_scale)
     print(f"model: {sum(q.numel() for q in model.parameters())} params "
           f"(n_blue={blue_cap}, n_obs={obs_cap}, {N_BINS} classes)")
     opt = torch.optim.Adam(model.parameters(), lr=a.lr)
@@ -252,7 +269,9 @@ def main() -> None:
             best = m["loss"]
             torch.save({"state_dict": model.state_dict(),
                        "n_blue": blue_cap, "n_obs": obs_cap,
-                       "d_hidden": a.d_hidden, "msg_rounds": a.msg_rounds},
+                       "d_hidden": a.d_hidden, "msg_rounds": a.msg_rounds,
+                       "accel_scale": float(a.accel_scale),
+                       "arena_size": float(a.arena_size)},
                       a.out)
             flag = "  *saved"
         print(f"[{ep:3d}/{a.epochs}] train {run / nb:.4f} | val {m['loss']:.4f} "

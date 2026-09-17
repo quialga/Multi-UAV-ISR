@@ -64,8 +64,11 @@ def load_red_motion_model(path: str, device: str = "cpu"
     the trained capacity has to be truncated (see ``set_context``).
     """
     ck = torch.load(path, map_location=device, weights_only=True)
+    # Checkpoints before the grid scale was recorded (v1-v3) used the unit
+    # disk.
     model = RedMotionGNN(n_blue=ck["n_blue"], n_red=1, n_obs=ck["n_obs"],
-                         d_hidden=ck["d_hidden"], n_msg_rounds=ck["msg_rounds"])
+                         d_hidden=ck["d_hidden"], n_msg_rounds=ck["msg_rounds"],
+                         accel_scale=float(ck.get("accel_scale", ACCEL_SCALE)))
     model.load_state_dict(ck["state_dict"])
     model.eval().to(device)
     return model, int(ck["n_blue"]), int(ck["n_obs"])
@@ -92,7 +95,6 @@ class LearnedRedMotion:
         blue_cap:         int,
         obs_cap:          int,
         dt:               float = 1.0,
-        a_max:            float = 1.0,
         v_max:            float = RED_TARGET.v_max,
         arena_size:       float = 130.0,
         max_branches:     int = 4,
@@ -103,19 +105,13 @@ class LearnedRedMotion:
         self.blue_cap = int(blue_cap)
         self.obs_cap = int(obs_cap)
         self.dt = float(dt)
-        self.a_max = float(a_max)
         self.v_max = float(v_max)
-        # a_max is NOT a free knob here.  The action discretisation bakes
-        # ACCEL_SCALE into every training label (accel_to_bin clips against
-        # it, mirroring PursuitEnv's own clip on the red action), so a
-        # different bound has to be changed in red_motion_features, not
-        # patched by rescaling this consumer's output.  Failing loudly
-        # beats silently emitting accelerations the model never learned.
-        if not np.isclose(self.a_max, ACCEL_SCALE):
-            raise ValueError(
-                f"a_max={self.a_max} disagrees with the discretiser's "
-                f"ACCEL_SCALE={ACCEL_SCALE}; the grid and every training "
-                f"label assume that bound (see red_motion_features)")
+        # The acceleration grid's scale is a property of the TRAINED MODEL
+        # (every label was binned with it), so it is read from the model,
+        # never passed in: a consumer re-declaring it could only get it
+        # wrong.  Models without the attribute predate it and used the unit
+        # disk.  See red_motion_features.ACCEL_SCALE / ACCEL_SCALE_BOX.
+        self.accel_scale = float(getattr(model, "accel_scale", ACCEL_SCALE))
         self.L = float(arena_size)
         # A cap on MODES, not on cells: every heading bin is assigned to a
         # kept peak, so raising or lowering this never discards mass, it
@@ -147,21 +143,20 @@ class LearnedRedMotion:
         # the heading bin's arc, which scales with |a| (a 10 degree bin is
         # a wider absolute spread for a large acceleration than a small
         # one), so it is applied per branch.
-        self._sd_radial = (ACCEL_SCALE / N_MAGNITUDE_BINS) / np.sqrt(12.0)
+        self._sd_radial = (self.accel_scale / N_MAGNITUDE_BINS) / np.sqrt(12.0)
         self._sd_tangential_per_a = (2 * np.pi / N_HEADING_BINS) / np.sqrt(12.0)
 
         # Per-cell acceleration and quantisation covariance are FIXED
         # properties of the grid, so they are built once rather than per
         # component per step.
         #
-        # NOT rescaled by a_max: bin_to_accel already returns PHYSICAL
-        # units, because the grid's magnitude axis is defined against
-        # ACCEL_SCALE, which mirrors the env's own clip on the red action.
-        # Multiplying here as well would emit accelerations the model was
-        # never trained to predict, and would break the round trip
+        # NOT rescaled: bin_to_accel already returns PHYSICAL units, because
+        # the grid's magnitude axis is defined against the model's scale in
+        # the env's own units.  Rescaling here would emit accelerations the
+        # model was never trained to predict, and would break the round trip
         # accel_to_bin(bin_to_accel(k)) == k that the labels rely on.
         cells = np.arange(ZERO_CLASS)
-        self._cell_accel = bin_to_accel(cells)                     # (180, 2)
+        self._cell_accel = bin_to_accel(cells, self.accel_scale)   # (180, 2)
         self._cell_quant = np.stack(
             [self._quantisation_cov(a) for a in self._cell_accel])  # (180,2,2)
 
@@ -292,7 +287,7 @@ class LearnedRedMotion:
                 "action depends on where the blues are this step")
         f = featurize_shard(self._pack(np.asarray(red_pos, dtype=np.float64),
                                       np.asarray(red_vel, dtype=np.float64)),
-                           arena_size=self.L)
+                           arena_size=self.L, accel_scale=self.accel_scale)
         with torch.no_grad():
             logits = self.model(*[torch.from_numpy(f[k]) for k in _INPUT_KEYS])
             if logits.shape[:2] != (1, 1):
@@ -327,7 +322,8 @@ class LearnedRedMotion:
         packs = [self._pack(red_pos[i], red_vel[i]) for i in range(K)]
         batch = {k: np.concatenate([p[k] for p in packs], axis=0)
                  for k in packs[0]}
-        f = featurize_shard(batch, arena_size=self.L)
+        f = featurize_shard(batch, arena_size=self.L,
+                            accel_scale=self.accel_scale)
         with torch.no_grad():
             logits = self.model(*[torch.from_numpy(f[k]) for k in _INPUT_KEYS])
             if logits.shape[:2] != (K, 1):

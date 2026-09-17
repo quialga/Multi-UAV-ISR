@@ -729,6 +729,25 @@ care whether they came from a 1-D heading-only categorical or a 2-D
 heading x magnitude one — the extra dimension is confined entirely to the
 not-yet-built learned-model layer.
 
+**The magnitude axis needs a scale, and there are two** (`ACCEL_SCALE`,
+`ACCEL_SCALE_BOX` in `red_motion_features`). The grid's units are the
+env's: `PursuitEnv.step` clips the red action PER AXIS to [-1, 1] and feeds
+it straight to `_integrate`.
+
+* The **unit disk** (1.0) fits `run_from_nearest_uav` and `StochasticRed`,
+  which normalise to `|a| <= 1`. Every checkpoint up to v3 used it.
+* The env's **whole box** (√2) is what a red using the corners needs —
+  `random_red`, one of the three policies the Stage 4 trainer runs, draws
+  uniformly in the box and exceeds 1 in 21% of its steps, and a learned or
+  self-play red would too. The collector fails loudly rather than folding
+  those into the top bin (`test_collector_rejects_a_red_that_breaches_the_grid_bound`).
+
+The scale travels WITH the model (`RedMotionGNN.accel_scale`, saved in the
+checkpoint and read by `LearnedRedMotion`), so a consumer cannot get it
+wrong and old checkpoints keep working. Keeping 5 magnitude bins at the box
+scale also puts a bin CENTRE at 0.99 — on the flee response's `|a| = 1`,
+which the unit-disk grid represented as 0.9.
+
 ### 8.5 Multiple hypotheses per track: Gaussian Sum, not particles
 
 §8.3's point 3 (`P(S) x P(a|S)` mixing epistemic and aleatoric branching)
@@ -1127,6 +1146,32 @@ different parameters; padding/masks are exact; `accel` matches
 are reproducible. Throughput: ~1600 samples/s, ~7.7 episodes/s on CPU (a
 150-step episode with ~3 active reds yields ~450 samples) — a
 million-sample dataset costs on the order of ten minutes, no GPU.
+
+### 10.1 Collecting for the TRAINING distribution (`--red-mix training`)
+
+v1–v3 were trained on `MixedStochasticRed` at L=130 with up to 6 blues and
+5 obstacles. The Stage 4 trainer runs something else entirely: L=200, 7
+blues, 9 obstacles, and a red policy drawn per episode from
+**stationary / random / run** (`--red-policy-mix`, uniform). A model for
+that distribution has to be collected in it — §6.3 measured v3 running out
+of its own distribution.
+
+`--red-mix training` reproduces the trainer's mix exactly: one policy per
+episode for every red, sampled uniformly from the three, the same way
+`Stage4VectorPursuitEnv._resample_red_policy` does. Nothing in the state
+says WHICH of the three a red is following, so the model has to learn the
+mixture — a still red, a random walk and a flee response all look like
+plausible continuations of the same position and velocity, weighted by how
+often each occurs and by whatever the geometry hints at.
+
+Two more collection changes, both for parallel runs into one directory:
+`--episode-offset` (the train/val split is BY episode, so ids must stay
+distinct across processes) and `--shard-prefix`. The collector also no
+longer maintains a belief map — nothing in the labels or in any policy here
+reads it, and it was most of the env's per-step cost at L=200.
+
+Throughput at the training geometry: ~400 samples and ~3 s per 300-step
+episode, so a ~1.5 M-sample dataset is about 45 minutes across 4 processes.
 
 ## 11. The learned motion model, measured downstream
 

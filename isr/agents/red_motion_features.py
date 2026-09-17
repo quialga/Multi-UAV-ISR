@@ -52,16 +52,27 @@ N_BINS = N_HEADING_BINS * N_MAGNITUDE_BINS + 1     # + the ZERO class
 ZERO_CLASS = N_BINS - 1
 ZERO_EPS = 1e-6              # |a| below this is the ZERO class
 
-# Largest |a| the magnitude axis can represent.  This is NOT a free
-# parameter: ``PursuitEnv.step`` clips the red action to [-1, 1] and then
-# feeds it to ``_integrate`` AS the acceleration, with no scale factor
-# anywhere, so the grid's units and the env's physical units are the same
-# thing.  ``accel_to_bin`` mirrors that clip, which means the whole
-# discretisation — and therefore every training label — assumes this
-# bound.  A red class with a different acceleration limit would need this
-# changed HERE, not worked around by rescaling a consumer's output: doing
-# that would emit accelerations the model was never trained to predict.
+# Largest |a| the magnitude axis represents — the GRID SCALE.  The grid's
+# units are the env's physical units: ``PursuitEnv.step`` clips the red
+# action PER AXIS to [-1, 1] and feeds it to ``_integrate`` as the
+# acceleration, with no scale factor anywhere.  ``accel_to_bin`` clips the
+# magnitude at the scale, so every training label assumes it, and a model
+# is only valid with the scale it was trained on: the scale travels WITH
+# the model (``RedMotionGNN.accel_scale``, saved in the checkpoint) rather
+# than being re-declared by a consumer.
+#
+# Two scales exist:
+#   ACCEL_SCALE      = 1.0      unit disk.  Every checkpoint up to v3.  Fits
+#                               run_from_nearest_uav / StochasticRed, which
+#                               normalise to |a| <= 1.
+#   ACCEL_SCALE_BOX  = sqrt(2)  the env's whole per-axis box.  Needed for any
+#                               red that uses the box — random_red (uniform
+#                               in it; |a| > 1 in 21% of steps), and any
+#                               learned / self-play red.
+# With 5 magnitude bins the box scale also puts a bin CENTRE at 0.99, i.e.
+# on the flee response's |a| = 1, where the unit-disk grid had 0.9.
 ACCEL_SCALE = 1.0
+ACCEL_SCALE_BOX = float(np.sqrt(2.0))
 
 
 # --------------------------------------------------------------------- #
@@ -98,25 +109,28 @@ def edge_features(rel_pos: np.ndarray, rel_vel: np.ndarray,
 #  Action discretisation
 # --------------------------------------------------------------------- #
 
-def accel_to_bin(accel: np.ndarray) -> np.ndarray:
+def accel_to_bin(accel: np.ndarray, accel_scale: float = ACCEL_SCALE
+                 ) -> np.ndarray:
     """Map raw accelerations (..., 2) to a flat class index (...,).
 
     Grid index = heading_bin * N_MAGNITUDE_BINS + magnitude_bin, with the
-    ZERO class reserved for |a| ~ 0 (heading undefined).
+    ZERO class reserved for |a| ~ 0 (heading undefined).  Magnitudes above
+    ``accel_scale`` fold into the top bin.
     """
     accel = np.asarray(accel, dtype=np.float64)
     mag = np.linalg.norm(accel, axis=-1)
     ang = np.arctan2(accel[..., 1], accel[..., 0])          # [-pi, pi)
     h = np.floor((ang + np.pi) / (2 * np.pi) * N_HEADING_BINS).astype(np.int64)
     h = np.clip(h, 0, N_HEADING_BINS - 1)
-    m = np.floor(np.clip(mag / ACCEL_SCALE, 0.0, 1.0)
+    m = np.floor(np.clip(mag / accel_scale, 0.0, 1.0)
                 * N_MAGNITUDE_BINS).astype(np.int64)
-    m = np.clip(m, 0, N_MAGNITUDE_BINS - 1)      # |a| == ACCEL_SCALE -> top bin
+    m = np.clip(m, 0, N_MAGNITUDE_BINS - 1)      # |a| == accel_scale -> top bin
     out = h * N_MAGNITUDE_BINS + m
     return np.where(mag < ZERO_EPS, ZERO_CLASS, out)
 
 
-def bin_to_accel(idx: np.ndarray) -> np.ndarray:
+def bin_to_accel(idx: np.ndarray, accel_scale: float = ACCEL_SCALE
+                 ) -> np.ndarray:
     """Inverse: the representative acceleration at a class's CENTRE.
 
     Used when turning a predicted class into a Gaussian-Sum branch
@@ -126,7 +140,7 @@ def bin_to_accel(idx: np.ndarray) -> np.ndarray:
     h = idx // N_MAGNITUDE_BINS
     m = idx % N_MAGNITUDE_BINS
     ang = (h + 0.5) / N_HEADING_BINS * 2 * np.pi - np.pi
-    mag = (m + 0.5) / N_MAGNITUDE_BINS * ACCEL_SCALE
+    mag = (m + 0.5) / N_MAGNITUDE_BINS * accel_scale
     out = np.stack([mag * np.cos(ang), mag * np.sin(ang)], axis=-1)
     return np.where((idx == ZERO_CLASS)[..., None], 0.0, out)
 
@@ -186,7 +200,8 @@ def _sender_vel(d: Dict[str, np.ndarray], kind: str) -> np.ndarray:
         key = f"{kind}_rel_vel"          # legacy shards
     return d[key].astype(np.float64)
 
-def featurize_shard(d: Dict[str, np.ndarray], arena_size: float = 130.0
+def featurize_shard(d: Dict[str, np.ndarray], arena_size: float = 130.0,
+                    accel_scale: float = ACCEL_SCALE
                     ) -> Dict[str, np.ndarray]:
     """Turn one loaded ``.npz`` shard into network inputs + targets.
 
@@ -239,7 +254,7 @@ def featurize_shard(d: Dict[str, np.ndarray], arena_size: float = 130.0
         o2r_edge_feats=o2r.astype(np.float32),
         b2r_active=blue_active.astype(np.float32),
         o2r_active=obs_mask.astype(np.float32),
-        target=accel_to_bin(d["accel"]).astype(np.int64),
+        target=accel_to_bin(d["accel"], accel_scale).astype(np.int64),
         accel=d["accel"].astype(np.float32),
         episode_id=d["episode_id"],
     )

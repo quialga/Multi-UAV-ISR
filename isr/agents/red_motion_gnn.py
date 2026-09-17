@@ -57,7 +57,7 @@ import torch.nn as nn
 # featuriser's labels -- a bug hit exactly once during development, when
 # the ZERO class was added on one side only.
 from isr.agents.red_motion_features import (
-    N_BINS, N_HEADING_BINS, N_MAGNITUDE_BINS, ZERO_CLASS,
+    ACCEL_SCALE, N_BINS, N_HEADING_BINS, N_MAGNITUDE_BINS, ZERO_CLASS,
 )
 
 
@@ -124,6 +124,7 @@ class RedMotionGNN(nn.Module):
         d_hidden:         int = 64,
         n_msg_rounds:     int = 2,
         trunk_hidden:     int = 128,
+        accel_scale:      float = ACCEL_SCALE,
     ) -> None:
         super().__init__()
         self.n_blue = n_blue
@@ -136,6 +137,10 @@ class RedMotionGNN(nn.Module):
         self.n_magnitude_bins = N_MAGNITUDE_BINS
         self.n_bins = N_BINS
         self.zero_class = ZERO_CLASS
+        # The grid scale the labels were binned with (red_motion_features).
+        # A plain attribute, not a parameter: it describes the output space,
+        # and consumers read it instead of assuming one.
+        self.accel_scale = float(accel_scale)
 
         self.red_input_mlp = _mlp(red_feat_dim, [d_hidden], d_hidden)
         self.blue_input_mlp = _mlp(blue_feat_dim, [d_hidden], d_hidden)

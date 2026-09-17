@@ -95,33 +95,36 @@ def test_accel_matches_the_true_action_not_a_re_invocation():
 
 
 def test_collector_rejects_a_red_that_breaches_the_grid_bound():
-    """accel_to_bin CLIPS magnitude at ACCEL_SCALE, so a red that
-    accelerates harder is silently folded into the top bin and the model
-    learns to under-predict the most aggressive manoeuvres.
+    """accel_to_bin CLIPS magnitude at the grid scale, so a red that
+    accelerates harder would be silently folded into the top bin and the
+    model would learn to under-predict the hardest manoeuvres.
 
-    No current red does this -- run_from_nearest_uav normalises to unit
-    magnitude. But the env's action space is the square Box(-1, 1, (2,)),
-    which admits |a| up to sqrt(2) on the diagonal (blue uses exactly
-    that), so a learned or self-play red WOULD breach it. Fail at
-    collection time, not after training.
+    The unit disk holds run_from_nearest_uav and StochasticRed, which
+    normalise to |a| <= 1. It does NOT hold the env's action space, the
+    square Box(-1, 1, (2,)), which admits |a| up to sqrt(2) on the
+    diagonal -- random_red uses exactly that, and so would a learned or
+    self-play red. Collecting for the unit disk must fail; collecting for
+    the box must accept it.
     """
-    from isr.agents.red_motion_features import ACCEL_SCALE
+    from isr.agents.red_motion_features import ACCEL_SCALE, ACCEL_SCALE_BOX
 
     def too_hard(blue_pos, red_pos, red_active, obstacle_pos=None,
                 obstacle_r=None, arena_size=None):
         # The diagonal corner of the action box: legal for the env,
-        # out of range for the grid.
+        # out of range for the unit-disk grid.
         a = np.zeros((len(red_pos), 2), dtype=np.float32)
         a[red_active] = [1.0, 1.0]          # |a| = sqrt(2)
         return a
 
-    rng = np.random.default_rng(11)
-    with pytest.raises(ValueError, match="ACCEL_SCALE"):
-        collect_episode(
-            rng, ep_id=0, steps=10, n_blue_range=(2, 2), n_red_range=(1, 1),
-            n_obs_range=(0, 0), blue_cap=2, obs_cap=1, arena_size=130.0,
-            p_deterministic=1.0, red_policy=too_hard)
-    assert ACCEL_SCALE == 1.0, "test's sqrt(2) assumption tracks ACCEL_SCALE"
+    kw = dict(steps=10, n_blue_range=(2, 2), n_red_range=(1, 1),
+              n_obs_range=(0, 0), blue_cap=2, obs_cap=1, arena_size=130.0,
+              p_deterministic=1.0, red_policy=too_hard)
+    with pytest.raises(ValueError, match="grid scale"):
+        collect_episode(np.random.default_rng(11), ep_id=0,
+                        accel_scale=ACCEL_SCALE, **kw)
+    samples = collect_episode(np.random.default_rng(11), ep_id=0,
+                              accel_scale=ACCEL_SCALE_BOX, **kw)
+    assert samples, "the box scale must accept the env's whole action space"
 
 
 def test_wall_dist_matches_the_env_convention():
@@ -218,3 +221,31 @@ def test_action_matches_the_state_the_policy_saw():
         f"features and label are misaligned: max {errs.max():.2f} deg "
         f"(median {np.median(errs):.2f}) against a deterministic policy "
         f"that should reproduce exactly")
+
+
+def test_training_mix_uses_only_the_trainer_s_three_red_policies():
+    """--red-mix training must reproduce Stage4VectorPursuitEnv's own mix:
+    one of stationary / random / run per episode, for every red."""
+    from scripts.collect_red_motion_dataset import TRAINING_MIX, _training_red
+    from isr.agents.heuristics import run_from_nearest_uav, stationary_red
+
+    rng = np.random.default_rng(3)
+    assert _training_red("stationary", rng) is stationary_red
+    assert _training_red("run", rng) is run_from_nearest_uav
+    assert callable(_training_red("random", rng))
+    with pytest.raises(ValueError):
+        _training_red("flee", rng)
+    assert TRAINING_MIX == ("stationary", "random", "run")
+
+    seen_zero = seen_move = False
+    for ep in range(6):
+        samples = collect_episode(
+            np.random.default_rng(100 + ep), ep_id=ep, steps=12,
+            n_blue_range=(2, 2), n_red_range=(1, 1), n_obs_range=(0, 0),
+            blue_cap=2, obs_cap=1, arena_size=130.0, p_deterministic=0.0,
+            red_mix="training")
+        mags = np.linalg.norm(np.stack([s["accel"] for s in samples]), axis=1)
+        seen_zero |= bool(np.all(mags < 1e-6))
+        seen_move |= bool(np.any(mags > 1e-6))
+    assert seen_zero, "a stationary-red episode should appear in six draws"
+    assert seen_move, "a moving-red episode should appear in six draws"
