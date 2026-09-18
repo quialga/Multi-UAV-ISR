@@ -187,9 +187,11 @@ oversubscription, not the observation.)
 * The learned motion model is now **v4**, retrained in the training
   distribution (§10.1), with `sigma_a_model` 0.10 and `merge_gate` 2.0
   (docs/tracking_diagnostics.md §11.7).  It tracks much better than v3
-  (MOTA 0.70/0.63 against 0.43/0.51) and costs more: 20.8 ms per step
-  against 6.7, all of it in the tracker's per-component Python loops, which
-  are the next thing to vectorise.
+  (MOTA 0.70/0.63 against 0.43/0.51) and costs more, because keeping the
+  mixture alive means more components to predict, gate and reduce.  The
+  gate and the merge search have been batched (median 18.7 -> 11.6 ms per
+  step); what dominates now is the adapter's per-component branch
+  construction and the obstacle tracker.
 * The filter stays over-cautious by design: NEES median 1.9 against 3.36,
   so the σ the actor sees is ~33% larger than honest.  That is the price of
   summarising a multimodal belief with one Gaussian; it errs safe for the

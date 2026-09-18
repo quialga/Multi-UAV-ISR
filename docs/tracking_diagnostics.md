@@ -1690,13 +1690,40 @@ tightening it to flatter a metric would start losing real associations. For
 the observation this errs on the safe side: with v4 every shown track under
 the 40 m cut-off has its red within 40 m, 100% of track-steps.
 
-**Cost.** The tracker goes from 6.7 to 20.8 ms per step (env.step is
-1.9 ms). Almost none of that is the network — it is one batched call either
-way — it is the Python loops that scale with components: the gate scores
-every (track, detection) pair against every component, and the reduce
-compares every pair of components. At the training configuration that is
-~2 h of wall time over a 1000-rollout run with 16 env workers, against ~1 h
-before. Vectorising those two loops is the obvious next optimisation.
+**Cost, and what actually costs.** Keeping the mixture alive roughly
+tripled the tracker's per-step time (6.7 -> 20.8 ms against an env.step of
+1.9 ms in that session). Almost none of it is the network — that is one
+batched call either way — so the suspects were the Python loops that scale
+with components: the gate, which scored every (track, return) pair against
+every component, and the reduce, which compared every pair of components.
+
+Both were batched, and the measurements corrected the guess twice:
+
+* **The gate**, batched over all (component, return) pairs of one blue with
+  the 2x2 inverse in closed form: **1.78x** on that piece, decisions
+  identical (`tests/test_tracker_vectorised.py`).
+* **The merge search** batched into one `solve` was **slower** for the
+  sizes that actually occur — 0.62x at ~3 components, where numpy's fixed
+  overhead beats two or three scalar 4x4 inverses. The crossover is at 4
+  components (1.3x at 4, 4x at 8, 20x at 32), so it is now a hybrid: the
+  loop below 4, batched above, which is what a track holds right after a
+  PREDICT before pruning.
+* **Neither was the whole story.** The in-process benchmark
+  (`scratch/bench_gate_reduce.py`) put the two together at ~0.13 ms per
+  step against a ~20 ms tracker step. What dominates instead is the
+  adapter's per-component branch construction (`_basins` / `_branches`) and
+  the obstacle tracker. Note cProfile is misleading here: it inflates
+  functions called many times with little work each (the profiled step ran
+  at 65 ms against 19 ms of wall time), which is exactly the shape of these
+  loops.
+
+End to end (`scratch/bench_tracker_step.py`, four alternating A/B passes
+against the unmodified code in the same session): the tracker-mode step
+went from a median 18.7 to 11.6 ms, and the tracker's own share (step minus
+the belief-mode step as a control) roughly halved — per-pass ratios 2.54,
+1.37, 1.91, 1.90. The spread is the machine, not the change: this laptop's
+absolute speed drifts by up to 2x between sessions and ~40% within one, so
+only same-session A/B numbers mean anything here.
 
 ### 11.8 What is still open
 

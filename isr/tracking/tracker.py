@@ -523,15 +523,10 @@ class MultiTargetTracker:
             comps = survivors or comps        # never prune down to nothing
 
         while len(comps) > 1:
-            best = None
-            for i in range(len(comps)):
-                for j in range(i + 1, len(comps)):
-                    d2 = _mahalanobis2_between(comps[i], comps[j])
-                    if d2 <= self.merge_gate and (best is None or d2 < best[0]):
-                        best = (d2, i, j)
-            if best is None:
+            pair = self._closest_pair(comps)
+            if pair is None:
                 break
-            _, i, j = best
+            i, j = pair
             merged = _merge_pair(comps[i], comps[j])
             comps = [c for k, c in enumerate(comps) if k not in (i, j)] + [merged]
 
@@ -544,6 +539,47 @@ class MultiTargetTracker:
             for c in comps:
                 c.w /= tot
         return comps
+
+    def _closest_pair(self, comps: List[_Component]):
+        """Indices of the closest pair of components within ``merge_gate``,
+        or None.  Same rule and same tie-break in either path: score every
+        pair with ``_mahalanobis2_between`` in (i < j) order and keep the
+        first strict minimum.
+
+        Two implementations, because the crossover is real and measured
+        (scratch/bench_gate_reduce.py): batching every pair into one
+        ``solve`` wins from 4 components up (1.3x at 4, 4x at 8, 20x at 32
+        — right after a PREDICT a track can hold branches x components
+        before pruning), and loses below that, where numpy's fixed
+        overhead costs more than two or three scalar 4x4 inverses.  This is
+        called ~24 times per step, so both ends matter."""
+        n = len(comps)
+        if n < 4:
+            best = None
+            for i in range(n):
+                for j in range(i + 1, n):
+                    d2 = _mahalanobis2_between(comps[i], comps[j])
+                    if d2 <= self.merge_gate and (best is None or d2 < best[0]):
+                        best = (d2, i, j)
+            return None if best is None else (best[1], best[2])
+        iu, ju = np.triu_indices(n, 1)
+        X = np.stack([c.x for c in comps])
+        P = np.stack([c.P for c in comps])
+        D = X[iu] - X[ju]
+        P_avg = 0.5 * (P[iu] + P[ju])
+        try:
+            d2 = np.einsum("ij,ij->i", D,
+                           np.linalg.solve(P_avg, D[..., None])[..., 0])
+        except np.linalg.LinAlgError:
+            # A singular averaged covariance: fall back pair by pair, where
+            # the offending pair scores infinity and the rest still count.
+            d2 = np.array([_mahalanobis2_between(comps[a], comps[b])
+                           for a, b in zip(iu, ju)])
+        within = d2 <= self.merge_gate
+        if not within.any():
+            return None
+        k = int(np.argmin(np.where(within, d2, np.inf)))
+        return int(iu[k]), int(ju[k])
 
     def _predict_all(self) -> None:
         """PREDICT every track.
@@ -621,6 +657,67 @@ class MultiTargetTracker:
             if best_cost is None or cost < best_cost:
                 best_d2, best_cost = d2, cost
         return best_d2, best_cost
+
+    def _gate_matrix(self, idxs: List[int], dets: Sequence[Dict]):
+        """(cost, gate) for one blue's returns against every track.
+
+        Same quantities as ``_gate_pos`` per (track, return) pair — the
+        minimum-cost component decides, cost = d^2 + ln|S| — computed for
+        every (component, return) pair at once.  LOST tracks
+        (``reacquire_after``) stay gated out.
+
+        Vectorised only for the position-only measurement; with
+        ``doppler_gating`` on, returns differ in dimension and the per-pair
+        path below is used instead.
+        """
+        n, m = len(self.tracks), len(idxs)
+        cost = np.zeros((n, m))
+        gate = np.zeros((n, m), dtype=bool)
+        thresh = np.array([self._gate_threshold(dets[k]) for k in idxs])
+        live = [i for i, tr in enumerate(self.tracks) if not self._is_lost(tr)]
+        if not live or m == 0:
+            return cost, gate
+
+        if self.doppler_gating:
+            for i in live:
+                for j, k in enumerate(idxs):
+                    d2, c = self._gate_pos(self.tracks[i], dets[k])
+                    cost[i, j] = c
+                    gate[i, j] = d2 <= thresh[j]
+            return cost, gate
+
+        owner = np.concatenate([np.full(len(self.tracks[i].components), i)
+                                for i in live])
+        comps = [c for i in live for c in self.tracks[i].components]
+        X = np.stack([c.x[:2] for c in comps])                  # (C, 2)
+        P = np.stack([c.P[:2, :2] for c in comps])              # (C, 2, 2)
+        Z = np.stack([dets[k]["z_pos"] for k in idxs]).astype(np.float64)
+        r2 = np.array([float(dets[k]["sigma_pos"]) ** 2 for k in idxs])
+
+        # S = P + R with R = sigma^2 I, inverted in closed form (2x2).
+        a = P[:, None, 0, 0] + r2[None, :]
+        b = P[:, None, 0, 1]
+        c_ = P[:, None, 1, 0]
+        d_ = P[:, None, 1, 1] + r2[None, :]
+        det = a * d_ - b * c_
+        ok = det > 0.0
+        safe = np.where(ok, det, 1.0)
+        y0 = Z[None, :, 0] - X[:, None, 0]
+        y1 = Z[None, :, 1] - X[:, None, 1]
+        d2 = (y0 * (d_ * y0 - b * y1) + y1 * (a * y1 - c_ * y0)) / safe
+        # ln|S| only when the determinant is positive, mirroring slogdet's
+        # sign check in the per-pair path.
+        pair_cost = d2 + np.where(ok, np.log(safe), 0.0)
+        d2 = np.where(ok, d2, np.inf)
+        pair_cost = np.where(ok, pair_cost, np.inf)
+
+        cols = np.arange(m)
+        for i in live:
+            rows = np.nonzero(owner == i)[0]
+            best = np.argmin(pair_cost[rows], axis=0)
+            cost[i] = pair_cost[rows][best, cols]
+            gate[i] = d2[rows][best, cols] <= thresh
+        return cost, gate
 
     def _gate_measurement(self, det: Dict):
         """(H, R, z) for gating: position only, or position + Doppler.
@@ -820,17 +917,7 @@ class MultiTargetTracker:
             for _blue, idxs in sorted(by_blue.items()):
                 if not self.tracks:
                     break
-                n, m = len(self.tracks), len(idxs)
-                cost = np.zeros((n, m))
-                gate = np.zeros((n, m), dtype=bool)
-                thresh = [self._gate_threshold(dets[k]) for k in idxs]
-                for i, tr in enumerate(self.tracks):
-                    if self._is_lost(tr):
-                        continue                    # gate row stays False
-                    for j, k in enumerate(idxs):
-                        d2, c = self._gate_pos(tr, dets[k])
-                        cost[i, j] = c
-                        gate[i, j] = d2 <= thresh[j]
+                cost, gate = self._gate_matrix(idxs, dets)
                 for i, j in solve_gated(cost, gate):
                     assignments.append((i, idxs[j]))
 
