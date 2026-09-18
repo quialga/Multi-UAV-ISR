@@ -1621,7 +1621,84 @@ would help stationary/random reds and could hurt fleeing ones, and with
 random blues the fleeing case is seen too rarely (recall ≤ 0.15) to
 measure.
 
-### 11.7 What is still open
+### 11.7 v4: retrained in the training distribution, and the mixture it needs
+
+v3 ran out of its own distribution at the training configuration (§6.3).
+v4 is the same architecture retrained on data collected there (§10.1): L=200,
+up to 7 blues and 9 obstacles, the trainer's stationary / random / run mix,
+1.82 M samples, 20 epochs. Val loss 2.696 against a 3.934 marginal baseline,
+angular median 50 deg against 90.
+
+**Downstream it is clearly better.** Same 10 episodes and seeds, training
+configuration, clutter 0.2, the chosen tracker with re-acquisition:
+
+| | v3 | v4 |
+|---|---|---|
+| MOTA stationary / random | 0.43 / 0.51 | **0.70 / 0.63** |
+| recall | 0.55 / 0.63 | **0.72 / 0.69** |
+| FP (stationary) | 587 | **100** |
+| position error at 20 coasted scans | 18.3 m | **9.5 m** |
+
+**But `sigma_a_model` stopped being the lever.** Swept from 0.35 down to
+0.0, the NEES median moved only 1.64 -> 1.67: the filter declares far more
+uncertainty than it commits, and the additive term is not what sets it.
+The cause is the MIXTURE. v3 knew one behaviour and predicted something
+unimodal; v4 has to hedge across three policies with nothing in the state
+saying which one a red follows, so it branches. Those branches were then
+being folded back together by `merge_gate`, whose moment-matched merge adds
+the SPREAD BETWEEN THE MEANS to the covariance — "still, or fleeing that
+way" becomes one fat Gaussian centred where the red never is.
+
+Worse, the merge criterion is a Mahalanobis distance, so the same physical
+separation shrinks as a track's own covariance grows: two modes 20 m apart
+are 4 sd apart at sd 5 m but 1.3 sd apart at sd 15 m. Exactly when the
+track is most lost, the criterion folds its hypotheses together — and the
+fold inflates the covariance further.
+
+**Sweep of `merge_gate`** (v4, `sigma_a_model` 0.10, 10 episodes,
+sequential runs so the timings are clean):
+
+| merge_gate | components / track | NEES median | MOTA stat / rand | FP stat | tracker ms/step |
+|---|---|---|---|---|---|
+| 4.0 (old default) | 1.28 | 1.64 | 0.66 / 0.57 | 169 | **6.7** |
+| **2.0** | 2.5 | 1.86 | **0.70 / 0.63** | **100** | 20.8 |
+| 1.0 | 4.5 | 2.25 | 0.67 / 0.60 | 146 | 61.6 |
+| 1.0, cap 4 components | 4.0 | — | 0.54 / 0.50 | 397 | 21.6 |
+
+2.0 is the optimum and both extremes are worse, for different reasons. At
+4.0 the mixture collapses. At 1.0 the modes survive but the readout (the
+dominant component) is right less often — its median error in the 30–40 m
+sd band is 12.1 m against 6.6 m at 2.0 — and the wide gate lets more
+detections in. The last row is the cheap way out and it does not work:
+capping the component count truncates probability mass, which is worse than
+merging it.
+
+**`sigma_a_model` re-calibrated at merge 2.0**: 1.94 (at 0.0), 1.86 (0.10),
+1.73 (0.20), 1.55 (0.35) — MOTA within noise across the four. **0.10
+adopted**: a small allowance for model error, since every measurement here
+used RANDOM blues and the blues become purposeful during training. Note the
+coupling — a larger `sigma_a_model` fattens each branch, which makes them
+merge more, so the component count falls from 2.75 to 1.40 across that
+sweep.
+
+**What remains open.** The filter is still over-cautious: NEES median 1.9
+against 3.36, i.e. the declared sd is ~33% larger than honest (it was 43%
+at merge 4.0). The rest is structural — summarising a genuinely multimodal
+belief with one Gaussian is wide by construction. It is left alone rather
+than scaled down, because that same covariance drives the association gate:
+tightening it to flatter a metric would start losing real associations. For
+the observation this errs on the safe side: with v4 every shown track under
+the 40 m cut-off has its red within 40 m, 100% of track-steps.
+
+**Cost.** The tracker goes from 6.7 to 20.8 ms per step (env.step is
+1.9 ms). Almost none of that is the network — it is one batched call either
+way — it is the Python loops that scale with components: the gate scores
+every (track, detection) pair against every component, and the reduce
+compares every pair of components. At the training configuration that is
+~2 h of wall time over a 1000-rollout run with 16 env workers, against ~1 h
+before. Vectorising those two loops is the obvious next optimisation.
+
+### 11.8 What is still open
 
 * **The mixture earns nothing, and that is now settled** (§11.4).
   Disabling merging entirely lets the hypotheses persist (1.01 → 28.8

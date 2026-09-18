@@ -48,16 +48,29 @@ RED_TRACKER_CONFIG = dict(
     dt=1.0, a_max=1.0, vel_prior_std=1.0,
     confirm_hits=3, confirm_window=4, confirm_deadline=True,
     max_misses=3, max_coast_steps=80, reacquire_after=4,
+    # merge_gate: squared Mahalanobis distance between two components'
+    # means, below which they are folded into one.  The tracker's own
+    # default (4.0) was a placeholder never tuned against a model that
+    # BRANCHES, and with the v3 model nothing branched (1.01 components).
+    # The v4 model does branch — it has to hedge across stationary /
+    # random / fleeing reds — and 4.0 then collapsed the mixture to 1.3
+    # components on average, turning "still, or fleeing that way" into one
+    # fat Gaussian centred where the red never is.  Measured sweep
+    # (docs/tracking_diagnostics.md §11.7): 2.0 is the optimum, and the
+    # extremes are worse in opposite ways.
+    merge_gate=2.0,
 )
 # Coverage margin (k * sd) for the red tracker's miss accounting.
 COVERAGE_K_SIGMA = 2.0
-# Learned red motion model adapter.  sigma_a_model CALIBRATED against NEES
-# at this configuration and FROZEN (docs/tracking_diagnostics.md §11.6):
-# with oracle association the mean NEES is 4.08 against a target of 4.0 for
-# a 4-D state (median 3.06 against 3.36).  The previous placeholder 0.35
-# was over-cautious (NEES 2.97 / 2.24).  Re-calibrate if the geometry, the
-# red policy mix or the model itself changes.
-LEARNED_MOTION_CONFIG = dict(max_branches=4, sigma_a_model=0.20)
+# Learned red motion model adapter.  sigma_a_model re-calibrated for the
+# v4 model (docs/tracking_diagnostics.md §11.7): 0.10, a small allowance
+# for model error, since every measurement here used RANDOM blues and the
+# blues become purposeful during training.  Unlike with v3 (§11.6), this
+# term is no longer the lever that sets the declared uncertainty: from 0.0
+# to 0.35 the NEES median only moves 1.94 -> 1.55, because the spread now
+# comes from the MIXTURE, not from this additive term.  Re-calibrate if the
+# geometry, the red policy mix or the model changes.
+LEARNED_MOTION_CONFIG = dict(max_branches=4, sigma_a_model=0.10)
 
 # Obstacle tracker (§9.6): 3-of-4 with deadline, never forgets a confirmed
 # obstacle, merges duplicates.  STATIC model when obstacles are known not to

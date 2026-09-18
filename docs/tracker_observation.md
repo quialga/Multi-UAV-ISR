@@ -97,15 +97,18 @@ Two things worth keeping in mind:
 
 * **σ is one standard deviation, not a radius that "surely" contains the
   red.** For an honest round 2-D Gaussian the red is within 1σ only ~39% of
-  the time. Measured, shown tracks do much better than that (≥ 91% within
-  40 m even in the 30–40 m σ band), because most shown tracks sit well
-  below the cut-off and because the covariance of coasting tracks is still
-  somewhat conservative (docs/tracking_diagnostics.md §11.6).
+  the time. Measured, shown tracks do much better than that — with the v4
+  model, 100% of shown track-steps have their red within 40 m — because
+  most shown tracks sit well below the cut-off and because the covariance
+  of a coasting track is still conservative
+  (docs/tracking_diagnostics.md §11.7).
 * **The cut-off acts on the uncertainty the tracker DECLARES, not on its
-  actual error.** Calibrating `sigma_a_model` from 0.35 to 0.20 made the
-  declared σ honest, which lets slightly older tracks through the same
-  40 m cut-off — docs/tracking_diagnostics.md §11.6 explains why and gives
-  the numbers. Lowering the flag restores the stricter behaviour.
+  actual error.** That is why the same 40 m has meant different things as
+  the model changed: an over-cautious filter declares a large σ and the
+  cut-off removes tracks that were fine, an honest one lets them through.
+  With the v4 model the filter is still ~33% over-cautious, so the cut-off
+  errs safe — every shown track under it has its red within 40 m
+  (docs/tracking_diagnostics.md §11.7).
 
 ## 3. No ground truth anywhere in the actor path
 
@@ -181,13 +184,17 @@ oversubscription, not the observation.)
 
 * **Nothing is trained yet.** Whether the tracker observation trains
   better than the belief map is exactly the open question.
-* `sigma_a_model` is calibrated and frozen at **0.20** (was 0.35;
-  docs/tracking_diagnostics.md §11.6).  Training logs NEES and NIS per
-  rollout (`tracker/nees`, `tracker/nis`), so drift away from 4.0 shows up
-  during the run.
-* The learned model v3 was trained at L=130 on stochastic reds; training
-  runs at L=200 with the stationary/random/run mix, so it is out of its
-  distribution (docs/tracking_diagnostics.md §6.3).
+* The learned motion model is now **v4**, retrained in the training
+  distribution (§10.1), with `sigma_a_model` 0.10 and `merge_gate` 2.0
+  (docs/tracking_diagnostics.md §11.7).  It tracks much better than v3
+  (MOTA 0.70/0.63 against 0.43/0.51) and costs more: 20.8 ms per step
+  against 6.7, all of it in the tracker's per-component Python loops, which
+  are the next thing to vectorise.
+* The filter stays over-cautious by design: NEES median 1.9 against 3.36,
+  so the σ the actor sees is ~33% larger than honest.  That is the price of
+  summarising a multimodal belief with one Gaussian; it errs safe for the
+  cut-off (every shown track under 40 m has its red within 40 m).  Training
+  logs NEES and NIS per rollout (`tracker/nees`, `tracker/nis`).
 * **Moving obstacles are not ready.** The env switches the obstacle tracker
   away from the static model automatically, but then drifting tracks come
   back (0.27 misleading per step) and nothing can delete them yet; they
