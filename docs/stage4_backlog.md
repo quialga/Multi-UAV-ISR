@@ -1115,6 +1115,103 @@ folded into it.
 
 ---
 
+## 21. Difficulty axes that exist but have never been TRAINED
+
+Four ways to make the task harder, grouped because they share one
+property: each changes the TASK, so each would confound the
+belief-map-vs-tracker comparison if switched on during it. They belong
+after that run, one at a time, with the same seeds.
+
+Two of them are already built and merely unused; one needs a knob that
+does not exist; one needs the obstacle tracker finished first.
+
+### 21.1 Variable obstacle count — BUILT, never trained
+
+`n_obstacles_min` already samples the active count per episode inside the
+padded capacity (see LANDED "Variable entity counts"), and the critic's
+masked-mean pool makes `V(s, i)` count-agnostic. The fixed-count baseline
+is validated; variable-N training is what is pending.
+
+The tracker observation makes this easier than it was: the actor's node
+count is the number of CONFIRMED TRACKS, capped at K, so it never saw the
+true obstacle count in the first place (docs/tracker_observation.md).
+Under the belief path, the actor's obstacle slots were one per placed
+obstacle, which leaked the count.
+
+### 21.2 Variable red:blue ratio — HALF built
+
+The RED side is built: `n_red_min` samples active reds per episode, and
+padded reds are inactive from step 0, reusing the caught-red machinery.
+Varying the ratio this way is a one-flag experiment.
+
+The BLUE side is not. `n_blue` is baked into the graph: `bb_edge_visible`,
+the blue-blue edge index tables and the GRU hidden state all assume a
+fixed blue count, and nothing masks an inactive blue. Varying the team
+size would need blue padding + masking end to end (encoder buffers, hidden
+state, per-agent reward and the PPO buffer's agent axis). Worth doing only
+if the question is specifically "does the policy transfer across team
+sizes"; for "does it handle a worse ratio", varying reds is enough.
+
+### 21.3 Red as fast as blue — needs a knob, and re-calibration
+
+Today blue `v_max` is 1.5 and red 1.0, and that RATIO is the task: a stern
+chase closes slowly, so cornering is already needed but pure pursuit still
+works. At equal speeds a red fleeing in a straight line can never be
+caught by pursuit at all — only by cornering it or cutting it off, which
+is exactly the coordination this would force (`run_from_nearest_uav`
+reacts to the NEAREST blue only, so a second blue coming from ahead is a
+real counter).
+
+Measured with the scripted team (GreedyPursuer, full observability, 7 blues
+vs 4 reds, 6 episodes, `scratch/red_speed_probe.py`):
+
+| red v_max | fleeing red | random red | stationary red |
+|---|---|---|---|
+| 1.0 (today) | 4.00/4 caught in 94 steps | 4.00/4 | 4.00/4 |
+| 1.25 | 4.00/4 in 132 steps | 4.00/4 | 4.00/4 |
+| **1.5 (= blue)** | **0.50/4**, times out | 4.00/4 | 4.00/4 |
+
+So the uncoordinated baseline collapses, which is the intent — and the
+risk: if a from-scratch team also catches nothing on the fleeing third of
+episodes, that third yields no reward signal. Sampling the red's speed per
+episode (e.g. uniform in [1.0, 1.5]) keeps a signal, gives a curriculum for
+free, and makes the policy handle both regimes.
+
+Capture tunnelling was checked and is a non-issue: at 1.5 vs 1.5 the
+closing speed reaches 3 m/step against a 3 m capture radius, yet the probe
+saw no capture missed between sampled steps.
+
+What is missing:
+
+* **`red_v_max` as an env parameter.** It is `RED_TARGET.v_max` in
+  `isr/env/entities.py` today — a frozen module constant, so there is no
+  per-episode or per-run way to set it.
+* **Tracker priors.** `vel_prior_std` (1.0) is the "how fast could this
+  thing be" scale used for the velocity ridge at birth; it becomes 1.5.
+* **The learned motion model.** Its training data would need re-collecting
+  at the new speed distribution (the state distribution changes, and the
+  model conditions on the red's velocity). Then `sigma_a_model` and
+  `merge_gate` need re-checking (docs/tracking_diagnostics.md §11.7).
+* **Detectability.** A faster red leaves the sensor disk sooner, so the
+  invisibility gaps lengthen and recall drops — expect the tracking
+  numbers to move, and re-measure rather than assume.
+
+### 21.4 Static and moving obstacles mixed — blocked on the obstacle tracker
+
+Moving obstacles landed (§4, reciprocating patrol) and are untrained. The
+blocker for the TRACKER path is measured in docs/tracking_diagnostics.md
+§9.6: with obstacles that can move, the tracker cannot use the static
+model (velocity pinned at 0), and with `sigma_a = 0.1` its tracks drift on
+a velocity estimated from noise — 0.27 misleading tracks per step and a
+worst centre error of 186 m, with nothing able to delete a drifted track.
+
+Before training this, §9.6 lists what is needed: a finite coverage-aware
+miss budget so a drifted track can die, an IMM (a static and a
+constant-velocity model per track, weighted by which explains the
+measurements) so a mixed fraction is representable at all, and a physical
+distance bound on the duplicate merge, which is only safe today because
+the static model keeps covariances small.
+
 ## Design questions still open
 
 Items where the "right" choice depends on empirical results:
