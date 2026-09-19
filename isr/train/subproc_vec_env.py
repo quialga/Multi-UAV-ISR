@@ -21,9 +21,11 @@ in-process class:
 so ``--n-workers`` is a pure drop-in in ``train_stage4.py``.
 
 Windows notes: uses the ``spawn`` start context (the only one on
-Windows).  Workers import numpy + the env stack only — torch is NOT
-imported in workers, keeping them light and avoiding thread-pool
-oversubscription against the parent's torch threads.
+Windows).  Workers used to import numpy + the env stack only, with torch
+kept out to avoid thread-pool oversubscription against the parent.  With
+``actor_obs="tracker"`` and a learned motion model the env itself runs a
+network, so torch IS imported in workers now — and each one pins itself to
+a single thread, which is what that exclusion was protecting.
 """
 from __future__ import annotations
 
@@ -53,7 +55,20 @@ def _worker(
     worker stack trace instead of a bare EOFError.
     """
     # Import inside the worker: with the 'spawn' context this runs in a
-    # fresh interpreter, and we deliberately keep torch out of it.
+    # fresh interpreter.
+    #
+    # torch used to stay out of the worker entirely, which is what kept its
+    # thread pool from fighting the parent's.  That stopped being true with
+    # actor_obs="tracker" and a learned motion model: the env then runs a
+    # network forward inside every worker, and torch would give EACH of
+    # them a pool sized for the whole machine.  One thread per worker is
+    # right regardless — a worker is already one of many processes, and its
+    # batches are a handful of samples, far too small for intra-op
+    # parallelism to pay (measured: the default pool made a training run
+    # ~7x slower on 8 cores).
+    import torch
+    torch.set_num_threads(1)
+
     from isr.train.vec_env import Stage4VectorPursuitEnv
 
     try:
