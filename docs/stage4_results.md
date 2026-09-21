@@ -686,10 +686,35 @@ carried over from a command line written before `2dc0528`, overriding the
 **NOT ESTABLISHED:** that this fully explains the gap. It is a sufficient
 explanation on paper; `bv3_repro` (arena 130, 5/3, no obstacles,
 `belief_grid_size 26`, `max_steps 200`, corrected recipe, 600 rollouts)
-is the run that settles it. If it climbs back toward 3/3 there is no
-regression and difficulty explains everything; if it stalls near 1/3 the
-remaining suspects are the two stabilisers `belief_v3` had and these runs
-did not — a warm-started critic and `aux_hidden_coef 0.2`.
+is the run that settles it.
+
+It cannot settle it alone, though, because the arena is not the only
+thing that changed since `belief_v3`. The full delta is:
+
+1. **§4b, the live-track sensor model** — the big one. `belief_v3` ran
+   when a red inside `sensor_radius` yielded `conf = 1.0` and an exact
+   position every step, through walls; §4b itself flags that "results
+   above this section were obtained under that near-oracle in-range
+   regime". Today detection must pass the `p_TP` draw, needs line of
+   sight, and position error grows with range. The 94.2% detection
+   figure §4b reports is for a red seen by SEVERAL blues (fusion gives
+   `1 − (1−p_TP)ⁿ`); a red seen by ONE blue — the normal case for a
+   dispersed search team — is 85% per step, and a 2.11 m position error
+   against a 3 m capture radius makes the final closing phase materially
+   harder.
+2. `enemy_belief_decay` 0.99 → 0.9935.
+3. No warm-started critic and `aux_hidden_coef 0`, the two stabilisers
+   `belief_v3` had.
+4. A different PPO geometry (16×300 then, 64×200 now; `mb 512` and 10
+   epochs in both).
+
+So three outcomes are possible, not two: back near 3/3 (difficulty
+explained it all), stalled near 1/3 (something else is wrong), or
+somewhere between (the arena explains part and §4b the rest, with no
+regression). §4b left escape hatches, so it isolates in one run:
+`--no-track-occlusion --no-track-detection --track-conf-min 1.0
+--sensor-noise-range-growth 0.0 --sensor-vel-noise-std 0.0` at arena 130
+reproduces `belief_v3`'s perception exactly, warm start aside.
 
 #### 6.5 Two traps worth not repeating
 
