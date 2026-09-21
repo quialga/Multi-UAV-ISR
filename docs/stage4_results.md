@@ -589,3 +589,117 @@ destroy-on-crash, now feasible via the variable-entity machinery), under
 a **motion curriculum** (`fraction 0.1 / speed 0.5` first) with the
 **default `lr 1e-4`, low entropy**. See `stage4_backlog.md` §5 / §10 /
 §15 for the perception-side options and the safe-RL framing.
+
+---
+
+### 6. The big-batch recipe does not train, and the task grew (MEASURED, 2026-09-19/21) · `feature/target-tracking`
+
+Six runs on a rented RTX 3090 (32 vCPU), while preparing the
+belief-map-vs-tracker comparison. The comparison never started: the
+control arm would not learn.
+
+#### 6.1 The symptom
+
+| run | task | recipe | outcome |
+|---|---|---|---|
+| `belief_ctrl_s0` | 7/4/9, crash 2.0/2.0 | `n_envs 1024, rollout_steps 128, mb 16384, epochs 4` | det eval **0.52 → 0.43 → 0.40** at rollouts 75/100/125, entropy RISING 2.84 → 3.25, `kl ≈ 0.0003`. Stopped at 125. |
+| `nopen_probe` | same, crash **0/0** | same | det eval 0.28 @50, 0.35 @75; `caught` flat at 0.57–0.58 for 75 rollouts; `kl = 0.0000`. |
+
+Removing the crash penalties changed nothing, which killed the first
+hypothesis (that avoidance was drowning the capture signal). The reward
+decomposition says why it was wrong: `r_team = 10·n_caught − 0.05/step
+[− 5·n_uncaught at the end]`, so each extra red caught is worth **+15**
+and the terminal term already points hard at capture. Measured, the
+crash penalties were worth only ~5.2 of ~25 return points (epR −24.96
+with them, −19.77 without, same rollout).
+
+#### 6.2 The cause: minibatch size, not episode truncation
+
+A 2×2 on the smallest possible task (1 blue, 1 stationary red, no
+obstacles, 60 rollouts, det eval at the end):
+
+| | `mb 4096` | `mb 512` |
+|---|---|---|
+| **truncated** (`rollout_steps 128`) | `tiny_b1` **0.03/1** | `abl_smallmb` **0.47/1** |
+| **whole episodes** (`rollout_steps 200`) | `abl_fullep` **0.05/1** | `tiny_oldrecipe` **0.42/1** |
+
+Sample counts per rollout were matched (~32k) so only the axis under test
+varies. The column decides and the row does not: **`mb_size` is the
+lever**; collecting whole episodes is not required. `abl_fullep` ended at
+`kl = 0.0000  clip = 0.000` — the policy never moved.
+
+With one agent there is no credit-assignment confound, which also rules
+out "7 agents sharing a team reward" as the cause.
+
+**Health check, cheap and reliable:** `kl ≈ 0.000` with `clip = 0.000`
+rollout after rollout means the run is dead, whatever else looks
+plausible. Healthy is ~0.002–0.03; above that `target_kl` starts binding
+and `eps` drops below `n_epochs`.
+
+**Consequence:** `n_envs` can go back up for throughput as long as
+`mb_size` stays small — but updates per rollout scale with `n_envs` at
+fixed `mb_size`, so that needs dimensioning rather than copying.
+
+#### 6.3 The corrected recipe trains, and still falls far short
+
+`n_envs 64, rollout_steps 200, mb 512, epochs 10`, 600 rollouts each:
+
+| run | task | result |
+|---|---|---|
+| `b5r3_long` | 5/3, no obstacles, **arena 200**, `max_steps 200` | **1.02/3** |
+| `real749_long` | 7/4/9, crash 2.0/2.0, **arena 200**, `max_steps 200` | **0.57/4** (166.6 min) |
+
+`real749_long` in detail: det eval 0.57 @225, 0.60 @475, 0.57 @600, peak
+0.68 @125 — flat. Learning was real (entropy 2.84 → 1.57, crash
+occupancy `o=11.4/a=10.5` @25 → eval `o=3.68/a=2.03` @600) but the `run`
+(fleeing) column sat at **0.05 throughout** and never moved.
+
+`b5r3_long` spent **7.7 M env steps** against `belief_v3`'s 1.9 M — 4×
+the data for a third of the result. So it is not a data-budget problem.
+
+#### 6.4 Why: the arena grew and the command undid the compensation
+
+Commit `2dc0528` (2026-08-25, *"scale the Stage 4 arena to L=200 so
+search and the belief map matter"*) changed, together: `arena_size`
+130 → 200, `max_steps` → **300**, `rollout_steps` → **320**,
+`belief_grid_size` 26 → 40, `n_obstacles` 4 → 9 (and `n_blue` 5 → 7,
+`n_red` 3 → 4). Before it, Stage 4 inherited `arena_size 130` from
+`stage3_default` and `max_steps 200` from `stage1_default` — those are
+`belief_v3`'s conditions.
+
+Sensor coverage `C = n_blue·πR²/L²` and episode length in arena
+crossings (`v_max 1.5`):
+
+| | arena | `max_steps` | coverage | crossings |
+|---|---|---|---|---|
+| `belief_v3` (3.00/3) | 130 | 200 | **1.49** | **2.3** |
+| config as written today | 200 | 300 | 0.88 | 2.25 |
+| `b5r3_long` (1.02/3) | 200 | 200 | **0.63** | **1.5** |
+| `real749_long` (0.57/4) | 200 | 200 | 0.88 | 1.5 |
+
+Two compounding handicaps against the run that scored 3.00/3: **42% of
+the sensor coverage and 65% of the episode length**. The second one was
+self-inflicted — every run in this batch passed `--max-steps 200`,
+carried over from a command line written before `2dc0528`, overriding the
+300 the config had raised precisely to preserve the crossing count.
+
+**NOT ESTABLISHED:** that this fully explains the gap. It is a sufficient
+explanation on paper; `bv3_repro` (arena 130, 5/3, no obstacles,
+`belief_grid_size 26`, `max_steps 200`, corrected recipe, 600 rollouts)
+is the run that settles it. If it climbs back toward 3/3 there is no
+regression and difficulty explains everything; if it stalls near 1/3 the
+remaining suspects are the two stabilisers `belief_v3` had and these runs
+did not — a warm-started critic and `aux_hidden_coef 0.2`.
+
+#### 6.5 Two traps worth not repeating
+
+- **`best_ckpt_metric`.** The default `mean_return` mis-selects on any
+  crash-penalty run (§3 already records this); these runs used
+  `det_caught` / `det_composite`. Consider changing the default.
+- **Never change a RunPod pod's `args` while it is running.** It recreates
+  the container immediately: it killed `bv3_repro`'s first attempt at
+  rollout 5 and left the pod billing overnight with nothing running. Set
+  the command before starting, guard each run with a `.done_` marker on
+  the persistent volume so a container recreate skips finished work, and
+  watch for shutdown via log inactivity read from the API rather than a
+  marker line in the container log (a recreate wipes that log).
