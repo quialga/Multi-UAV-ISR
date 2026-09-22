@@ -147,6 +147,7 @@ def write_results_md(
     eval_episodes:   int,
     stage_label:     str = "Stage 2",
     bar_label:       str = "1.20 × GreedyPursuer",
+    stochastic:      bool = False,
 ) -> None:
     """Render the results writeup.  ``stage_label`` + ``bar_label`` are
     populated by the caller so the same template serves Stage 1/2 and
@@ -179,7 +180,7 @@ bar = {bar_label} = **{acceptance_bar:+.2f}**; margin = **{margin:+.2f}**)
 Generated: {time.strftime('%Y-%m-%d %H:%M:%S')}
 Checkpoint: `{ckpt_path}`
 Training: rollout {ckpt_meta.get('rollout', '?')}, global_step {ckpt_meta.get('global_step', '?')}
-Eval episodes per cell: {eval_episodes} (deterministic, fixed seeds shared across blue policies)
+Eval episodes per cell: {eval_episodes} ({'STOCHASTIC — actions sampled' if stochastic else 'deterministic'}, fixed seeds shared across blue policies)
 
 ## Evaluation table
 
@@ -220,7 +221,7 @@ even when reward moves only a little.
   faster** (less step cost), **catching with less effort** (lower
   action cost), or **catching more reds in time-up episodes** (less
   terminal penalty).
-- Eval is deterministic (distribution mean, no exploration noise).
+- {'Eval SAMPLES actions (exploration noise kept). Blues share parameters and differ only by observation, so noise decorrelates the team; compare against the deterministic run on the same seed base.' if stochastic else 'Eval is deterministic (distribution mean, no exploration noise).'}
   Returns will be lower-variance than during training.
 """
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -239,6 +240,17 @@ def main() -> None:
     p.add_argument("--n-episodes", type=int, default=50,
                    help="episodes per (blue, red) cell")
     p.add_argument("--device",     default="cpu")
+    p.add_argument("--stochastic", action="store_true",
+                   help="SAMPLE actions instead of taking the distribution "
+                        "mean.  The default (deterministic) is the metric "
+                        "training reports as '[det eval]'.  Run both on the "
+                        "same --seed-base to ask whether exploration noise "
+                        "HELPS: blues share parameters and differ only by "
+                        "observation, so the greedy policy can make them act "
+                        "too alike (two chasing one red), and noise may "
+                        "decorrelate the team.  If stochastic wins on "
+                        "identical episodes, the deterministic metric is "
+                        "understating the policy rather than measuring it.")
     p.add_argument("--seed-base",  type=int, default=50_000,
                    help="shared seed base across blue policies for the same env")
     p.add_argument("--gif-seed",   type=int, default=12_345,
@@ -277,7 +289,8 @@ def main() -> None:
         "Greedy":  lambda: GreedyPursuer(),
         # ``build_trained_agent`` picks the right adapter (Stage 1/2
         # adapter) from the loaded policy's class.
-        "Trained": lambda: build_trained_agent(policy, device, deterministic=True),
+        "Trained": lambda: build_trained_agent(
+            policy, device, deterministic=not args.stochastic),
     }
     red_factories = {
         "Stationary":     stationary_red,
@@ -362,7 +375,11 @@ def main() -> None:
     # Default the write-up NEXT TO THE CHECKPOINT, like the JSON and GIFs.
     # It used to fall back to docs/stage2_results.md, a TRACKED file, so any
     # eval silently overwrote the Stage 2 results doc.
-    md_path = Path(args.results_md or (ckpt_path.parent / "eval_results.md")
+    # Stochastic runs get their own filename: the point of --stochastic is to
+    # compare the two on the same checkpoint, so they must not overwrite.
+    _default_md = ("eval_results_stochastic.md" if args.stochastic
+                   else "eval_results.md")
+    md_path = Path(args.results_md or (ckpt_path.parent / _default_md)
                    ).resolve()
     stage_label = ("Stage 4" if train_args.get("policy_type") == "gnn_stage4_v6"
                    else "Stage 2")
@@ -382,6 +399,7 @@ def main() -> None:
         eval_episodes   = args.n_episodes,
         stage_label     = stage_label,
         bar_label       = bar_label,
+        stochastic      = args.stochastic,
     )
     print(f"Markdown writeup: {md_path}")
 
