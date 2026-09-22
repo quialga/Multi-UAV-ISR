@@ -872,8 +872,12 @@ only confirmed tracks under the σ cut-off.
   `enemy_belief_diffusion 0.2`, unobserved cells drift back toward the
   prior, which *is* a where-have-I-looked signal. The tracker arm gets K
   discrete confirmed tracks and nothing else. Region / staleness nodes
-  (docs/search_design.md) are the missing half, and this run is the first
-  evidence for them rather than an argument from first principles.
+  (docs/search_design.md) would close that asymmetry. **This run is not
+  evidence that they would help**: the two arms tie, so nothing here
+  attributes the shared ceiling to missing coverage. An earlier draft of
+  this section claimed it did, on a reading of rollouts ≤200 where the
+  tracker looked behind on `stat`/`rand` — it had simply not converged
+  yet.
 * **K slots and the σ cut-off were calibrated elsewhere** (L=200, 7 blue /
   4 red / 9 obstacles). At this geometry 8 slots comfortably exceed
   2 × n_red and the 40 m cut-off is still the sensor radius, but that is
