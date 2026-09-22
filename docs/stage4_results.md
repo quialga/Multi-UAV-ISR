@@ -899,3 +899,93 @@ compute-parity objection; if it ties again, it is not.
 Note that `--n-rollouts 1000` is **not** "600 and then more": the `lr`
 decays linearly over the budget, so a 1000-rollout run holds a higher
 `lr` for longer and is a different recipe.
+
+---
+
+### 8. The observation is not the bottleneck — the policy is (MEASURED, 2026-09-22)
+
+#### 8.1 Why the old bar was not a bar
+
+`GreedyPursuer` reads `env.state_snapshot()`: **true** red positions,
+gated only by range. It never misses a detection, never sees a false one,
+and its positions carry no error — precisely the near-oracle in-range
+regime §4b removed from the policy's inputs. Reading "greedy 2.63 vs
+trained 1.27" as *a trivial baseline beats us* is therefore wrong: the
+comparison mixes policy quality with an information gap we created on
+purpose.
+
+#### 8.2 `ObservationGreedyPursuer`, the same-information baseline
+
+Same rule, run on what the **actor** is shown.
+
+**Inputs.** Exactly the arrays the policy receives for its enemy graph —
+`rb_edge_features` (K track slots × N blues, 7-D) and `rb_edge_visible`,
+from `structured_belief_observation()`. In belief mode those come from
+`_build_enemy_tracks` (live tracks + belief-map memory peaks); in tracker
+mode from the tracker's confirmed tracks. Same producer as the policy's,
+whichever arm is running.
+
+It uses a **strict subset** of them: `rel_pos` (indices 0:2) and `range`
+(index 4), plus the mask. It ignores relative velocity (2:4), bearing
+(5:7), the `red_features` nodes (confidence + velocity covariance), its
+teammates (`blue_features`, `bb_*`), obstacles, and has no memory of its
+own — only what the observation already carries. The policy gets all of
+that **plus** a GRU.
+
+**Rule.** Among this blue's slots with a non-zero mask, keep the most
+confident ones and steer at the nearest of those; hold position if there
+are none. The mask *is* the confidence (1.0 live, the belief peak's value
+for memory, 0 padding), so a live target always outranks a remembered one
+and memory is used exactly when nothing is live. Ranking by distance
+alone chased ghosts — a test caught it steering at a 2 m belief artefact
+over a real red 30 m away.
+
+#### 8.3 Results (50 episodes per cell, matched seeds)
+
+Trained row = the tracker-CV arm's checkpoint.
+
+| Blue | Stationary | Random | RunFromNearest | **mean /3** |
+|---|---|---|---|---|
+| Random | 0.94 (198 steps) | 1.20 (199) | 0.12 (200) | **0.75** |
+| Trained | 1.72 (185) | 1.84 (186) | **0.26** (200) | **1.27** |
+| Greedy (true-in-range) | 2.60 (94) | 2.80 (76) | 2.50 (121) | **2.63** |
+| **ObsGreedy** (same obs) | **2.86 (66)** | **2.92 (63)** | **2.62 (114)** | **2.80** |
+
+#### 8.4 What this establishes
+
+* **Perception memory beats exact-in-range truth.** `ObsGreedy` beats
+  `GreedyPursuer` on *every* column and finishes episodes ~30% faster.
+  The mechanism is in `GreedyPursuer`'s own code: with nothing in sensor
+  range it returns a zero action and sits still, while `ObsGreedy` still
+  gets a heading from a belief-map peak or a coasting track. This is a
+  result **for** the perception stack — the memory it carries is worth
+  more than the position error it adds.
+* **The observation is not the bottleneck.** 2.80/3 is extractable from
+  it by a rule with no learning, no velocity, no teammates and no
+  recurrence. Neither the belief map nor the tracker is what limits the
+  trained policy.
+* **The policy is.** It sits at 1.27/3 — **25% of the way from random
+  (0.75) to `ObsGreedy` (2.80)** — on an input from which a five-line
+  rule extracts 2.80. Against the evader it is barely above chance:
+  **0.26 against random's 0.12**, where `ObsGreedy` gets 2.62. Episode
+  length says the same thing: `ObsGreedy` closes passive reds in 63–66
+  steps, the policy burns 185–200 and times out.
+* **So §7's belief-vs-tracker comparison is premature.** It measures
+  which of two policies, both far below what their own inputs allow, is
+  marginally less bad. The tie there stands as a fact; it should not be
+  reported as a finding about the two representations until a policy
+  exists that approaches what either observation supports.
+
+#### 8.5 What it unlocks
+
+`ObsGreedy` is an **expert that consumes the policy's own observation
+space**, which is exactly the precondition for behaviour cloning: its
+actions can be generated for any state the policy visits, with no
+privileged information to strip out. Pre-training the actor to imitate it
+and then fine-tuning with PPO is the standard treatment for this
+symptom — an agent that fails to learn a behaviour expressible in a few
+lines — and it was not available before this baseline existed.
+
+It also replaces `GreedyPursuer` as the honest acceptance bar. The
+repo-wide criterion of "1.2 × GreedyPursuer" was calibrated against an
+oracle-in-range opponent and is the wrong target under §4b perception.
