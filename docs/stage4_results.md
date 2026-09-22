@@ -796,3 +796,102 @@ and pays for it in captures. Removing it (`bv3_warm_noaux`) restores the
   the persistent volume so a container recreate skips finished work, and
   watch for shutdown via log inactivity read from the API rather than a
   marker line in the container log (a recreate wipes that log).
+
+---
+
+### 7. Belief map vs tracker observation — first head-to-head (MEASURED, 2026-09-22) · `feature/target-tracking`
+
+Both arms identical except `--actor-obs`: arena 130, 5 blue / 3 red, no
+obstacles, `max_steps 200`, `n_envs 64 / rollout_steps 200 / mb 512 /
+n_epochs 10`, cold, seed 0, 600 rollouts, eval every 25. The tracker arm
+runs **constant velocity** (no `--red-motion-ckpt`).
+
+#### 7.1 Headline: a tie
+
+Mean of the **last eight** deterministic evals (rollouts 425–600), which
+is the robust comparison — single points swing ±0.25 in both arms:
+
+| | belief map | tracker (CV) |
+|---|---|---|
+| **mean / 3** | **1.144** | **1.155** |
+| `stat` | 1.61 | 1.56 |
+| `rand` | 1.63 | 1.67 |
+| `run` | 0.19 | 0.24 |
+
+A 0.011 difference against within-arm swings of ±0.15 is a tie. The
+`run` column favours the tracker but not meaningfully: its eight values
+range 0.05–0.45 and the belief's 0.00–0.25, so 0.24 vs 0.19 is noise.
+(The final eval alone reads `run` 0.40 vs 0.10 — a 4x gap that does
+**not** survive averaging. Do not quote it.)
+
+#### 7.2 The real finding: the two learning curves have different shapes
+
+Splitting both 24-eval series into thirds:
+
+| rollouts | belief map | tracker (CV) |
+|---|---|---|
+| 25–200 | **1.146** | 0.869 |
+| 225–400 | **1.221** | 0.986 |
+| 425–600 | 1.144 | **1.155** |
+
+The belief map is **at its ceiling by rollout 25** and flat for the
+remaining 575 — no trend across 24 evals, with a `lr` that traverses the
+whole 1e-4 → 1e-5 range along the way. The tracker climbs monotonically
+across all three thirds and is **still climbing at 600**: its last four
+are 1.15, 1.20, 1.13, 1.28, with `kl` down at 0.011–0.014 against a
+`target_kl` of 0.03 and `eps=10`, i.e. no longer limited by the trust
+region but by the decayed `lr`. It did not converge; it ran out of
+budget.
+
+So the tracker observation **matches the belief map while giving up the
+five privileged-information leaks** listed in
+`docs/tracker_observation.md` (true red count, memory slots, slot
+identity, true obstacle radius, obstacle count), with no coverage
+information at all, and without having converged.
+
+#### 7.3 The tracker itself is healthy — the deficit was never perception
+
+Throughout training: `nees` 3.8–5.5 around its 4.0 target (so the
+uncertainty the actor receives is honest, not inflated), `nis` 1.1–1.3
+(mildly conservative innovation covariance), and `trk` 2.2–5.0 m against
+the belief map's 25–50 m. The shown tracks are metre-accurate and
+well-calibrated even as the policy changes the geometry the filter sees.
+Whatever limits this task, it is not track quality.
+
+Note `trk` is **not comparable across arms**: belief measures the
+distance from each extracted peak to the nearest red, tracker measures
+only confirmed tracks under the σ cut-off.
+
+#### 7.4 Caveats to state whenever this is reported
+
+* **Only the red half of the tracker path is exercised.** With
+  `n_obstacles 0` the obstacle tracker is inert, so this says nothing
+  about the obstacle-estimation half.
+* **The tracker path has no coverage information.** The belief map does
+  double duty — with `enemy_belief_decay 0.9935` and
+  `enemy_belief_diffusion 0.2`, unobserved cells drift back toward the
+  prior, which *is* a where-have-I-looked signal. The tracker arm gets K
+  discrete confirmed tracks and nothing else. Region / staleness nodes
+  (docs/search_design.md) are the missing half, and this run is the first
+  evidence for them rather than an argument from first principles.
+* **K slots and the σ cut-off were calibrated elsewhere** (L=200, 7 blue /
+  4 red / 9 obstacles). At this geometry 8 slots comfortably exceed
+  2 × n_red and the 40 m cut-off is still the sensor radius, but that is
+  an assumption, not a measurement.
+* **The two arms carry different false-alarm models**, not none vs some:
+  the tracker path has `clutter_rate 0.2` false plots, the belief map has
+  per-cell `p_FP 0.15`. Neither is privileged; they are not identical.
+
+#### 7.5 Next
+
+The tracker at **1000 rollouts**, same everything else. The belief arm is
+deliberately **not** re-run at 1000: it reached ~1.15 at rollout 25 with
+`lr` barely decayed and never exceeded its 1.221 third-mean across the
+full `lr` range, so extra budget is measured — not assumed — to do
+nothing for it. If the tracker at 1000 lands clearly above ~1.3, a
+matching 1000-rollout belief run becomes worth its 1.6 h to close the
+compute-parity objection; if it ties again, it is not.
+
+Note that `--n-rollouts 1000` is **not** "600 and then more": the `lr`
+decays linearly over the budget, so a 1000-rollout run holds a higher
+`lr` for longer and is a different recipe.
