@@ -244,12 +244,17 @@ class TrainedStage4BlueAgent(HeuristicBlueAgent):
                     mean, self._hidden = self.policy.act_deterministic(
                         partial_obs, self._hidden)
                 else:
-                    # (action, log_prob, entropy, value, new_hidden,
-                    #  actor_h_blue, critic_h_blue) -- the CTDE critic path
-                    # is unused here, so the actor obs stands in for it.
-                    out = self.policy.get_action_and_value(
-                        partial_obs, partial_obs, self._hidden)
-                    mean, self._hidden = out[0], out[4]
+                    # Sample from the actor's Gaussian.  NOT via
+                    # get_action_and_value: that also runs critic_forward on
+                    # the CTDE full state, and passing partial_obs in its
+                    # place fed the critic's red_input_mlp tensors of the
+                    # wrong width (the actor's red features and the critic's
+                    # true_* ones differ), so this branch raised a Linear
+                    # shape error the moment it was first exercised.  The
+                    # value head is not needed to act.
+                    mean, log_std, self._hidden, _ = self.policy.actor_forward(
+                        partial_obs, self._hidden)
+                    mean = mean + log_std.exp() * torch.randn_like(mean)
             self._actions  = mean.squeeze(0).cpu().numpy().astype(np.float32)
             self._cached_t = t
         idx = env.possible_agents.index(agent)
