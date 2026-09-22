@@ -716,7 +716,75 @@ regression). §4b left escape hatches, so it isolates in one run:
 --sensor-noise-range-growth 0.0 --sensor-vel-noise-std 0.0` at arena 130
 reproduces `belief_v3`'s perception exactly, warm start aside.
 
-#### 6.5 Two traps worth not repeating
+#### 6.5 The honest baseline: 1.2/3, and why 3.00/3 is not the target
+
+`bv3_repro` and a warm-started replicate both plateau at the same place,
+so this is a reproducible ceiling rather than one noisy number:
+
+| run | what | result |
+|---|---|---|
+| `bv3_repro` | cold, 600 rollouts | **1.17/3** (`stat 1.65 / rand 1.75 / run 0.10` at rollout 600) |
+| `bv3_warm_noaux` | warm-started from `bv3_repro/best.pt` | **1.19/3** (7 evals to rollout 175) |
+
+`bv3_repro` reaches ~1.2 by **rollout 50** and then oscillates 0.92–1.45
+for the remaining 550 rollouts with no trend; the mean over evals 50–200
+(1.18) and over evals 425–600 (1.14) is the same number. Entropy falls
+from 2.84 to −0.67 (σ 1.0 → 0.17) across that stretch and changes
+nothing, so the ceiling is not set by exploration breadth. The warm
+replicate sits at the same 1.2 with σ ≈ 0.21 throughout — same ceiling
+from opposite ends of the exploration range.
+
+**Exact configuration of the baseline** (`bv3_repro`):
+
+```
+--arena-size 130 --n-blue 5 --n-red 3 --n-obstacles 0
+--belief-grid-size 26 --max-steps 200 --sensor-radius 40 (default)
+--red-policy-mix stationary:1,random:1,run:1
+--n-envs 64 --rollout-steps 200 --mb-size 512 --n-epochs 10
+--n-rollouts 600 --eval-interval 25 --best-ckpt-metric det_caught --seed 0
+lr 1e-4 (linear decay), ent_coef 0.008, aux_hidden_coef 0.0,
+cold start (no warm_start_critic, no warm_start_full),
+§4b live-track sensor model ON (occlusion, p_TP draw, conf and accuracy
+falling with range), actor_obs = belief.
+```
+
+**Why `belief_v3`'s 3.00/3 is not a recoverable target.** Three things
+changed since it was recorded (2026-07-21), and two of them are
+deliberate realism improvements nobody wants to undo:
+
+1. **The evader stopped cornering itself.** `f9bc512` (2026-07-31) added
+   wall repulsion to `run_from_nearest_uav`: before it, a fleeing red ran
+   into the arena wall, had its perpendicular velocity clipped and slid
+   along the boundary, pinning itself — and the commit message records
+   that blue "learned a degenerate wall-trapping counter", with red time
+   within 8 m of a wall measured at 0.63 before and 0.42 after. That is
+   exactly the `run` third of the eval, which sits at ~0.18 in every run
+   above while `stat` and `rand` sit near 1.7.
+2. **Live tracks stopped being near-oracle in range** (§4b).
+3. The arena grew 130 → 200 — measured as the *smallest* of the three:
+   returning to 130 bought only +0.15/3 (1.02 → 1.17).
+
+**So the number the tracker observation has to beat is 1.2/3 under these
+conditions**, not 3.00/3. Two caveats to state whenever that comparison
+is reported: with `n_obstacles 0` only the RED half of the tracker path
+is exercised (the obstacle tracker is inert), and the tracker path's K
+slots and σ cut-off were calibrated at L=200 with 7 blues / 4 reds /
+9 obstacles, so their adequacy at this geometry is an assumption rather
+than a measurement.
+
+**`aux_hidden_coef 0.2` is harmful here, against what the config assumed.**
+`stage4_default.py` says aux 0.2 is safe once the critic is "MEANINGFUL"
+— converged, same architecture, same distribution. `bv3_warm` met all
+three conditions (warm-started full from `bv3_repro/best.pt`, 61 tensors
+copied, identical task) and degraded **monotonically from 1.29 to 1.01
+over 95 rollouts** while the `aux` term itself fell from 8.05 to 1.44.
+At rollout 5 the aux term contributes ~1.6 to the loss against a policy
+loss of ~0.02, and `kl` overshoots `target_kl` in the first epoch every
+rollout (`eps=1`). The actor learns to imitate the critic's hidden state
+and pays for it in captures. Removing it (`bv3_warm_noaux`) restores the
+1.2 plateau.
+
+#### 6.6 Two traps worth not repeating
 
 - **`best_ckpt_metric`.** The default `mean_return` mis-selects on any
   crash-penalty run (§3 already records this); these runs used
