@@ -36,7 +36,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from isr.agents.heuristics import (
-    GreedyPursuer, HeuristicBlueAgent, RandomAgent,
+    GreedyPursuer, HeuristicBlueAgent, ObservationGreedyPursuer, RandomAgent,
     run_from_nearest_uav, stationary_red, random_red,
 )
 from isr.agents.policy_loader import (
@@ -286,7 +286,13 @@ def main() -> None:
     # ---- Eval matrix ----------------------------------------------------
     blue_factories = {
         "Random":  lambda: RandomAgent(seed=0),
+        # Greedy reads TRUE red positions gated only by range, so it enjoys
+        # the near-oracle in-range regime §4b removed from the policy's
+        # inputs: it is an upper bound, not a fair bar.  ObsGreedy runs the
+        # same rule on the observation the POLICY is given, which is the
+        # comparison that isolates policy quality from the information gap.
         "Greedy":  lambda: GreedyPursuer(),
+        "ObsGreedy": lambda: ObservationGreedyPursuer(),
         # ``build_trained_agent`` picks the right adapter (Stage 1/2
         # adapter) from the loaded policy's class.
         "Trained": lambda: build_trained_agent(

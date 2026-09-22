@@ -136,6 +136,94 @@ class GreedyPursuer(HeuristicBlueAgent):
         return (d_vec / norm).astype(np.float32)
 
 
+class ObservationGreedyPursuer(HeuristicBlueAgent):
+    """``GreedyPursuer``'s rule, run on the ACTOR's observation.
+
+    ``GreedyPursuer`` reads ``env.state_snapshot()`` — TRUE red positions,
+    gated only by range.  It therefore never misses a detection, never sees
+    a false one, and its positions carry no error: exactly the near-oracle
+    in-range regime §4b removed from the policy's inputs.  Comparing a
+    trained policy against it mixes policy quality with an information gap.
+
+    This variant chases the same targets the POLICY is shown — the actor's
+    red nodes, with their detection misses, position error and clutter —
+    so it answers "what does a trivial pursuit rule achieve on THIS
+    observation?".  Two uses: a fair bar for the trained policy, and a
+    learning-free measure of observation quality (run it under
+    ``actor_obs='belief'`` and ``'tracker'`` to compare the two
+    representations without a policy in the way).
+
+    Rule: among this blue's red-slot edges with a non-zero visibility
+    mask, steer at the nearest one; hold position if there are none
+    (matching ``GreedyPursuer`` when nothing is in range).
+
+    Memory is the fallback, not an equal: the mask IS the track confidence
+    (1.0 for a live track, the belief peak's confidence for a memory one,
+    0 for padding), so the rule takes the most confident slots on offer and
+    picks the nearest of THOSE.  A live target therefore always outranks a
+    remembered one, and memory is used exactly when nothing is live.
+
+    Ranking by distance alone was tried first and is wrong: a low-confidence
+    belief peak sitting closer than a live track would win, so the baseline
+    chased ghosts.  In tracker mode the mask is binary for every confirmed
+    track (coasting included), so this degenerates to "nearest confirmed
+    track" — correct, because the tracker exposes no live/memory split and
+    neither does the policy's observation.
+    """
+
+    def __init__(self) -> None:
+        self._env = None
+        self._t   = None
+        self._obs = None
+
+    def reset(self) -> None:
+        self._env = None
+        self._t   = None
+        self._obs = None
+
+    def act(self, obs, env, agent):
+        # One observation per (env, timestep).  structured_belief_observation
+        # UPDATES the belief map as it builds it, so calling it once per blue
+        # would advance the belief N_blue times per step.
+        t = int(env._t)
+        if self._obs is None or env is not self._env or t != self._t:
+            self._obs = env.structured_belief_observation()
+            self._env = env
+            self._t   = t
+
+        feats = self._obs["rb_edge_features"]    # (n_rb, 7)
+        vis   = self._obs["rb_edge_visible"]     # (n_rb,)
+        my_idx = env.possible_agents.index(agent)
+
+        # NOT env.rb_edge_dst: those index the n_red TRUE reds, while the
+        # actor's enemy graph has K track SLOTS (K != n_red in general --
+        # tracker mode pads to --tracker-red-slots).  The documented edge
+        # ordering is "for s in K, for b in N_blue", so edge e lands on
+        # blue e % n_blue.
+        vis = np.asarray(vis)
+        n_blue = int(env.n_blue)
+        assert vis.shape[0] % n_blue == 0, (vis.shape, n_blue)
+        dst  = np.arange(vis.shape[0]) % n_blue
+        mine = np.nonzero((dst == my_idx) & (vis > 0.0))[0]
+        if mine.size == 0:
+            return np.zeros(2, dtype=np.float32)
+
+        # Live before remembered: keep only the most confident slots this
+        # blue has, then take the nearest of those.
+        best_conf = float(vis[mine].max())
+        mine = mine[vis[mine] >= best_conf - 1e-6]
+
+        # Layout is [rel_pos (2), rel_vel (2), range (1), bearing (2)] with
+        # rel_pos = dst - src.  These edges run red -> blue, so rel_pos is
+        # (blue - red) and the heading toward the target is its negation.
+        best    = int(mine[int(np.argmin(feats[mine, 4]))])
+        toward  = -feats[best, 0:2]
+        norm    = float(np.linalg.norm(toward))
+        if norm < 1e-8:
+            return np.zeros(2, dtype=np.float32)
+        return (toward / norm).astype(np.float32)
+
+
 # ===========================================================================
 #  Red policies — (blue_pos, red_pos, red_active) -> (N_red, 2)
 # ===========================================================================
