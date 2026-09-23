@@ -942,7 +942,10 @@ over a real red 30 m away.
 
 #### 8.3 Results (50 episodes per cell, matched seeds)
 
-Trained row = the tracker-CV arm's checkpoint.
+Trained row = `bv3_tracker_cv_1k`, the 1000-rollout tracker-CV arm
+(§7.5). The whole table therefore runs in **tracker** mode: `ObsGreedy`
+here is reading the tracker's confirmed tracks, not the belief map. The
+belief-mode counterpart is §9.
 
 | Blue | Stationary | Random | RunFromNearest | **mean /3** |
 |---|---|---|---|---|
@@ -989,3 +992,130 @@ lines — and it was not available before this baseline existed.
 It also replaces `GreedyPursuer` as the honest acceptance bar. The
 repo-wide criterion of "1.2 × GreedyPursuer" was calibrated against an
 oracle-in-range opponent and is the wrong target under §4b perception.
+
+---
+
+### 9. Belief map vs tracker, with the policy removed (MEASURED, 2026-09-23) · `feature/target-tracking`
+
+§7 compared the two observations through two trained policies; §8 then
+showed both policies sit at ~25% of what their own input supports. A
+comparison of representations read off two policies that far below their
+ceiling measures the policies, not the representations.
+
+`ObsGreedy` consumes the actor's enemy graph and nothing else, so running
+it under both `--actor-obs` values asks the question directly: **how much
+pursuit is extractable from each observation, with no learning
+involved?** Same env, same seeds, 50 episodes per cell:
+
+```
+python scripts/compare_observation_quality.py --n-episodes 50
+```
+
+#### 9.1 The control, and a metric bug it exposed
+
+`Random` and `Greedy` read no actor observation — `Greedy` reads
+`state_snapshot()`, `Random` reads nothing — so their rows must be
+identical in both modes. They are, **to every digit** (mean of the three
+reds: 0.713 and 2.647 in both). Any ObsGreedy difference is therefore the
+observation and not the env.
+
+Getting that clean took a fix. `evaluate_trained.eval_matrix` takes red
+*policies*, not factories, so `random_red(seed=0)`'s closure holds one RNG
+stream shared across every episode **and every blue row**: its draws
+depend on how many steps the preceding rows consumed, and episode length
+is exactly what this table measures. It showed up as the only column
+failing the control — `Stationary` and `RunFromNearest` reproduced
+digit-for-digit across two independent sweeps while `Random` did not.
+`compare_observation_quality.py` rebuilds the red policy per episode from
+the episode seed. **The `Random` column of §8.3 was produced under the
+old shared-stream behaviour**; its cross-row comparisons carry that
+caveat, the other two columns do not.
+
+#### 9.2 Results — the belief map wins by 0.13/3
+
+Mean reds caught of 3, 50 matched-seed episodes per cell:
+
+| Blue | Stationary | Random | RunFromNearest | **mean /3** |
+|---|---|---|---|---|
+| Random *(control)* | 0.94 | 1.08 | 0.12 | **0.713** in both modes |
+| Greedy *(control)* | 2.60 | 2.84 | 2.50 | **2.647** in both modes |
+| ObsGreedy — **belief** | **3.00** (68.6 steps) | **3.00** (64.6) | **2.74** (125.2) | **2.913** |
+| ObsGreedy — **tracker** | 2.86 (65.5) | 2.86 (68.5) | 2.62 (114.2) | **2.780** |
+
+The belief map wins every column by 0.12–0.14. Consistent in sign and
+size across three different reds at n=50 matched seeds, so unlike §7's
+0.011 this is a difference rather than noise.
+
+#### 9.3 The mechanism: the tracker is sharper but goes blind
+
+The means hide two opposite effects. Taking the `Stationary` column
+per-episode:
+
+| | clean sweeps (3/3) | steps on those | failures |
+|---|---|---|---|
+| belief | **50 / 50** | 68.6 | — |
+| tracker | 43 / 50 | **43.6** | 7 episodes, all 2/3 at the 200-step cap |
+
+The tracker is **36% faster when it works** — its confirmed tracks are
+metre-accurate (§7.3: `trk` 2.2–5.0 m against the belief map's 25–50 m),
+so pursuit is direct instead of drifting toward a smeared peak. It then
+loses 7 episodes outright, never acquiring the third red at all.
+
+Why: counting the agent-steps where `ObsGreedy` returns the zero action
+because no slot is visible,
+
+| | idle agent-steps, all episodes | idle in the timed-out episodes |
+|---|---|---|
+| belief | **0.0%** | — |
+| tracker | **49.9%** | **85.7%** |
+
+In belief mode a blue is *never* without something to chase: decayed
+memory peaks and p_FP artefacts always offer a heading, which makes idle
+blues wander and incidentally sweep the arena. In tracker mode a blue
+with no confirmed track has nothing, holds position, and stops
+contributing — half the time overall, and almost always in the episodes
+that fail.
+
+#### 9.4 What this establishes
+
+* **The belief map's advantage is coverage, not accuracy.** On accuracy
+  the tracker wins outright (43.6 vs 68.6 steps). It loses on never
+  having a reason to move.
+* **This *is* the evidence §7.4 said the tie did not provide.** That
+  caveat stands as written — the §7 tie attributes nothing, because both
+  policies were far below their inputs. Removing the policy changes that:
+  the tracker arm's measured failure mode is precisely a missing
+  where-should-I-look signal, which is what region / staleness nodes
+  supply (`docs/search_design.md`).
+* **The §7 tie now has an explanation.** Two observations that differ by
+  0.13/3 for a greedy rule produced policies differing by 0.011 — further
+  evidence that at 1.15/3 neither policy is limited by its input.
+* **Scope.** `n_obstacles 0`, so only the red half of the tracker path is
+  exercised; and `ObsGreedy` ignores velocity, bearing and teammates, so
+  this measures what the *enemy graph* supports for a memoryless
+  single-target rule, not what a coordinating policy could extract.
+
+#### 9.5 Staleness is implemented at both ends and wired at neither
+
+Worth recording exactly, because "add region nodes" sounds like a feature
+and is three edits:
+
+| piece | where | state |
+|---|---|---|
+| `_staleness` field, steps since each cell was observed | `pursuit_env.py:2200`, flag `use_staleness` (default `False`) | implemented |
+| `R×R` region nodes `[staleness, searchable]` + weighted region→blue edges | `pursuit_env.py:2247`, `:2302` | implemented |
+| coverage path in the encoder (`n_region`, `region_feat_dim=2`, gb messages) | `gnn_stage4_policy.py:202` | implemented |
+| tests | `test_staleness.py`, `test_region_nodes.py`, `test_region_graph.py` | 60 passing |
+
+Not connected: `structured_belief_observation()` emits no
+`region_feats` / `gb_edge_feats` / `gb_weight`; `GNNStage4Policy` builds
+both encoders without `n_region` (`:412`, `:432`); `train_stage4.py` has
+no flag. The only callers of `_build_region_graph` in the repo are tests.
+**No training run has ever seen a region node** — so §7.4's asymmetry is
+not a gap in the design, it is an unconnected wire.
+
+This also means the comparison above is clean: neither mode had region
+nodes, and `ObsGreedy` would not read them anyway, so §9.2 is a
+comparison of the **enemy graph alone**. The coverage difference it
+measures is the one living *inside* that graph — `enemy_belief_decay
+0.9935` giving memory peaks the tracker has no equivalent for.
