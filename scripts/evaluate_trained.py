@@ -90,7 +90,7 @@ def run_episode(
 
 def eval_matrix(
     blue_factories: Dict[str, Callable],   # name -> ()->HeuristicBlueAgent
-    red_factories:  Dict[str, Callable],   # name -> red_policy callable
+    red_factories:  Dict[str, Callable],   # name -> (seed)->red_policy
     env_kwargs:     Dict,
     n_episodes:     int,
     seed_base:      int = 50_000,
@@ -98,11 +98,26 @@ def eval_matrix(
     """
     Returns nested dict: results[blue_name][red_name] = {mean_return,
     std_return, mean_caught}.
+
+    ``red_factories`` maps a name to ``(seed) -> policy``, NOT to a policy.
+    It used to take policies, and ``random_red(seed=0)``'s closure then
+    held ONE RNG stream shared across every episode and every blue row: its
+    draws depended on how many steps the preceding rows had consumed, and
+    episode length is exactly what this matrix measures.  So the `Random`
+    column was not matched-seed across rows — two blue policies of
+    different speed faced different reds, and re-ordering the rows changed
+    the numbers.  Rebuilding the red from the episode seed makes every cell
+    of every table see identical opposition.
+
+    (Measured while writing `docs/stage4_results.md §9`: under the old
+    behaviour the `Stationary` and `RunFromNearest` columns reproduced
+    digit-for-digit across two independent sweeps and `Random` did not.
+    §9.1 records which published numbers were affected.)
     """
     results: Dict[str, Dict[str, Dict[str, float]]] = {}
     for b_name, b_factory in blue_factories.items():
         results[b_name] = {}
-        for r_name, r_policy in red_factories.items():
+        for r_name, r_factory in red_factories.items():
             returns: List[float] = []
             caughts: List[int]   = []
             steps:   List[int]   = []
@@ -110,7 +125,8 @@ def eval_matrix(
                 blue = b_factory()
                 # Same seed across blue policies => directly comparable
                 seed = seed_base + ep
-                r, c, n, _ = run_episode(blue, r_policy, env_kwargs, seed)
+                r, c, n, _ = run_episode(blue, r_factory(seed),
+                                         env_kwargs, seed)
                 returns.append(r)
                 caughts.append(c)
                 steps.append(n)
@@ -298,10 +314,12 @@ def main() -> None:
         "Trained": lambda: build_trained_agent(
             policy, device, deterministic=not args.stochastic),
     }
+    # seed -> policy: the red opposition must depend only on the episode
+    # seed, never on what the rows above it did.  See eval_matrix.
     red_factories = {
-        "Stationary":     stationary_red,
-        "Random":         random_red(seed=0),
-        "RunFromNearest": run_from_nearest_uav,
+        "Stationary":     lambda seed: stationary_red,
+        "Random":         lambda seed: random_red(seed=seed),
+        "RunFromNearest": lambda seed: run_from_nearest_uav,
     }
 
     print(f"\nEvaluating ({args.n_episodes} episodes per cell, matched seeds)...")
@@ -341,11 +359,12 @@ def main() -> None:
     gif_paths: Dict[str, Path] = {}
 
     print(f"\nRendering GIFs to {gif_dir}/ ...")
-    for r_name, r_policy in red_factories.items():
+    for r_name, r_factory in red_factories.items():
         # Trained blue vs this red — factory picks the right adapter.
         blue = build_trained_agent(policy, device, deterministic=True)
-        _, _, _, snaps = run_episode(blue, r_policy, env_kwargs,
-                                  seed=args.gif_seed, collect_snaps=True)
+        _, _, _, snaps = run_episode(blue, r_factory(args.gif_seed),
+                                     env_kwargs,
+                                     seed=args.gif_seed, collect_snaps=True)
         path = gif_dir / f"trained_vs_{r_name.lower()}.gif"
         animate_episode(snaps, env_kwargs["arena_size"],
                         save_path=str(path), fps=args.fps)

@@ -888,15 +888,36 @@ only confirmed tracks under the σ cut-off.
   the tracker path has `clutter_rate 0.2` false plots, the belief map has
   per-cell `p_FP 0.15`. Neither is privileged; they are not identical.
 
-#### 7.5 Next
+#### 7.5 The tracker at 1000 rollouts: it plateaus (MEASURED, 2026-09-23)
 
-The tracker at **1000 rollouts**, same everything else. The belief arm is
-deliberately **not** re-run at 1000: it reached ~1.15 at rollout 25 with
-`lr` barely decayed and never exceeded its 1.221 third-mean across the
-full `lr` range, so extra budget is measured — not assumed — to do
-nothing for it. If the tracker at 1000 lands clearly above ~1.3, a
-matching 1000-rollout belief run becomes worth its 1.6 h to close the
-compute-parity objection; if it ties again, it is not.
+The plan here was: run the tracker to 1000, and *if it lands clearly
+above ~1.3, a matching 1000-rollout belief run becomes worth its 1.6 h to
+close the compute-parity objection; if it ties again, it is not.* The
+belief arm was deliberately not re-run, since it reached ~1.15 by rollout
+25 and never exceeded its 1.221 third-mean across the full `lr` range.
+
+`bv3_tracker_cv_1k`, 40 deterministic evals:
+
+| rollouts | mean /3 | `stat` | `rand` | `run` |
+|---|---|---|---|---|
+| 25–325 | 1.058 | 1.41 | 1.51 | 0.26 |
+| 350–650 | 1.172 | 1.60 | 1.68 | 0.23 |
+| 675–1000 | 1.226 | 1.67 | 1.73 | 0.28 |
+| **last 8 (825–1000)** | **1.223** | 1.69 | 1.72 | 0.26 |
+
+**1.223, not "clearly above 1.3". So the matching belief run is not
+worth running** — the condition was written in advance and it was not
+met. Best single eval was 1.33 at rollout 700 and did not hold.
+
+Two corrections this forces on §7.2:
+
+* **"Still climbing at 600" was noise.** The thirds gain +0.114 then
+  +0.054, and the last eight equal the final third to 0.003. It is
+  flat by ~700. The run's own `best.pt` (by `det_caught`) is from
+  **rollout 325**, not 1000.
+* **The `run` column is flat across all three thirds** (0.26 / 0.23 /
+  0.28). 975 rollouts bought *nothing* against the evader — which is
+  §8's finding arriving from a second direction.
 
 Note that `--n-rollouts 1000` is **not** "600 and then more": the `lr`
 decays linearly over the budget, so a 1000-rollout run holds a higher
@@ -911,8 +932,8 @@ decays linearly over the budget, so a 1000-rollout run holds a higher
 `GreedyPursuer` reads `env.state_snapshot()`: **true** red positions,
 gated only by range. It never misses a detection, never sees a false one,
 and its positions carry no error — precisely the near-oracle in-range
-regime §4b removed from the policy's inputs. Reading "greedy 2.63 vs
-trained 1.27" as *a trivial baseline beats us* is therefore wrong: the
+regime §4b removed from the policy's inputs. Reading "greedy 2.65 vs
+trained 1.28" as *a trivial baseline beats us* is therefore wrong: the
 comparison mixes policy quality with an information gap we created on
 purpose.
 
@@ -944,37 +965,58 @@ over a real red 30 m away.
 
 #### 8.3 Results (50 episodes per cell, matched seeds)
 
-Trained row = `bv3_tracker_cv_1k`, the 1000-rollout tracker-CV arm
-(§7.5). The whole table therefore runs in **tracker** mode: `ObsGreedy`
-here is reading the tracker's confirmed tracks, not the belief map. The
-belief-mode counterpart is §9.
+Both trained rows are `bv3_tracker_cv_1k` (§7.5), so the whole table runs
+in **tracker** mode: `ObsGreedy` here reads the tracker's confirmed
+tracks, not the belief map. The belief-mode counterpart is §9.
+
+Re-measured 2026-09-23 with the seeding fix of §9.1 and the checkpoints
+pulled off the pod, which is also what settled *which* checkpoint — the
+run's `best.pt` is from **rollout 325**, a third of the way in, not the
+1000-rollout endpoint. Both are shown, since the gap between them is
+itself the point.
 
 | Blue | Stationary | Random | RunFromNearest | **mean /3** |
 |---|---|---|---|---|
-| Random | 0.94 (198 steps) | 1.20 (199) | 0.12 (200) | **0.75** |
-| Trained | 1.72 (185) | 1.84 (186) | **0.26** (200) | **1.27** |
-| Greedy (true-in-range) | 2.60 (94) | 2.80 (76) | 2.50 (121) | **2.63** |
-| **ObsGreedy** (same obs) | **2.86 (66)** | **2.92 (63)** | **2.62 (114)** | **2.80** |
+| Random | 0.94 (198 steps) | 1.08 (195) | 0.12 (200) | **0.713** |
+| Trained — `best.pt` @ **325** | 1.76 (187) | 1.86 (183) | 0.22 (200) | **1.280** |
+| Trained — `final.pt` @ 1000 | 1.70 (190) | 1.78 (182) | 0.30 (200) | **1.260** |
+| Greedy (true-in-range) | 2.60 (94) | 2.84 (75) | 2.50 (121) | **2.647** |
+| **ObsGreedy** (same obs) | **2.86 (66)** | **2.86 (69)** | **2.62 (114)** | **2.780** |
+
+675 extra rollouts are worth **−0.02**, which is §7.5's plateau seen from
+the evaluation side.
+
+**On the superseded row.** The version first published here read
+`1.72 / 1.84 / 0.26 = 1.27` and reproduces *neither* checkpoint — it sits
+between them in all three columns. `Stationary` and `RunFromNearest` face
+deterministic reds, so §9.1's seeding bug cannot account for it; it must
+have come from a third checkpoint. Its provenance is not recoverable:
+the pod's own `eval_results.json` was overwritten by the re-measurement
+(the script always writes that filename next to the checkpoint), so the
+row is replaced rather than explained. The copy on the pod's volume
+survives if it is ever worth recovering.
 
 #### 8.4 What this establishes
 
 * **Perception memory beats exact-in-range truth.** `ObsGreedy` beats
-  `GreedyPursuer` on *every* column and finishes episodes ~30% faster.
-  The mechanism is in `GreedyPursuer`'s own code: with nothing in sensor
+  `GreedyPursuer` on every column and finishes episodes ~30% faster. The
+  mechanism is in `GreedyPursuer`'s own code: with nothing in sensor
   range it returns a zero action and sits still, while `ObsGreedy` still
   gets a heading from a belief-map peak or a coasting track. This is a
   result **for** the perception stack — the memory it carries is worth
-  more than the position error it adds.
-* **The observation is not the bottleneck.** 2.80/3 is extractable from
+  more than the position error it adds. State the margin honestly,
+  though: it is +0.26 on `Stationary` and +0.12 on `RunFromNearest` but
+  only **+0.02 on the random red**, which is a tie on that column.
+* **The observation is not the bottleneck.** 2.78/3 is extractable from
   it by a rule with no learning, no velocity, no teammates and no
   recurrence. Neither the belief map nor the tracker is what limits the
   trained policy.
-* **The policy is.** It sits at 1.27/3 — **25% of the way from random
-  (0.75) to `ObsGreedy` (2.80)** — on an input from which a five-line
-  rule extracts 2.80. Against the evader it is barely above chance:
-  **0.26 against random's 0.12**, where `ObsGreedy` gets 2.62. Episode
-  length says the same thing: `ObsGreedy` closes passive reds in 63–66
-  steps, the policy burns 185–200 and times out.
+* **The policy is.** Its best checkpoint sits at 1.280/3 — **27% of the
+  way from random (0.713) to `ObsGreedy` (2.780)** — on an input from
+  which a five-line rule extracts 2.78. Against the evader it is barely
+  above chance: **0.22–0.30 against random's 0.12**, where `ObsGreedy`
+  gets 2.62. Episode length says the same thing: `ObsGreedy` closes
+  passive reds in 66–69 steps, the policy burns 182–200 and times out.
 * **So §7's belief-vs-tracker comparison is premature.** It measures
   which of two policies, both far below what their own inputs allow, is
   marginally less bad. The tie there stands as a fact; it should not be
@@ -1000,7 +1042,7 @@ oracle-in-range opponent and is the wrong target under §4b perception.
 ### 9. Belief map vs tracker, with the policy removed (MEASURED, 2026-09-23) · `feature/target-tracking`
 
 §7 compared the two observations through two trained policies; §8 then
-showed both policies sit at ~25% of what their own input supports. A
+showed both policies sit at ~27% of what their own input supports. A
 comparison of representations read off two policies that far below their
 ceiling measures the policies, not the representations.
 
@@ -1021,17 +1063,25 @@ identical in both modes. They are, **to every digit** (mean of the three
 reds: 0.713 and 2.647 in both). Any ObsGreedy difference is therefore the
 observation and not the env.
 
-Getting that clean took a fix. `evaluate_trained.eval_matrix` takes red
-*policies*, not factories, so `random_red(seed=0)`'s closure holds one RNG
-stream shared across every episode **and every blue row**: its draws
-depend on how many steps the preceding rows consumed, and episode length
+Getting that clean took a fix. `evaluate_trained.eval_matrix` used to take
+red *policies*, not factories, so `random_red(seed=0)`'s closure held one
+RNG stream shared across every episode **and every blue row**: its draws
+depended on how many steps the preceding rows consumed, and episode length
 is exactly what this table measures. It showed up as the only column
 failing the control — `Stationary` and `RunFromNearest` reproduced
 digit-for-digit across two independent sweeps while `Random` did not.
-`compare_observation_quality.py` rebuilds the red policy per episode from
-the episode seed. **The `Random` column of §8.3 was produced under the
-old shared-stream behaviour**; its cross-row comparisons carry that
-caveat, the other two columns do not.
+
+`eval_matrix` now takes `(seed) -> policy` and rebuilds the red per
+episode, so every cell of every table faces identical opposition.
+`tests/test_eval_matrix_seeding.py` pins the property that states it
+without jargon: **the matrix must not depend on the order of its blue
+rows**. Under the old code it did — swapping the `Greedy` and `Random`
+rows moved Greedy's own `Random`-column score from 1.50 to 1.25, a 0.25
+swing bought with nothing but row order.
+
+Tables produced before the fix were re-measured rather than annotated:
+§8.3 in full (which is also where the checkpoint ambiguity got settled),
+and the §9.2 table below was already clean.
 
 #### 9.2 Results — the belief map wins by 0.13/3
 

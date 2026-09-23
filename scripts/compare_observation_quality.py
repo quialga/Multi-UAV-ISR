@@ -23,6 +23,11 @@ they do not, the two modes are not the same env and the delta is
 confounded (belief maps carry their own RNG draws, and the tracker path
 adds clutter plots).
 
+That control is what caught the shared red-RNG bug now fixed in
+``evaluate_trained.eval_matrix``: it made the `Random` column depend on
+the episode lengths of the rows above it, so the control failed on that
+one column while passing to the digit on the other two.
+
 Defaults reproduce the §7 head-to-head geometry: arena 130, 5 blue /
 3 red, no obstacles, ``max_steps 200``, §4b sensor model on.  Everything
 else comes from the TRAINER's own argument parser, so a config here is
@@ -42,11 +47,9 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Callable, Dict
+from typing import Dict
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-
-import numpy as np                                               # noqa: E402
 
 import scripts.train_stage4 as train_stage4                      # noqa: E402
 from isr.agents.heuristics import (                              # noqa: E402
@@ -54,7 +57,7 @@ from isr.agents.heuristics import (                              # noqa: E402
     run_from_nearest_uav, stationary_red, random_red,
 )
 from isr.agents.policy_loader import env_kwargs_from_checkpoint  # noqa: E402
-from scripts.evaluate_trained import run_episode, _fmt_cell      # noqa: E402
+from scripts.evaluate_trained import eval_matrix, _fmt_cell      # noqa: E402
 
 # The §7 / §8 geometry.  Kept as one string so it reads as the command a
 # training run was launched with, which is how docs/stage4_results.md
@@ -63,50 +66,6 @@ DEFAULT_TRAIN_ARGS = (
     "--arena-size 130 --n-blue 5 --n-red 3 --n-obstacles 0 "
     "--belief-grid-size 26 --max-steps 200"
 )
-
-
-def eval_matrix(
-    blue_factories: Dict[str, Callable],   # name -> () -> HeuristicBlueAgent
-    red_factories:  Dict[str, Callable],   # name -> (seed) -> red policy
-    env_kwargs:     Dict,
-    n_episodes:     int,
-    seed_base:      int = 50_000,
-) -> Dict[str, Dict[str, Dict[str, float]]]:
-    """``evaluate_trained.eval_matrix`` with the RED policy rebuilt per
-    episode instead of shared.
-
-    That function takes red policies, not factories, so ``random_red``'s
-    closure keeps ONE RNG stream across every episode and every blue row.
-    Its draws therefore depend on how many steps the preceding rows took,
-    and rows with different episode lengths — which is precisely what this
-    comparison measures — see different red noise.  It shows up as the
-    only column that fails the control here: `Stationary` and
-    `RunFromNearest` reproduce to the digit across the two modes while
-    `Random` does not.
-
-    Taking a factory instead makes red noise a function of the episode
-    seed alone, so every cell of every table sees identical reds.
-    """
-    results: Dict[str, Dict[str, Dict[str, float]]] = {}
-    for b_name, b_factory in blue_factories.items():
-        results[b_name] = {}
-        for r_name, r_factory in red_factories.items():
-            returns, caughts, steps = [], [], []
-            for ep in range(n_episodes):
-                seed = seed_base + ep
-                r, c, n, _ = run_episode(b_factory(), r_factory(seed),
-                                         env_kwargs, seed)
-                returns.append(r)
-                caughts.append(c)
-                steps.append(n)
-            results[b_name][r_name] = {
-                "mean_return": float(np.mean(returns)),
-                "std_return":  float(np.std(returns)),
-                "mean_caught": float(np.mean(caughts)),
-                "mean_steps":  float(np.mean(steps)),
-                "std_steps":   float(np.std(steps)),
-            }
-    return results
 
 
 def env_kwargs_for_mode(train_args: str, mode: str) -> Dict:
