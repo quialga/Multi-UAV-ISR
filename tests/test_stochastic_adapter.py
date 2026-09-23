@@ -61,11 +61,12 @@ def test_sampling_branch_runs_without_the_critic():
 def test_sampling_spreads_far_more_than_the_deterministic_path():
     """Isolates the ACTION noise from the observation noise statistically.
 
-    ``structured_belief_observation()`` updates the belief map as it builds
-    it, so repeated calls at the same timestep do not return the same
-    observation and the deterministic action jitters a little.  (Production
-    never sees this: ``act`` caches per ``env._t``, so the observation is
-    built once per step.)  Rather than fight that, compare spreads: the
+    ``structured_belief_observation()`` re-draws the sensor on every call
+    (the p_TP detection dice and the position noise), so repeated calls at
+    the same timestep do not return the same observation and the
+    deterministic action jitters a little.  (Production never sees this:
+    ``act`` caches per ``env._t``, so the observation is built once per
+    step.)  Rather than fight that, compare spreads: the
     sampled actions must scatter by roughly sigma, orders of magnitude
     more than that residual jitter.
     """

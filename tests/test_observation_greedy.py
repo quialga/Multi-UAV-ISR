@@ -134,9 +134,13 @@ def test_uses_memory_when_the_red_is_no_longer_visible():
 
 
 def test_observation_is_built_once_per_timestep():
-    """Calling structured_belief_observation() per blue would advance the
-    belief map N_blue times per step.  One agent instance, two blues, one
-    build."""
+    """structured_belief_observation() re-draws the sensor on every call
+    (p_TP dice, position noise), so building it per blue would give the
+    UAVs different realisations of the same instant where the policy gets
+    one.  One agent instance, two blues, one build.
+
+    (It does not mutate the belief map — _update_belief_maps runs in
+    step().  An earlier version of this docstring said it did.)"""
     env = _env()
     _place(env, [[0.0, 0.0], [10.0, 0.0]], [[20.0, 0.0], [-60.0, -60.0]])
 

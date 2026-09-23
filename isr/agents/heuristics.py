@@ -182,26 +182,41 @@ class ObservationGreedyPursuer(HeuristicBlueAgent):
         self._obs = None
 
     def act(self, obs, env, agent):
-        # One observation per (env, timestep).  structured_belief_observation
-        # UPDATES the belief map as it builds it, so calling it once per blue
-        # would advance the belief N_blue times per step.
+        # One observation per (env, timestep), shared by every blue.
+        # structured_belief_observation() re-draws the sensor each call --
+        # the p_TP detection dice and the position noise -- so calling it
+        # per blue would give the five UAVs five different realisations of
+        # the same instant, where the policy gets one.  (It does NOT mutate
+        # the belief map: _update_belief_maps runs in step(), and an earlier
+        # version of this comment claiming otherwise was wrong.)
         t = int(env._t)
         if self._obs is None or env is not self._env or t != self._t:
             self._obs = env.structured_belief_observation()
             self._env = env
             self._t   = t
+        return self.act_from_observation(
+            self._obs, env.possible_agents.index(agent), int(env.n_blue))
 
-        feats = self._obs["rb_edge_features"]    # (n_rb, 7)
-        vis   = self._obs["rb_edge_visible"]     # (n_rb,)
-        my_idx = env.possible_agents.index(agent)
+    def act_from_observation(self, obs, my_idx: int, n_blue: int):
+        """The rule itself, on a GIVEN observation.
+
+        Split out from ``act`` so the same expert can label a BATCH of
+        observations that were built elsewhere — behaviour cloning has to
+        pair each stored observation with the action the expert takes on
+        *that* observation, and re-deriving it from the env would re-draw
+        the sensor and label a different realisation.
+
+        ``obs`` is anything exposing ``rb_edge_features`` (n_rb, 7) and
+        ``rb_edge_visible`` (n_rb,) for a single env.
+        """
+        feats = np.asarray(obs["rb_edge_features"])    # (n_rb, 7)
+        vis   = np.asarray(obs["rb_edge_visible"])     # (n_rb,)
 
         # NOT env.rb_edge_dst: those index the n_red TRUE reds, while the
         # actor's enemy graph has K track SLOTS (K != n_red in general --
         # tracker mode pads to --tracker-red-slots).  The documented edge
         # ordering is "for s in K, for b in N_blue", so edge e lands on
         # blue e % n_blue.
-        vis = np.asarray(vis)
-        n_blue = int(env.n_blue)
         assert vis.shape[0] % n_blue == 0, (vis.shape, n_blue)
         dst  = np.arange(vis.shape[0]) % n_blue
         mine = np.nonzero((dst == my_idx) & (vis > 0.0))[0]

@@ -39,7 +39,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import shlex
 import sys
 import time
 from pathlib import Path
@@ -111,17 +110,19 @@ def eval_matrix(
 
 
 def env_kwargs_for_mode(train_args: str, mode: str) -> Dict:
-    """Parse ``train_args`` with the TRAINER's parser, then rebuild the env
-    config exactly as an evaluation of a checkpoint would."""
-    argv_backup = sys.argv
-    try:
-        sys.argv = (["train_stage4.py"] + shlex.split(train_args)
-                    + ["--actor-obs", mode])
-        args = train_stage4._parse_args()
-    finally:
-        sys.argv = argv_backup
-    return env_kwargs_from_checkpoint({**vars(args),
-                                       "policy_type": "gnn_stage4_v6"})
+    """Build the env config a TRAINING RUN with these flags would get.
+
+    Via ``train_stage4.saved_args_from_flags``, not the parser alone: the
+    reward shape lives in the config rather than in argparse, so a dict
+    built from the parser makes ``env_kwargs_from_checkpoint`` fall back to
+    its pre-feature defaults (``step_cost`` 0.05 against the 0.033 in use)
+    and compare under a reward no run has trained with.  It changes no
+    `caught` number here — none of these baselines reads the reward — but
+    it would make every `mean_return` incomparable with §7/§8.
+    """
+    return env_kwargs_from_checkpoint(
+        train_stage4.saved_args_from_flags(
+            f"{train_args} --actor-obs {mode}"))
 
 
 def main() -> None:

@@ -296,6 +296,40 @@ def _parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
+def saved_args(args) -> dict:
+    """The ``args`` dict a checkpoint carries.
+
+    Reward shape is config-only (not argparse) but must be recorded, so a
+    checkpoint pins the reward it was trained under.  Sister scripts
+    (``train_bc.py``, ``compare_observation_quality.py``) build env configs
+    through this same function: building them from the parser alone lets
+    ``env_kwargs_from_checkpoint`` fall through to its PRE-feature defaults
+    — ``step_cost`` 0.05 instead of the 0.033 this config actually uses —
+    and silently evaluate in a different reward regime from training.
+    """
+    return {
+        **vars(args), "policy_type": "gnn_stage4_v6",
+        "catch_reward":     STAGE4_DEFAULTS["catch_reward"],
+        "step_cost":        STAGE4_DEFAULTS["step_cost"],
+        "uncaught_penalty": STAGE4_DEFAULTS["uncaught_penalty"],
+        "action_cost_coef": STAGE4_DEFAULTS["action_cost_coef"],
+        "p_TP_obstacle":    STAGE4_DEFAULTS["p_TP_obstacle"],
+        "p_FP_obstacle":    STAGE4_DEFAULTS["p_FP_obstacle"],
+    }
+
+
+def saved_args_from_flags(flags: str) -> dict:
+    """``saved_args`` for a command line given as a string, so another
+    script describes an env the way a training run is launched."""
+    import shlex
+    argv_backup = sys.argv
+    try:
+        sys.argv = ["train_stage4.py"] + shlex.split(flags)
+        return saved_args(_parse_args())
+    finally:
+        sys.argv = argv_backup
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -592,17 +626,7 @@ def main() -> None:
     # fresh for the loaded weights.
     optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
 
-    args_dict_saved = {
-        **vars(args), "policy_type": "gnn_stage4_v6",
-        # Reward shape is config-only (not argparse), but must be recorded
-        # so a checkpoint pins the reward it was trained under.
-        "catch_reward":     STAGE4_DEFAULTS["catch_reward"],
-        "step_cost":        STAGE4_DEFAULTS["step_cost"],
-        "uncaught_penalty": STAGE4_DEFAULTS["uncaught_penalty"],
-        "action_cost_coef": STAGE4_DEFAULTS["action_cost_coef"],
-        "p_TP_obstacle":    STAGE4_DEFAULTS["p_TP_obstacle"],
-        "p_FP_obstacle":    STAGE4_DEFAULTS["p_FP_obstacle"],
-    }
+    args_dict_saved = saved_args(args)
 
     # Buffer (generic dict-of-tensors).
     buffer = Stage4RolloutBuffer(
