@@ -88,10 +88,18 @@ from scripts.train_stage4 import (                                # noqa: E402
     _to_device, evaluate_policy_deterministic,
 )
 
-# §7 / §9 geometry, belief mode: the arm whose expert scores 2.913/3.
+# §7 / §10 geometry, TRACKER mode with the coverage path on.
+#
+# Not belief, although its expert scores a hair higher (2.913 vs 2.900):
+# the belief path carries five privileged information leaks
+# (docs/tracker_observation.md), and a policy cloned on it would learn to
+# depend on knowledge no sensor reported.  Since §10 gave both arms a
+# search tier they match on captures anyway, and the tracker gets there
+# 14-31% faster.  Equal captures, better efficiency, less information.
 DEFAULT_ENV_ARGS = (
     "--arena-size 130 --n-blue 5 --n-red 3 --n-obstacles 0 "
-    "--belief-grid-size 26 --max-steps 200 --actor-obs belief"
+    "--belief-grid-size 26 --max-steps 200 --actor-obs tracker "
+    "--use-staleness --staleness-regions 5"
 )
 
 
@@ -105,12 +113,19 @@ def expert_actions(
     Reads the stored arrays, never the envs — see the module docstring on
     why re-deriving from the env would label a different sensor draw.
     """
-    rb_f = obs_np["rb_edge_features"]     # (E, n_rb, 7)
-    rb_v = obs_np["rb_edge_visible"]      # (E, n_rb)
-    E = rb_f.shape[0]
+    # Every key the expert reads has to be sliced through, INCLUDING the
+    # coverage path.  Omitting region_feats / gb_edge_feats silently
+    # disables ObsGreedy's search tier, so the labels come from an expert
+    # that holds position with nothing trackable -- 58.4% of agent-steps
+    # on the tracker observation (§10.2).  Cloning that teaches the policy
+    # to freeze, and reads afterwards as "cloning did not transfer".
+    keys = [k for k in ("rb_edge_features", "rb_edge_visible",
+                        "region_feats", "gb_edge_feats", "gb_weight")
+            if k in obs_np]
+    E = obs_np["rb_edge_features"].shape[0]
     out = np.zeros((E, n_blue, 2), dtype=np.float32)
     for i in range(E):
-        row = {"rb_edge_features": rb_f[i], "rb_edge_visible": rb_v[i]}
+        row = {k: obs_np[k][i] for k in keys}
         for b in range(n_blue):
             out[i, b] = experts[i].act_from_observation(row, b, n_blue)
     return out
@@ -211,6 +226,11 @@ def main() -> None:
         n_msg_rounds       = saved_args["n_msg_rounds"],
         init_log_std       = STAGE4_DEFAULTS.get("init_log_std", 0.0),
         use_hidden_in_gnn  = saved_args["share_hidden_via_gnn"],
+        # The student must SEE what the expert acts on.  Without this the
+        # expert searches on region nodes the actor never receives, and the
+        # clone is being asked to fit a function of inputs it does not have.
+        n_region           = (saved_args["staleness_regions"] ** 2
+                              if saved_args["use_staleness"] else 0),
     ).to(device)
     log(f"Policy: {sum(p_.numel() for p_ in policy.parameters())} params")
 

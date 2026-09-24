@@ -220,3 +220,81 @@ def test_saved_args_pin_the_configs_reward_not_the_legacy_default():
     assert kw["step_cost"] == 0.033, kw["step_cost"]
     assert kw["catch_reward"] == 10.0
     assert kw["uncaught_penalty"] == 5.0
+
+
+# --------------------------------------------------------------------------
+#  The coverage path has to survive the trip to the expert AND the student
+# --------------------------------------------------------------------------
+
+SEARCH_FLAGS = ("--arena-size 130 --n-blue 3 --n-red 2 --n-obstacles 0 "
+                "--belief-grid-size 26 --max-steps 40 --actor-obs tracker "
+                "--use-staleness --staleness-regions 5")
+
+
+def _search_vec(n_envs=2, seed=7):
+    kw = env_kwargs_from_checkpoint(saved_args_from_flags(SEARCH_FLAGS))
+    v = Stage4VectorPursuitEnv(
+        n_envs=n_envs, env_kwargs=kw, base_seed=seed,
+        episode_buffer_size=16, red_policy_mix=[("stationary", 1.0)])
+    return v, v.reset(seed=seed)
+
+
+def test_batch_labelling_passes_the_coverage_keys_through():
+    """The quiet failure: slice only the enemy-graph keys and ObsGreedy's
+    search tier never fires, so the labels come from an expert that holds
+    position with nothing trackable — 58.4% of agent-steps on the tracker
+    observation.  Cloning that teaches the policy to freeze and reads
+    afterwards as 'cloning did not transfer'."""
+    vec_env, obs_np = _search_vec()
+    assert "region_feats" in obs_np, "env did not emit the coverage path"
+
+    experts = [ObservationGreedyPursuer() for _ in range(2)]
+    labelled = expert_actions(experts, obs_np, vec_env.n_blue)
+
+    # Same observation with the coverage keys withheld — the old behaviour.
+    stripped = {k: v for k, v in obs_np.items()
+                if k not in ("region_feats", "gb_edge_feats", "gb_weight")}
+    blind = expert_actions([ObservationGreedyPursuer() for _ in range(2)],
+                           stripped, vec_env.n_blue)
+
+    n_idle_blind = int((np.abs(blind).sum(-1) == 0).sum())
+    n_idle_full = int((np.abs(labelled).sum(-1) == 0).sum())
+    assert n_idle_blind > 0, "test geometry has something trackable already"
+    assert n_idle_full == 0, (
+        f"{n_idle_full} labels are 'hold position' although the coverage "
+        f"path was available")
+    vec_env.close()
+
+
+def test_the_student_is_built_with_the_coverage_path_the_expert_uses():
+    """The other half of the same trap: an expert searching on region nodes
+    the actor never receives asks the clone to fit a function of inputs it
+    does not have."""
+    saved = saved_args_from_flags(SEARCH_FLAGS)
+    n_region = saved["staleness_regions"] ** 2 if saved["use_staleness"] else 0
+    assert n_region == 25
+
+    vec_env, obs_np = _search_vec()
+    policy = GNNStage4Policy(
+        n_blue=vec_env.n_blue, n_red=vec_env.n_red,
+        n_obs=vec_env.n_obstacles, blue_feat_dim=vec_env.blue_feat_dim,
+        red_feat_dim=4, obs_feat_dim=5,
+        actor_n_red=vec_env.actor_n_red, actor_n_obs=vec_env.actor_n_obstacles,
+        actor_red_feat_dim=vec_env.actor_red_feat_dim,
+        actor_obs_feat_dim=vec_env.actor_obs_feat_dim,
+        edge_feat_dim=vec_env.edge_feat_dim, action_dim=vec_env.action_dim,
+        n_region=n_region)
+    assert policy.actor_encoder.n_region == 25
+    # And the critic must NOT have it: it already reads true_occupancy.
+    assert policy.critic_encoder.n_region == 0
+
+    obs_t = {k: torch.from_numpy(v).float() for k, v in obs_np.items()}
+    partial_obs, full_state = split_stage4_obs(obs_t)
+    for k in ("region_feats", "gb_edge_feats", "gb_weight"):
+        assert k in partial_obs, f"{k} did not reach the actor"
+        assert k not in full_state, f"{k} leaked into the critic"
+
+    mean, _ = policy.act_deterministic(
+        partial_obs, policy.initial_hidden(2, torch.device("cpu")))
+    assert mean.shape == (2, vec_env.n_blue, 2)
+    vec_env.close()
