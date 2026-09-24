@@ -193,6 +193,24 @@ def _parse_args() -> argparse.Namespace:
                    help="Path to a Stage 1/2 GNN checkpoint to warm-start "
                         "the critic (Stage 3's stabiliser).  'none' to "
                         "cold-start.")
+    p.add_argument("--reset-log-std", type=float, default=None,
+                   help="After warm-starting, overwrite the actor's "
+                        "log_std with this value (sigma = exp(x)).  Applies "
+                        "AFTER the copy, which is the only place it works: "
+                        "load_full_stage4 copies every shape-matching "
+                        "tensor, actor_log_std included, so a checkpoint's "
+                        "own sigma otherwise wins over anything the "
+                        "constructor set.  Needed because PPO SAMPLES while "
+                        "eval takes the mean: a behaviour-cloned actor "
+                        "arrives with log_std still at its init 0.0 "
+                        "(sigma 1.0, near-uniform on a [-1,1]^2 box), so its "
+                        "rollouts perform far below the policy itself -- "
+                        "measured 1.70/3 sampled against 2.52/3 "
+                        "deterministic -- and PPO would compute advantages "
+                        "on wrecked trajectories.  docs/stage4_results.md "
+                        "6.5 records entropy settling around sigma 0.17-0.2 "
+                        "on this task, so -1.2 (sigma 0.30) is a sane "
+                        "fine-tuning width.")
     p.add_argument("--warm-start-full",
                    default=None,
                    help="Path to a converged Stage 4 checkpoint (e.g. "
@@ -638,6 +656,16 @@ def main() -> None:
             if ws and str(ws).lower() != "none":
                 log(f"WARN: warm-start ckpt not found ({ws}); cold-starting.")
             log("Critic COLD-STARTED (typed GNN, no CNN).")
+
+    # Exploration width, AFTER the warm-start copy (which would otherwise
+    # overwrite it with the checkpoint's own).  See --reset-log-std.
+    if args.reset_log_std is not None:
+        with torch.no_grad():
+            was = policy.actor_log_std.detach().clone()
+            policy.actor_log_std.fill_(float(args.reset_log_std))
+        log(f"actor log_std reset {was.tolist()} -> "
+            f"{policy.actor_log_std.detach().tolist()}  "
+            f"(sigma {float(np.exp(args.reset_log_std)):.3f})")
 
     # Build the optimizer AFTER warm-start so Adam's moment buffers are
     # fresh for the loaded weights.
