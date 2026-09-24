@@ -189,6 +189,9 @@ def env_kwargs_from_checkpoint(train_args: dict) -> dict:
         # evaluates in the regime it trained in.
         use_staleness            = g("use_staleness", False),
         staleness_regions        = g("staleness_regions", 5),
+        # None = RED_TARGET.v_max, which is what every pre-flag checkpoint
+        # trained under.
+        red_v_max                = g("red_v_max", None),
     )
     if kw["actor_obs"] == "tracker":
         kw.update(

@@ -68,6 +68,17 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--max-steps",      type=int,   default=d["max_steps"])
     p.add_argument("--capture-radius", type=float, default=d["capture_radius"])
     p.add_argument("--sensor-radius",  type=float, default=d["sensor_radius"])
+    p.add_argument("--red-v-max", type=float, default=None,
+                   help="Red top speed; None keeps RED_TARGET.v_max (1.0) "
+                        "against the blue's 1.5, the setting every result "
+                        "in docs/stage4_results.md was measured under.  At "
+                        "1.0 a stern chase closes 0.5/step and covers 100 "
+                        "units of a 130 m arena in an episode, so pure "
+                        "pursuit wins without coordination -- measured, not "
+                        "argued: the uncoordinated ObsGreedy scores 2.90/3. "
+                        "Raise it to make cutting a target off the only way "
+                        "to catch it.  CHANGES THE TASK: results are not "
+                        "comparable across values.")
     # Stage 4 obstacle + belief knobs
     p.add_argument("--n-obstacles",           type=int,   default=d["n_obstacles"])
     p.add_argument("--n-red-min", type=int, default=d.get("n_red_min", None),
@@ -538,6 +549,7 @@ def main() -> None:
         clearance_ally_margin   = args.clearance_ally_margin,
         use_staleness           = args.use_staleness,
         staleness_regions       = args.staleness_regions,
+        red_v_max               = args.red_v_max,
     )
 
     # Red policy mix parsing.

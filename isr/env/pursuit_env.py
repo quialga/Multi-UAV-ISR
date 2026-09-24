@@ -191,6 +191,17 @@ class PursuitEnv(ParallelEnv):
         max_steps:                int                = 200,
         capture_radius:           float              = 3.0,
         dt:                       float              = 1.0,
+        # Red top speed.  None keeps RED_TARGET.v_max (1.0) against the
+        # blue's 1.5, which is the configuration every result in
+        # docs/stage4_results.md was measured under -- and at which a blue
+        # in a stern chase closes 0.5 per step, so over 200 steps it covers
+        # 100 units of a 130 m arena and pure pursuit essentially always
+        # wins.  That is measured, not argued: ObsGreedy is a pure-pursuit
+        # rule with no coordination whatsoever and it scores 2.90/3 (§10).
+        # Raising this is how the task starts to REQUIRE cutting a target
+        # off rather than running it down, which is the only condition
+        # under which coordination can pay.
+        red_v_max:                Optional[float]    = None,
         red_policy:               Optional[Callable] = None,
         seed:                     Optional[int]      = None,
         # ----- Reward shape (was hard-coded in _step) ---------------------
@@ -464,6 +475,9 @@ class PursuitEnv(ParallelEnv):
         self.arena_size     = float(arena_size)
         self.max_steps      = int(max_steps)
         self.capture_radius = float(capture_radius)
+        self.red_v_max = (RED_TARGET.v_max if red_v_max is None
+                          else float(red_v_max))
+        assert self.red_v_max > 0.0
         self.dt             = float(dt)
         self.red_policy     = red_policy or run_from_nearest_uav
         self.sensor_radius: Optional[float] = (
@@ -884,7 +898,7 @@ class PursuitEnv(ParallelEnv):
         # 4. Integrate red kinematics.
         prev_red_pos = self._red_pos.copy()
         self._red_pos, self._red_vel = self._integrate(
-            self._red_pos, self._red_vel, red_a, RED_TARGET.v_max,
+            self._red_pos, self._red_vel, red_a, self.red_v_max,
         )
         if self.n_obstacles > 0:
             self._red_pos, self._red_vel, _ = self._clip_positions_from_obstacles(
