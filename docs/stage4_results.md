@@ -23,8 +23,14 @@ first real step toward what a fielded ISR UAV actually sees.
 > * the belief map and the tracker are **equivalent on captures** once
 >   both have a search signal, and the tracker is 14–31% faster while
 >   giving up five privileged information leaks (§10);
-> * the next move is behaviour cloning from that rule (§8.5), with the
->   bar set at its 2.90.
+> * behaviour cloning from that rule **reaches it** — 2.940/3 in 768k
+>   steps against PPO-from-scratch's 1.280 in 12.8M, and the repo-wide
+>   acceptance criterion passes for the first time under §4b
+>   perception (§11).
+>
+> Next: PPO fine-tuning from the cloned checkpoint, which must pass
+> `--reset-log-std` or it will collect rollouts from a policy 0.8/3
+> worse than the one it is meant to improve (§11.4).
 
 ---
 
@@ -1378,3 +1384,158 @@ graph always offers a memory peak, so the search tier never fires.
   tracker path is still inert, and `searchable` is still trivially 1.0
   everywhere — the leak fix above is untested against real obstacles
   because there are none to test against yet.
+
+---
+
+### 11. Behaviour cloning from `ObsGreedy` reaches the expert (MEASURED, 2026-09-24) · `feature/target-tracking`
+
+§8 established that a five-line rule extracts far more from the actor's
+observation than PPO ever did, and §10 made the tracker version of that
+rule a competent expert with no privileged information. This clones it.
+
+`bc_tracker_v1`: tracker observation, region nodes on, 60 rounds ×
+64 envs × 200 steps = **768 000 steps**, 121 min of laptop CPU, β decayed
+1.0 → 0.3, seed 0. Config in `scripts/train_bc.py`; the checkpoint carries
+its own hyperparameters under `args["bc"]`.
+
+#### 11.1 Result: the clone matches its expert, and acceptance PASSES
+
+50 matched-seed episodes per cell, the same protocol and seeds as §10:
+
+| Blue | Stationary | Random | RunFromNearest | **mean /3** |
+|---|---|---|---|---|
+| Random | 0.94 (198.4 steps) | 1.08 (194.6) | 0.12 (200.0) | **0.713** |
+| Greedy (true-in-range) | 2.60 (93.7) | 2.84 (75.0) | 2.50 (121.0) | **2.647** |
+| `ObsGreedy` (the expert) | 2.98 (47.3) | 3.00 (49.5) | 2.72 (107.1) | **2.900** |
+| **Trained (the clone)** | **3.00 (53.5)** | **3.00 (56.1)** | **2.82 (100.7)** | **2.940** |
+
+**Acceptance: PASS** — `+23.13` against the `1.20 × Greedy` bar of
+`+21.93`. The repo-wide Stage 1 criterion, which had never passed under
+§4b perception (§8.3 recorded `-20.27` → FAIL).
+
+**The clone matches the expert; it does not beat it.** 2.940 vs 2.900 is
++0.04, and the column carrying it is `RunFromNearest` at +0.10 — **0.8
+standard errors** on n=50. Stated as a win it would be the same
+over-claim this document has had to retract twice.
+
+For scale, against the from-scratch baseline:
+
+| | steps | mean /3 | `run` |
+|---|---|---|---|
+| PPO from scratch, best of 1000 rollouts (§8.3) | 12 800 000 | 1.280 | 0.22 |
+| **behaviour cloning, 60 rounds** | **768 000** | **2.940** | **2.82** |
+
+The evader column is the one to look at: it sat at ~0.25 for every
+trained policy in this document, barely above random's 0.12, and is now
+2.82.
+
+#### 11.2 The learning curve, and what the β floor was for
+
+Deterministic eval every 5 rounds (20 episodes at seed base 30 000 — the
+in-training metric, not the 50-episode table above):
+
+| round | 5 | 10 | 15 | 20 | 25 | 30 | 35 | 40 | 45 | 50 | 55 | 60 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mean /3 | 1.63 | 1.77 | 1.83 | 1.87 | 2.10 | 2.52 | 2.62 | 2.72 | 2.80 | 2.87 | 2.78 | **2.88** |
+
+Monotone but for round 55, and crucially **no collapse as β fell to
+0.3**, with the clone loss still falling (0.309 → 0.082). An earlier
+belief-mode pilot that decayed β to **0** over only 12 rounds did
+collapse — 1.80 at round 8 down to 1.33 by round 12, clone loss *rising*
+0.19 → 0.38 — because with no expert left driving, the data comes
+entirely from a student still too weak to generate it. The floor is what
+prevents that, and it is the one hyperparameter here worth defending.
+
+#### 11.3 The training log's `caught` is not the policy — read `[det eval]`
+
+Worth stating because it looks alarming: the per-round line reads
+`caught ≈ 2.9` while the deterministic eval reads 1.87. They measure
+different things. The round line comes from the episodes collected for
+training, in which **the expert drives with probability β**, redrawn per
+step per env — so it is a mixture, dominated by the expert. At round 1
+(β = 1.0) it read 2.94, which is just the expert's own score.
+
+Decomposed at the round-20 checkpoint, stationary red, 20 matched
+episodes:
+
+| β (P the expert drives) | caught |
+|---|---|
+| 1.0 — expert alone | 2.85 |
+| 0.73 — the mixture at the time | 2.90 |
+| 0.30 — the final mixture | 2.95 |
+| 0.0 — **the student alone** | **1.80** |
+
+The student alone reproduces that round's `[det eval] stat=1.80`
+exactly. Note the mixture does **not** degrade as β falls — it rises
+slightly — so "watch `caught` drop as β decays" is not a progress signal.
+Only `[det eval]` is.
+
+#### 11.4 A trap in the handover to PPO, and the flag that defuses it
+
+Cloning regresses the **mean** and deliberately leaves `log_std` alone —
+the MSE has no gradient into it, which is the point, since an NLL
+objective against a deterministic expert would drive σ to zero and leave
+PPO no exploration. The consequence is that the clone arrives with
+`log_std` still at its init **0.0, i.e. σ = 1.0**, which on a `[-1,1]²`
+action box is close to uniform noise.
+
+PPO **samples** its rollout actions. Measured on this checkpoint:
+
+| | Stationary | Random | RunFromNearest | mean |
+|---|---|---|---|---|
+| deterministic | 2.65 | 2.70 | 2.20 | **2.52** |
+| sampled (σ = 1.0) | 2.20 | 2.15 | **0.75** | **1.70** |
+
+Fine-tuning from here unmodified would have PPO collecting rollouts from
+a policy performing 0.8/3 below the one being evaluated, computing
+advantages on trajectories that do not reflect it, with `ent_coef 0.008`
+pushing to keep the width — and it would have read as *PPO destroyed the
+clone*.
+
+`train_stage4.py --reset-log-std` fixes it, applied **after** the
+warm-start copy, which is the only place it works: `load_full_stage4`
+copies every shape-matching tensor and `actor_log_std` matches, so a
+checkpoint's own σ otherwise silently wins. §6.5 records entropy settling
+near σ 0.17–0.2 on this task, so **−1.2 (σ 0.30)** is the value to start
+from.
+
+#### 11.5 Why the clone matches an expert it only imitated — unexplained
+
+Two mechanisms were proposed, **both tested, neither held**. Recorded
+because the negative results are the useful part:
+
+* **Decorrelation — falsified.** `ObsGreedy` is uncoordinated (five blues
+  chase the same nearest track), and the β mixture above *improves* as
+  more student enters, which suggested the clone's imperfections spread
+  the team. Measured, the opposite is true: the clone is **more**
+  clustered (52.0 m mean pairwise blue distance against the expert's
+  56.5 on stationary, 41.4 vs 45.7 on the evader) and has **more**
+  redundant pairs (17.4% vs 13.6%, 28.8% vs 24.9%). It matches the
+  expert while coordinating *worse*.
+* **Interception — not supported.** The clone sees relative velocity,
+  bearing, its teammates and has a GRU, all of which `ObsGreedy` ignores,
+  so leading a fleeing target was the obvious candidate. The expert's
+  lead angle measures exactly 0.00° (pure pursuit by construction — a
+  check that the measurement works) and the clone's is −7.4° against
+  stationary reds and −6.6° against the evader. **Nearly the same offset
+  whether or not the target moves**, which argues against a
+  target-motion explanation; and the sign convention does not cleanly
+  separate "leading the target" from "following its own momentum" when
+  the target is still.
+
+So the clone deviates systematically from pure pursuit, it is neither
+interception nor decorrelation, and what it *is* remains unmeasured. The
+GRU's memory is the untested candidate.
+
+#### 11.6 Caveats
+
+* **One seed, one run.** n=1 on the BC run itself; the table is n=50
+  episodes within it.
+* **Deterministic only.** Every headline number here is the distribution
+  mean. §11.4 is what the same policy does when sampled.
+* **It inherits the expert's ceiling and its uncoordination**, measurably
+  (§11.5): 2.90 is a ceiling reached, not a floor to build from. The
+  headroom above it is coordination, which neither the expert nor the
+  clone has, and which is what PPO fine-tuning would have to add.
+* **`n_obstacles 0`**, so the obstacle half of the tracker path is still
+  inert, as everywhere above.
