@@ -7,10 +7,24 @@ The blues no longer receive ground-truth enemy/obstacle positions —
 they must act on a fused, uncertain picture of the world, which is the
 first real step toward what a fielded ISR UAV actually sees.
 
-The headline result: **the belief-driven policy reaches the same
-capture performance as the fully-observable oracle** (3/3 catches in
-training), paying only a small, honest cost in convergence speed and
-final reward for acting under uncertainty instead of ground truth.
+> **Read §6.5 onward before quoting anything above it.** This file is
+> kept as a running record, oldest first, and its early headline —
+> *the belief-driven policy matches the fully-observable oracle at 3/3*
+> — **no longer holds**. It was recorded in 2026-07 at arena 130 with a
+> near-oracle in-range sensor and an evader that cornered itself. Two
+> deliberate realism changes and one geometry change since then put the
+> honest figure at **1.2–1.28/3** (§6.5, §8.3), and §6.5 explains why
+> 3.00/3 is not a recoverable target.
+>
+> The current state of play, in three lines:
+> * a trivial rule extracts **2.90/3** from the same observation the
+>   policy gets, so the observation is not the bottleneck — the policy
+>   is (§8, §10);
+> * the belief map and the tracker are **equivalent on captures** once
+>   both have a search signal, and the tracker is 14–31% faster while
+>   giving up five privileged information leaks (§10);
+> * the next move is behaviour cloning from that rule (§8.5), with the
+>   bar set at its 2.90.
 
 ---
 
@@ -867,19 +881,25 @@ only confirmed tracks under the σ cut-off.
 * **Only the red half of the tracker path is exercised.** With
   `n_obstacles 0` the obstacle tracker is inert, so this says nothing
   about the obstacle-estimation half.
-* **The tracker path has no coverage information.** The belief map does
-  double duty — with `enemy_belief_decay 0.9935` and
-  `enemy_belief_diffusion 0.2`, unobserved cells drift back toward the
-  prior, which *is* a where-have-I-looked signal. The tracker arm gets K
-  discrete confirmed tracks and nothing else. Region / staleness nodes
-  (docs/search_design.md) would close that asymmetry. **This run is not
-  evidence that they would help**: the two arms tie, so nothing here
-  attributes the shared ceiling to missing coverage. An earlier draft of
-  this section claimed it did, on a reading of rollouts ≤200 where the
-  tracker looked behind on `stat`/`rand` — it had simply not converged
-  yet. **§9 supplies that evidence a different way**, by taking the
-  policy out of the comparison: there the tracker's failure mode is
-  measurably a missing where-should-I-look signal.
+* **~~The belief map does coverage double duty.~~ NEITHER path had
+  coverage information — corrected in §9.3.** This bullet used to argue
+  that `enemy_belief_decay 0.9935` plus `enemy_belief_diffusion 0.2`
+  made unobserved cells drift back toward the prior, so the belief map
+  carried a where-have-I-looked signal the tracker lacked. The drift is
+  real *in the grid*; what the actor gets is K peaks, and
+  `_extract_belief_peaks` is a global argmax, so it lands on whatever
+  false alarm is freshest **inside the current sensor footprint**.
+  Measured: the cell it steers to has staleness 0 in 579 of 579 cases
+  against a map mean of 36.5 steps (§9.3). So the asymmetry this bullet
+  described did not exist — both arms were blind, one of them noisily.
+  §10 gives both a real one via region / staleness nodes
+  (`docs/search_design.md`), and the belief/tracker gap closes to 0.013.
+* **This run is not evidence that region nodes would help.** The two
+  arms tie, so nothing here attributes the shared ceiling to missing
+  coverage. An earlier draft claimed it did, on a reading of rollouts
+  ≤200 where the tracker looked behind on `stat`/`rand` — it had simply
+  not converged yet. §10 measures the answer at the expert level
+  instead; whether it moves a *trained policy* is still unmeasured.
 * **K slots and the σ cut-off were calibrated elsewhere** (L=200, 7 blue /
   4 red / 9 obstacles). At this geometry 8 slots comfortably exceed
   2 × n_red and the 40 m cut-off is still the sensor radius, but that is
@@ -1009,14 +1029,16 @@ survives if it is ever worth recovering.
   only **+0.02 on the random red**, which is a tie on that column.
 * **The observation is not the bottleneck.** 2.78/3 is extractable from
   it by a rule with no learning, no velocity, no teammates and no
-  recurrence. Neither the belief map nor the tracker is what limits the
-  trained policy.
+  recurrence — **2.90/3 once §10 gives that rule a search tier**.
+  Neither the belief map nor the tracker is what limits the trained
+  policy.
 * **The policy is.** Its best checkpoint sits at 1.280/3 — **27% of the
-  way from random (0.713) to `ObsGreedy` (2.780)** — on an input from
-  which a five-line rule extracts 2.78. Against the evader it is barely
-  above chance: **0.22–0.30 against random's 0.12**, where `ObsGreedy`
-  gets 2.62. Episode length says the same thing: `ObsGreedy` closes
-  passive reds in 66–69 steps, the policy burns 182–200 and times out.
+  way from random (0.713) to `ObsGreedy` (2.780), and 24% of the way to
+  §10's 2.900** — on an input from which a five-line rule extracts that
+  much. Against the evader it is barely above chance: **0.22–0.30
+  against random's 0.12**, where `ObsGreedy` gets 2.62. Episode length
+  says the same thing: `ObsGreedy` closes passive reds in 66–69 steps
+  (47–50 with the search tier), the policy burns 182–200 and times out.
 * **So §7's belief-vs-tracker comparison is premature.** It measures
   which of two policies, both far below what their own inputs allow, is
   marginally less bad. The tie there stands as a fact; it should not be
@@ -1036,6 +1058,22 @@ lines — and it was not available before this baseline existed.
 It also replaces `GreedyPursuer` as the honest acceptance bar. The
 repo-wide criterion of "1.2 × GreedyPursuer" was calibrated against an
 oracle-in-range opponent and is the wrong target under §4b perception.
+
+**Which `ObsGreedy`, settled in §10.** The expert to clone is the one on
+the **tracker** observation: it is the one a fielded system could run,
+the belief path carrying five privileged leaks
+(`docs/tracker_observation.md`) that a cloned policy would come to depend
+on. Since §10 gave both arms a search tier they match on captures anyway,
+and the tracker is 14–31% faster. **The bar is its 2.900/3** — not the
+belief arm's 2.913, which is reached with privileged information, and not
+the 2.780 in §8.3, which was reached while idle half the time.
+
+Agreed in advance, so the result is not read after the fact: **≥ 2.0/3
+means cloning transfers** and PPO fine-tuning earns its GPU time;
+**< 1.5/3 is the more interesting outcome** — it would say a policy with
+a GRU and the full typed graph cannot represent a five-line rule over its
+own observation, which is a finding about the architecture, not the
+algorithm.
 
 ---
 
@@ -1083,7 +1121,14 @@ Tables produced before the fix were re-measured rather than annotated:
 §8.3 in full (which is also where the checkpoint ambiguity got settled),
 and the §9.2 table below was already clean.
 
-#### 9.2 Results — the belief map wins by 0.13/3
+#### 9.2 Results — the belief map wins by 0.13/3 (SUPERSEDED by §10)
+
+**The 0.13 is not a property of the two representations.** §10 wires the
+coverage path both observations were missing, gives `ObsGreedy` the
+matching search tier, and the gap collapses to **0.013** — the belief
+map's whole advantage here was the tracker arm freezing for want of a
+search rule. The table stands as a correct measurement *of the
+configuration without region nodes*; the heading's conclusion does not.
 
 Mean reds caught of 3, 50 matched-seed episodes per cell:
 
@@ -1159,6 +1204,9 @@ extraction destroys it** before the actor sees anything.
 
 #### 9.4 What this establishes
 
+*(§10 acted on every item here and measured the result; read the two
+together.)*
+
 * **The belief map's advantage is motion, not coverage and not
   accuracy.** On accuracy the tracker wins outright (43.6 vs 68.6
   steps). What it loses on is never having a reason to move: it freezes
@@ -1167,6 +1215,8 @@ extraction destroys it** before the actor sees anything.
   while a stationary one only finds what walks into its radar. That is
   the whole 0.13/3. It is a duller mechanism than "the belief map knows
   where to search", which is what the first version of §9.4 claimed.
+  **§10 confirms it by removing the cause**: give the tracker a search
+  rule and the 0.13 becomes 0.013.
 * **Neither observation carries a search signal — retracting the claim
   that this one does.** §7.4 said the §7 tie was not evidence for region
   nodes; the first version of this section said removing the policy
@@ -1177,7 +1227,9 @@ extraction destroys it** before the actor sees anything.
   signal** — one is blind and the other chases its own clutter. That is
   a stronger reason to wire region / staleness nodes
   (`docs/search_design.md`) than the one withdrawn, because it applies
-  to both arms rather than closing a gap between them.
+  to both arms rather than closing a gap between them. **True as
+  written on 2026-09-23 and no longer true of the code**: §10 wires
+  them, and both arms now have one.
 * **The §7 tie now has an explanation.** Two observations that differ by
   0.13/3 for a greedy rule produced policies differing by 0.011 — further
   evidence that at 1.15/3 neither policy is limited by its input.
@@ -1188,34 +1240,41 @@ extraction destroys it** before the actor sees anything.
   them stops being the same-information baseline this section rests on
   and becomes a handicapped one. The fallback has to become "go to the
   stalest searchable region" in the same commit that wires them.
+  **Done in §10.1**, in that commit.
 * **Scope.** `n_obstacles 0`, so only the red half of the tracker path is
   exercised; and `ObsGreedy` ignores velocity, bearing and teammates, so
   this measures what the *enemy graph* supports for a memoryless
   single-target rule, not what a coordinating policy could extract.
 
-#### 9.5 Staleness is implemented at both ends and wired at neither
+#### 9.5 Staleness was implemented at both ends and wired at neither (DONE in §10)
 
-Worth recording exactly, because "add region nodes" sounds like a feature
-and is three edits:
+*This section is the state on 2026-09-23 and the work order §10 carried
+out. Kept because "add region nodes" sounded like a feature and was in
+fact three edits plus a leak — worth knowing next time something looks
+absent and is merely disconnected.*
 
-| piece | where | state |
-|---|---|---|
-| `_staleness` field, steps since each cell was observed | `pursuit_env.py:2200`, flag `use_staleness` (default `False`) | implemented |
-| `R×R` region nodes `[staleness, searchable]` + weighted region→blue edges | `pursuit_env.py:2247`, `:2302` | implemented |
-| coverage path in the encoder (`n_region`, `region_feat_dim=2`, gb messages) | `gnn_stage4_policy.py:202` | implemented |
-| tests | `test_staleness.py`, `test_region_nodes.py`, `test_region_graph.py` | 60 passing |
+| piece | where | state then | state now |
+|---|---|---|---|
+| `_staleness` field, steps since each cell was observed | `pursuit_env.py`, flag `use_staleness` | implemented | reachable via `--use-staleness` |
+| `R×R` region nodes `[staleness, searchable]` + weighted region→blue edges | `pursuit_env.py` | implemented | emitted by `structured_belief_observation()` |
+| coverage path in the encoder (`n_region`, `region_feat_dim=2`, gb messages) | `gnn_stage4_policy.py` | implemented | fed, actor-side, via `n_region` |
+| tests | `test_staleness.py`, `test_region_nodes.py`, `test_region_graph.py` | 50 passing | 51 — three rewritten, one added (see the leak) |
 
-**One leak to close before wiring it.** `_build_region_nodes`'s
-`searchable` feature is computed from `_obstacle_grid`, which is built
-from the **true** obstacle positions and radii (`pursuit_env.py:1824`) —
-it is the ground-truth occupancy the CTDE critic is allowed to see. At
-`n_obstacles 0` it is 1.0 everywhere and harmless, which is why it can
-be wired now; the moment obstacles return it would hand the tracker arm
-a true obstacle map and become the **sixth** entry in
-`docs/tracker_observation.md`'s leak table, of exactly the kind the
-tracker path exists to remove. `searchable` has to come from the
-obstacle belief channel in belief mode and the obstacle tracker in
-tracker mode.
+**One leak to close before wiring it — closed in §10.1.**
+`_build_region_nodes`'s `searchable` feature was computed from
+`_obstacle_grid`, which is built from the **true** obstacle positions and
+radii — the ground-truth occupancy the CTDE critic is allowed to see. At
+`n_obstacles 0` it is 1.0 everywhere and harmless, which is why the path
+could be wired before fixing it; the moment obstacles return it would
+hand the tracker arm a true obstacle map and become the **sixth** entry
+in `docs/tracker_observation.md`'s leak table, of exactly the kind the
+tracker path exists to remove. It now comes from the obstacle belief
+channel in belief mode and the obstacle tracker in tracker mode.
+
+Three tests in `test_region_nodes.py` **failed on that fix, because they
+were pinning the leak** — they drove `_obstacle_grid` and asserted
+`searchable` followed. They now drive the estimate, and a new test moves
+truth alone and asserts nothing changes.
 
 The `staleness` feature itself is clean: it is derived from the blues'
 own positions and sensor geometry, so it is self-knowledge, not
