@@ -1121,27 +1121,73 @@ because no slot is visible,
 | belief | **0.0%** | — |
 | tracker | **49.9%** | **85.7%** |
 
-In belief mode a blue is *never* without something to chase: decayed
-memory peaks and p_FP artefacts always offer a heading, which makes idle
-blues wander and incidentally sweep the arena. In tracker mode a blue
-with no confirmed track has nothing, holds position, and stops
-contributing — half the time overall, and almost always in the episodes
-that fail.
+In belief mode a blue is *never* without something to chase. In tracker
+mode a blue with no confirmed track has nothing, holds position, and
+stops contributing — half the time overall, and almost always in the
+episodes that fail.
+
+**What the belief map falls back to is not what it looks like**
+(MEASURED 2026-09-24, correcting the first version of this section,
+which said the fallback made idle blues "wander and incidentally sweep
+the arena"). It does not sweep. `_extract_belief_peaks` is a global
+argmax of `sigmoid(log_odds)` with no threshold, and the log-odds
+arithmetic decides where that lands:
+
+| cell state | log-odds | posterior | measured, at step 60 |
+|---|---|---|---|
+| observed, false-alarm evidence | `L > 0` | `p > 0.5` | max **0.943** |
+| never observed | `L = 0` | `p = 0.5` | max **0.499**, median 0.354 |
+| observed, empty | `L < 0` | `p ≈ 0` | median **0.000** |
+
+An unobserved cell starts at the prior and can only fall — decay pulls
+it toward 0 and diffusion mixes it with searched neighbours — so it can
+never outrank a cell that just took a `p_FP = 0.15` false alarm. **The
+argmax is therefore always inside the current sensor footprint.**
+
+Directly: switching on the env's `_staleness` field (steps since each
+cell was last observed — implemented, never shown to any policy, §9.5)
+and reading off the cell `ObsGreedy` steers to when nothing is live:
+
+| | staleness of the cell it steers to | staleness of the map |
+|---|---|---|
+| 579 belief-driven headings, 20 eps | **0.0 steps, every single one** | 36.5 steps |
+
+It steers at a clutter echo under its own radar, not at unexplored
+ground. The coverage information *is* in the grid — "never looked" and
+"looked, empty" are genuinely different values — and **the peak
+extraction destroys it** before the actor sees anything.
 
 #### 9.4 What this establishes
 
-* **The belief map's advantage is coverage, not accuracy.** On accuracy
-  the tracker wins outright (43.6 vs 68.6 steps). It loses on never
-  having a reason to move.
-* **This *is* the evidence §7.4 said the tie did not provide.** That
-  caveat stands as written — the §7 tie attributes nothing, because both
-  policies were far below their inputs. Removing the policy changes that:
-  the tracker arm's measured failure mode is precisely a missing
-  where-should-I-look signal, which is what region / staleness nodes
-  supply (`docs/search_design.md`).
+* **The belief map's advantage is motion, not coverage and not
+  accuracy.** On accuracy the tracker wins outright (43.6 vs 68.6
+  steps). What it loses on is never having a reason to move: it freezes
+  half the time. The belief map always hands back *a* heading, so its
+  blues keep moving, and a UAV in motion eventually blunders into a red
+  while a stationary one only finds what walks into its radar. That is
+  the whole 0.13/3. It is a duller mechanism than "the belief map knows
+  where to search", which is what the first version of §9.4 claimed.
+* **Neither observation carries a search signal — retracting the claim
+  that this one does.** §7.4 said the §7 tie was not evidence for region
+  nodes; the first version of this section said removing the policy
+  *made* it evidence, on the reading that the belief arm had coverage
+  and the tracker did not. §9.3's staleness measurement kills that: the
+  belief fallback points at staleness-0 cells, i.e. ground being swept
+  right now. So the position is **neither arm has a where-should-I-look
+  signal** — one is blind and the other chases its own clutter. That is
+  a stronger reason to wire region / staleness nodes
+  (`docs/search_design.md`) than the one withdrawn, because it applies
+  to both arms rather than closing a gap between them.
 * **The §7 tie now has an explanation.** Two observations that differ by
   0.13/3 for a greedy rule produced policies differing by 0.011 — further
   evidence that at 1.15/3 neither policy is limited by its input.
+* **`ObsGreedy` is not yet a same-information expert for a searching
+  policy.** Its rule bottoms out at "hold position", which is only the
+  honest action while the observation offers nothing better. The moment
+  region nodes enter the policy's observation, an expert that ignores
+  them stops being the same-information baseline this section rests on
+  and becomes a handicapped one. The fallback has to become "go to the
+  stalest searchable region" in the same commit that wires them.
 * **Scope.** `n_obstacles 0`, so only the red half of the tracker path is
   exercised; and `ObsGreedy` ignores velocity, bearing and teammates, so
   this measures what the *enemy graph* supports for a memoryless
@@ -1158,6 +1204,23 @@ and is three edits:
 | `R×R` region nodes `[staleness, searchable]` + weighted region→blue edges | `pursuit_env.py:2247`, `:2302` | implemented |
 | coverage path in the encoder (`n_region`, `region_feat_dim=2`, gb messages) | `gnn_stage4_policy.py:202` | implemented |
 | tests | `test_staleness.py`, `test_region_nodes.py`, `test_region_graph.py` | 60 passing |
+
+**One leak to close before wiring it.** `_build_region_nodes`'s
+`searchable` feature is computed from `_obstacle_grid`, which is built
+from the **true** obstacle positions and radii (`pursuit_env.py:1824`) —
+it is the ground-truth occupancy the CTDE critic is allowed to see. At
+`n_obstacles 0` it is 1.0 everywhere and harmless, which is why it can
+be wired now; the moment obstacles return it would hand the tracker arm
+a true obstacle map and become the **sixth** entry in
+`docs/tracker_observation.md`'s leak table, of exactly the kind the
+tracker path exists to remove. `searchable` has to come from the
+obstacle belief channel in belief mode and the obstacle tracker in
+tracker mode.
+
+The `staleness` feature itself is clean: it is derived from the blues'
+own positions and sensor geometry, so it is self-knowledge, not
+knowledge of the enemy. A real C2 layer knows where its own sensors have
+swept.
 
 Not connected: `structured_belief_observation()` emits no
 `region_feats` / `gb_edge_feats` / `gb_weight`; `GNNStage4Policy` builds
