@@ -68,6 +68,10 @@ def load_policy(
             n_msg_rounds      = int(args.get("n_msg_rounds", 2)),
             init_log_std      = STAGE4_DEFAULTS["init_log_std"],
             use_hidden_in_gnn = bool(args.get("share_hidden_via_gnn", True)),
+            # Pre-feature default 0: a checkpoint written before the
+            # coverage path existed rebuilds without it, as it trained.
+            n_region          = (int(args.get("staleness_regions", 5)) ** 2
+                                 if args.get("use_staleness", False) else 0),
             **_actor_sizing(args),
         ).to(device)
     else:
@@ -181,6 +185,10 @@ def env_kwargs_from_checkpoint(train_args: dict) -> dict:
         clutter_rate             = g("clutter_rate", 0.0),
         obstacle_radius_noise_std= g("obstacle_radius_noise_std", 0.0),
         actor_obs                = g("actor_obs", "belief"),
+        # Coverage path.  Off by default so a pre-feature checkpoint
+        # evaluates in the regime it trained in.
+        use_staleness            = g("use_staleness", False),
+        staleness_regions        = g("staleness_regions", 5),
     )
     if kw["actor_obs"] == "tracker":
         kw.update(

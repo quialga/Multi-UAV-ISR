@@ -181,3 +181,106 @@ def test_runs_in_tracker_mode_too():
 
     assert a is not None and np.isfinite(a).all()
     assert a[0] > 0.5, f"confirmed track east of blue_0 should pull east, {a}"
+
+
+# ===========================================================================
+#  Third tier: search.  Holding position is only honest while the
+#  observation offers nothing better; once it carries region nodes, an
+#  expert that ignores them is no longer a same-information baseline.
+# ===========================================================================
+
+def _search_env(mode="tracker", seed=0, **kw):
+    cfg = dict(BASE, actor_obs=mode, use_belief_maps=(mode == "belief"),
+               use_staleness=True, staleness_regions=5, seed=seed)
+    cfg.update(kw)
+    e = PursuitEnv(**cfg)
+    e.reset(seed=seed)
+    return e
+
+
+def test_search_replaces_holding_position_when_regions_are_available():
+    """The regression this tier exists for: with nothing trackable, the
+    old rule returned a zero action."""
+    env = _search_env()
+    _place(env, [[0.0, 0.0], [5.0, 0.0]], [[125.0, 125.0], [125.0, 120.0]])
+    a = ObservationGreedyPursuer().act(None, env, env.possible_agents[0])
+    assert not np.allclose(a, 0.0), "should go looking, not sit still"
+    assert abs(np.linalg.norm(a) - 1.0) < 1e-5, a
+
+
+def test_still_holds_position_when_there_is_no_coverage_path():
+    """Without region nodes there is genuinely nothing to act on, and the
+    honest action is still to hold — this must not become random motion."""
+    env = _env(mode="tracker")
+    _place(env, [[0.0, 0.0], [5.0, 0.0]], [[125.0, 125.0], [125.0, 120.0]])
+    a = ObservationGreedyPursuer().act(None, env, env.possible_agents[0])
+    assert np.allclose(a, 0.0), a
+
+
+def test_search_prefers_the_staler_region():
+    env = _search_env()
+    _place(env, [[65.0, 65.0], [60.0, 60.0]], [[125.0, 125.0], [125.0, 120.0]])
+    # Everything freshly swept except one corner region, which is ancient.
+    env._staleness[:] = 0
+    env._staleness[0:5, 0:5] = env.max_steps          # region 0 = low corner
+    a = ObservationGreedyPursuer().act(None, env, env.possible_agents[0])
+    assert a[0] < -0.3 and a[1] < -0.3, (
+        f"should head for the stale low corner from the centre, got {a}")
+
+
+def test_distance_discounts_staleness():
+    """The reason the rule is not a plain staleness argmax: that would
+    send a blue across the whole arena for an older region when a nearly
+    as stale one is under its nose.
+
+    Set up so the two criteria DISAGREE — the far region is strictly
+    staler, so staleness alone would pick it — and check the discount
+    decides."""
+    env = _search_env()
+    _place(env, [[15.0, 15.0], [60.0, 60.0]], [[125.0, 125.0], [125.0, 120.0]])
+    env._staleness[:] = 0
+    env._staleness[0:5, 0:5] = int(0.60 * env.max_steps)    # near, 3 m away
+    env._staleness[20:26, 20:26] = env.max_steps            # far, stalest
+
+    feats, centres = env._build_region_nodes()
+    near, far = 0, feats.shape[0] - 1
+    assert feats[far, 0] > feats[near, 0], "test setup: far must be staler"
+
+    a = ObservationGreedyPursuer().act(None, env, env.possible_agents[0])
+    # Near region centre (12.5, 12.5) is down-left of a blue at (15, 15);
+    # the far one (~115, 115) is up-right.  Opposite quadrants, so the
+    # choice is unambiguous.
+    assert a[0] < -0.3 and a[1] < -0.3, (
+        f"staleness alone would cross the arena; the near region should "
+        f"win once distance discounts it, got {a}")
+
+
+def test_a_target_always_outranks_searching():
+    """Search is the LAST tier: a visible track must still win."""
+    env = _search_env()
+    _place(env, [[0.0, 0.0], [60.0, 60.0]], [[20.0, 0.0], [-60.0, -60.0]])
+    env._staleness[:] = env.max_steps
+    agent = ObservationGreedyPursuer()
+    a = None
+    for _ in range(6):
+        env.step({x: np.zeros(2, dtype=np.float32) for x in env.agents})
+        _place(env, [[0.0, 0.0], [60.0, 60.0]], [[20.0, 0.0], [-60.0, -60.0]])
+        a = agent.act(None, env, env.possible_agents[0])
+    assert a[0] > 0.5, f"confirmed track east must beat any region, {a}"
+
+
+def test_solid_rock_is_never_searched():
+    """searchable = 0 zeroes the score, so a fully blocked region cannot
+    be chosen however stale it reads."""
+    env = _search_env(mode="belief", n_obstacles=1, use_belief_maps=True)
+    _place(env, [[65.0, 65.0], [60.0, 60.0]], [[125.0, 125.0], [125.0, 120.0]],
+           wipe_belief=False)
+    env._staleness[:] = 0
+    env._staleness[0:5, 0:5] = env.max_steps
+    env._belief_maps[1][:] = -10.0
+    env._belief_maps[1][0:5, 0:5] = +10.0      # that stale region is rock
+    feats, _ = env._build_region_nodes()
+    assert feats[0, 1] == 0.0 and feats[0, 0] == 0.0
+    a = ObservationGreedyPursuer().act(None, env, env.possible_agents[0])
+    assert not (a[0] < -0.3 and a[1] < -0.3), (
+        f"steered into solid rock, got {a}")

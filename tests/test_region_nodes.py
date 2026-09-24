@@ -149,14 +149,26 @@ def test_searchable_is_one_with_no_obstacles():
     assert np.allclose(feats[:, 1], 1.0)
 
 
+def _believe_obstacle(e, cx0, cx1, cy0, cy1):
+    """Make the team BELIEVE those cells are blocked.
+
+    Region nodes feed the actor, so ``searchable`` is sourced from the
+    obstacle estimate, never from ``_obstacle_grid`` (which is built from
+    true positions and radii and belongs to the CTDE critic).  Driving the
+    truth grid therefore no longer moves the feature — and these tests
+    used to do exactly that, which is to say they pinned the leak.
+    """
+    e._belief_maps[1][:] = -10.0
+    e._belief_maps[1][cx0:cx1, cy0:cy1] = +10.0
+    return e._estimated_obstacle_mask()
+
+
 def test_searchable_counts_only_cells_outside_obstacles():
-    e = _env(n_obstacles=1, staleness_regions=5)
-    e._obstacle_pos = np.array([[13.0, 13.0]], dtype=np.float32)
-    e._obstacle_r = np.array([14.0], dtype=np.float32)
-    e._recompute_obstacle_grid()
+    e = _env(n_obstacles=1, staleness_regions=5, use_belief_maps=True)
+    blocked = _believe_obstacle(e, 0, 6, 0, 6)
     feats, _ = e._build_region_nodes()
     bounds = e._region_bounds()
-    free = e._obstacle_grid <= 0.5
+    free = ~blocked
     k = 0
     for x0, x1 in bounds:
         for y0, y1 in bounds:
@@ -169,32 +181,50 @@ def test_searchable_counts_only_cells_outside_obstacles():
 def test_staleness_averages_only_over_searchable_cells():
     """Obstacle interiors cannot hide a target, so averaging them in would
     dilute the very signal the feature exists to carry."""
-    e = _env(n_obstacles=1, staleness_regions=5)
-    e._obstacle_pos = np.array([[13.0, 13.0]], dtype=np.float32)
-    e._obstacle_r = np.array([14.0], dtype=np.float32)
-    e._recompute_obstacle_grid()
-    free = e._obstacle_grid <= 0.5
+    e = _env(n_obstacles=1, staleness_regions=5, use_belief_maps=True)
+    free = ~_believe_obstacle(e, 0, 6, 0, 6)
     # Rock reads as freshly seen, open ground as never seen.  A naive mean
     # over ALL cells would be pulled down; the correct one stays at 1.0.
     e._staleness[:] = e.max_steps
     e._staleness[~free] = 0
     feats, _ = e._build_region_nodes()
-    blocked = feats[:, 1] < 1.0
-    assert blocked.any(), "test set up no partially blocked region"
-    assert np.allclose(feats[blocked, 0], 1.0), (
+    # PARTIALLY blocked only: a fully blocked region reports staleness 0 by
+    # design (nothing to find there), which the next test pins.
+    partial = (feats[:, 1] > 0.0) & (feats[:, 1] < 1.0)
+    assert partial.any(), "test set up no partially blocked region"
+    assert np.allclose(feats[partial, 0], 1.0), (
         "obstacle interiors leaked into the staleness mean")
 
 
 def test_a_fully_blocked_region_reports_zero_staleness():
     """Nothing to find there, so sweeping it gains nothing -- reporting
     max would send the policy to search solid rock."""
-    e = _env(n_obstacles=1, staleness_regions=2)
-    e._obstacle_grid = np.zeros_like(e._obstacle_grid)
-    e._obstacle_grid[0:13, 0:13] = 1.0          # region 0 entirely blocked
+    e = _env(n_obstacles=1, staleness_regions=2, use_belief_maps=True)
+    _believe_obstacle(e, 0, 13, 0, 13)          # region 0 entirely blocked
     e._staleness[:] = e.max_steps
     feats, _ = e._build_region_nodes()
     assert feats[0, 1] == 0.0
     assert feats[0, 0] == 0.0
+
+
+def test_searchable_reads_the_estimate_not_the_true_obstacle_grid():
+    """The leak this file used to pin.  Region nodes reach the ACTOR, so a
+    `searchable` sourced from `_obstacle_grid` would hand the tracker arm
+    a true obstacle map — the sixth entry in the leak table of
+    docs/tracker_observation.md.  Moving truth alone must change nothing.
+    """
+    e = _env(n_obstacles=1, staleness_regions=2, use_belief_maps=True)
+    e._belief_maps[1][:] = -10.0                # believed entirely open
+    before, _ = e._build_region_nodes()
+
+    e._obstacle_pos = np.array([[13.0, 13.0]], dtype=np.float32)
+    e._obstacle_r = np.array([40.0], dtype=np.float32)
+    e._recompute_obstacle_grid()
+    assert e._obstacle_grid.any(), "test failed to place a true obstacle"
+
+    after, _ = e._build_region_nodes()
+    assert np.allclose(before, after), (
+        "the true obstacle grid leaked into the actor's region features")
 
 
 # --------------------------------------------------------------------- #

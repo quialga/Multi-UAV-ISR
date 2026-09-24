@@ -152,6 +152,18 @@ def _parse_args() -> argparse.Namespace:
                    default=d["obstacle_radius_noise_std"],
                    help="Obstacle radius measurement noise (m, range-scaled) "
                         "in raw_obstacle_detections() (tracker path only).")
+    p.add_argument("--use-staleness", action="store_true",
+                   help="maintain the staleness field and give the ACTOR "
+                        "R*R region nodes [staleness, searchable] -- the "
+                        "where-have-we-not-looked signal NEITHER observation "
+                        "carries today (docs/stage4_results.md 9.3: the "
+                        "belief map's own fallback peak lands on cells being "
+                        "swept right now, so it is clutter, not search).")
+    p.add_argument("--staleness-regions", type=int, default=5,
+                   help="R: the staleness field is aggregated to R x R "
+                        "region nodes.  At sensor_radius 40 in a 130 m "
+                        "arena, R=5 gives 26 m regions a blue sweeps from "
+                        "their centre.")
     p.add_argument("--actor-obs", choices=("belief", "tracker"),
                    default=d["actor_obs"],
                    help="Source of the ACTOR's red and obstacle nodes: the "
@@ -506,6 +518,8 @@ def main() -> None:
         clearance_margin        = args.clearance_margin,
         clearance_ally_weight   = args.clearance_ally_weight,
         clearance_ally_margin   = args.clearance_ally_margin,
+        use_staleness           = args.use_staleness,
+        staleness_regions       = args.staleness_regions,
     )
 
     # Red policy mix parsing.
@@ -594,6 +608,9 @@ def main() -> None:
         n_msg_rounds      = args.n_msg_rounds,
         init_log_std      = STAGE4_DEFAULTS.get("init_log_std", 0.0),
         use_hidden_in_gnn = args.share_hidden_via_gnn,
+        # Coverage path, actor only; 0 leaves the policy as it was.
+        n_region          = (args.staleness_regions ** 2
+                             if args.use_staleness else 0),
     ).to(device)
     n_params = sum(p.numel() for p in policy.parameters())
     log(f"Policy: GNNStage4Policy (v6) d_hidden={args.d_hidden} "

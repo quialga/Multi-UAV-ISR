@@ -2244,6 +2244,46 @@ class PursuitEnv(ParallelEnv):
         edges = [(i * W) // R for i in range(R + 1)]
         return [(edges[i], edges[i + 1]) for i in range(R)]
 
+    def _estimated_obstacle_mask(self) -> np.ndarray:
+        """(W, H) bool: cells the team BELIEVES are blocked.
+
+        Deliberately not ``_obstacle_grid``, which is built from the true
+        obstacle positions and radii (``_recompute_obstacle_grid``) and is
+        the ground-truth occupancy the CTDE critic is allowed to read.
+        Region nodes go to the ACTOR, so sourcing ``searchable`` from truth
+        would hand the tracker arm a true obstacle map -- a sixth entry in
+        ``docs/tracker_observation.md``'s leak table, of exactly the kind
+        the tracker path exists to remove.  At ``n_obstacles 0`` every
+        source agrees on "all free", which is why the coverage path could
+        be wired before this mattered; it matters the moment obstacles
+        return.
+
+        Belief mode reads the obstacle belief channel; tracker mode
+        rasterises the obstacle tracker's CONFIRMED tracks, radius
+        estimate included.
+        """
+        g = self.belief_grid_size
+        blocked = np.zeros((g, g), dtype=bool)
+        if self.n_obstacles == 0:
+            return blocked
+
+        if self.actor_obs == "tracker":
+            tracker = getattr(self, "_obstacle_tracker", None)
+            if tracker is None:
+                return blocked
+            for tr in tracker.tracks:
+                if not getattr(tr, "confirmed", False):
+                    continue
+                r = float(getattr(tr, "radius", 0.0))
+                d = np.linalg.norm(self._cell_centres_flat - np.asarray(
+                    tr.pos, dtype=np.float32)[None, :], axis=1)
+                blocked |= (d <= r).reshape(g, g)
+            return blocked
+
+        if self._belief_maps is not None and self.belief_channels > 1:
+            blocked = (self._belief_maps[1] > 0.0)      # log-odds > 0 => p > 0.5
+        return blocked
+
     def _build_region_nodes(self) -> Tuple[np.ndarray, np.ndarray]:
         """Aggregate the staleness field into R x R REGION nodes.
 
@@ -2282,9 +2322,7 @@ class PursuitEnv(ParallelEnv):
         if self._staleness is None:
             return feats, centres
 
-        obst = getattr(self, "_obstacle_grid", None)
-        free = (obst <= 0.5) if obst is not None else np.ones_like(
-            self._staleness, dtype=bool)
+        free = ~self._estimated_obstacle_mask()
 
         k = 0
         for x0, x1 in bounds:
@@ -3349,6 +3387,20 @@ class PursuitEnv(ParallelEnv):
             true_ob_node, true_ob_edge = self._true_obstacle_graph()
             out["true_obstacle_features"] = true_ob_node
             out["true_ob_edge_features"]  = true_ob_edge
+
+        # ---- Coverage graph (only when staleness is enabled) -------------
+        # ACTOR ONLY.  The enemy graph answers "where is the target"; these
+        # answer "where have we not looked", which neither the belief peaks
+        # nor the tracker's confirmed tracks carry (see
+        # docs/stage4_results.md §9.3: the belief map's own argmax lands on
+        # cells being swept RIGHT NOW, so its fallback is clutter, not
+        # search).  The critic is deliberately not given them -- it already
+        # reads true_occupancy.
+        if self.use_staleness:
+            region_feats, gb_edge_feats, gb_weight = self._build_region_graph()
+            out["region_feats"]   = region_feats
+            out["gb_edge_feats"]  = gb_edge_feats
+            out["gb_weight"]      = gb_weight
 
         # ---- Diagnostics (telemetry; NOT fed to the policy) --------------
         if self._belief_maps is not None:

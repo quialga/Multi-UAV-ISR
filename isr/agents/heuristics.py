@@ -221,7 +221,7 @@ class ObservationGreedyPursuer(HeuristicBlueAgent):
         dst  = np.arange(vis.shape[0]) % n_blue
         mine = np.nonzero((dst == my_idx) & (vis > 0.0))[0]
         if mine.size == 0:
-            return np.zeros(2, dtype=np.float32)
+            return self._search(obs, my_idx, n_blue)
 
         # Live before remembered: keep only the most confident slots this
         # blue has, then take the nearest of those.
@@ -232,11 +232,66 @@ class ObservationGreedyPursuer(HeuristicBlueAgent):
         # rel_pos = dst - src.  These edges run red -> blue, so rel_pos is
         # (blue - red) and the heading toward the target is its negation.
         best    = int(mine[int(np.argmin(feats[mine, 4]))])
-        toward  = -feats[best, 0:2]
-        norm    = float(np.linalg.norm(toward))
+        return self._heading(feats[best, 0:2])
+
+    @staticmethod
+    def _heading(rel_pos) -> np.ndarray:
+        """Unit step toward a target given ``rel_pos = dst - src``.
+
+        These edges run target -> blue, so rel_pos is (blue - target) and
+        the heading is its negation.  Getting the sign backwards flees the
+        target and still produces a plausible unit vector, which is why
+        ``test_observation_greedy.py`` opens on it.
+        """
+        toward = -np.asarray(rel_pos, dtype=np.float32)
+        norm   = float(np.linalg.norm(toward))
         if norm < 1e-8:
             return np.zeros(2, dtype=np.float32)
         return (toward / norm).astype(np.float32)
+
+    def _search(self, obs, my_idx: int, n_blue: int) -> np.ndarray:
+        """Nothing on the enemy graph: go look somewhere.
+
+        Holding position is only the honest action while the observation
+        offers nothing better, and it is expensive — measured, `ObsGreedy`
+        on the tracker observation is idle 49.9% of agent-steps and 85.7%
+        of them in the episodes it loses (docs/stage4_results.md §9.3).
+
+        When the observation carries the coverage path, head for the
+        region maximising
+
+            staleness x searchable / (1 + range)
+
+        ``range`` (edge feature 4) is already normalised by ``arena_size``,
+        so this is the ``staleness / (1 + d/L)`` trade agreed for the rule:
+        a plain staleness argmax sends a blue across the whole arena for a
+        marginally older cell.  ``searchable`` zeroes regions that are
+        solid rock, matching the weighting ``_build_region_graph`` uses.
+
+        Deliberately UNCOORDINATED, like every other tier: five blues may
+        pick the same region, and the distance term is the only thing
+        spreading them.  Dividing the arena between them is a job for the
+        learned policy — the moment this baseline coordinates it stops
+        being the trivial rule that makes it a credible bar.
+        """
+        region = obs.get("region_feats") if hasattr(obs, "get") else None
+        gb     = obs.get("gb_edge_feats") if hasattr(obs, "get") else None
+        if region is None or gb is None:
+            return np.zeros(2, dtype=np.float32)
+
+        region = np.asarray(region)          # (R*R, 2) [staleness, searchable]
+        gb     = np.asarray(gb)              # (R*R*n_blue, 7)
+        if region.size == 0 or gb.size == 0:
+            return np.zeros(2, dtype=np.float32)
+
+        # Same ordering as the enemy edges: "for s in regions, for b in
+        # blues", so edge e runs region e // n_blue -> blue e % n_blue.
+        mine  = np.arange(my_idx, gb.shape[0], n_blue)
+        rng   = gb[mine, 4]
+        score = region[:, 0] * region[:, 1] / (1.0 + rng)
+        if not np.any(score > 0.0):
+            return np.zeros(2, dtype=np.float32)
+        return self._heading(gb[mine[int(np.argmax(score))], 0:2])
 
 
 # ===========================================================================

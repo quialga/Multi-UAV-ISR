@@ -71,6 +71,10 @@ _ACTOR_KEYS = (
     "blue_features", "bb_edge_features", "bb_edge_visible",
     "red_features", "rb_edge_features", "rb_edge_visible",
     "obstacle_features", "ob_edge_features", "ob_edge_visible",
+    # Coverage path (only present when the env runs with use_staleness).
+    # Actor-only by design: the critic already sees true_occupancy, so
+    # "where have we looked" tells it nothing it does not have.
+    "region_feats", "gb_edge_feats", "gb_weight",
 )
 # Critic: shared precise keys + true_* remapped to the plain names the
 # GNNEncoder expects.
@@ -390,6 +394,13 @@ class GNNStage4Policy(nn.Module):
         actor_n_obs:        Optional[int] = None,
         actor_red_feat_dim: Optional[int] = None,
         actor_obs_feat_dim: Optional[int] = None,
+        # Coverage path: R*R region nodes carrying [staleness, searchable].
+        # ACTOR ONLY, and 0 disables it (the default, which leaves the
+        # policy byte-identical to before).  The critic is not given them
+        # on purpose: it already consumes true_occupancy, so "where have we
+        # looked" is not news to it, and adding nodes there would change
+        # the CTDE baseline for no information gain.
+        n_region:           int = 0,
     ) -> None:
         super().__init__()
         self.n_blue            = n_blue
@@ -397,6 +408,7 @@ class GNNStage4Policy(nn.Module):
         self.n_obs             = n_obs
         self.actor_n_red = n_red if actor_n_red is None else int(actor_n_red)
         self.actor_n_obs = n_obs if actor_n_obs is None else int(actor_n_obs)
+        self.n_region    = int(n_region)
         if (self.actor_n_obs > 0) != (n_obs > 0):
             raise ValueError("actor and critic must agree on whether "
                              "obstacles exist")
@@ -421,6 +433,7 @@ class GNNStage4Policy(nn.Module):
             edge_feat_dim = edge_feat_dim,
             d_hidden      = d_hidden,
             n_msg_rounds  = n_msg_rounds,
+            n_region      = self.n_region,
         )
         self.actor_gru  = nn.GRUCell(input_size=d_hidden, hidden_size=d_hidden)
         self.actor_mean = _layer_init(nn.Linear(d_hidden, action_dim), std=0.01)
@@ -485,6 +498,11 @@ class GNNStage4Policy(nn.Module):
             bb_visible    = partial_obs["bb_edge_visible"],
             rb_visible    = partial_obs["rb_edge_visible"],
             ob_visible    = ob_visible,
+            # Absent unless the env runs with use_staleness; the encoder
+            # disables the coverage path when either side is missing.
+            region_feats  = partial_obs.get("region_feats"),
+            gb_edge_feats = partial_obs.get("gb_edge_feats"),
+            gb_weight     = partial_obs.get("gb_weight"),
         )
 
     def actor_forward(
