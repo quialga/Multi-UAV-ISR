@@ -1234,3 +1234,88 @@ nodes, and `ObsGreedy` would not read them anyway, so §9.2 is a
 comparison of the **enemy graph alone**. The coverage difference it
 measures is the one living *inside* that graph — `enemy_belief_decay
 0.9935` giving memory peaks the tracker has no equivalent for.
+
+---
+
+### 10. Wiring the coverage path closes the belief/tracker gap entirely (MEASURED, 2026-09-24) · `feature/target-tracking`
+
+§9.3 found that **neither** observation carries a where-have-we-not-looked
+signal: the tracker is blind without a confirmed track, and the belief
+map's fallback peak lands on cells being swept right now, so it chases
+its own clutter. §9.5 recorded that the field, the region nodes and the
+encoder path all existed, fully tested, connected by nothing. This wires
+them.
+
+#### 10.1 What was connected
+
+`structured_belief_observation()` emits `region_feats` / `gb_edge_feats` /
+`gb_weight` under `--use-staleness`; `split_stage4_obs` routes them to the
+actor; `GNNStage4Policy` takes `n_region` (0 = off, and the policy stays
+byte-identical); `train_stage4.py` gains `--use-staleness` /
+`--staleness-regions`. At R=5 that is 25 region nodes and +9 024
+parameters (136 965 → 145 989).
+
+**Actor only.** The critic already reads `true_occupancy`, so "where have
+we looked" is not news to it, and adding nodes there would move the CTDE
+baseline for no information gain.
+
+**`ObsGreedy` had to grow the same tier**, or it would have stopped being
+a same-information baseline the moment the policy could see regions. With
+nothing on the enemy graph it now heads for the region maximising
+`staleness × searchable / (1 + range)` (`range` is already normalised by
+`arena_size`). Distance-discounted, because a plain staleness argmax
+crosses the arena for a marginally older region; and **uncoordinated**,
+like its other tiers — splitting the arena between five blues is the
+learned policy's job, and a baseline that coordinates is no longer the
+trivial rule that makes it a credible bar.
+
+**A leak closed on the way.** `searchable` was computed from
+`_obstacle_grid` — the *true* occupancy the CTDE critic may read. Harmless
+at `n_obstacles 0`, but these nodes go to the **actor**, so once obstacles
+return it would have handed the tracker arm a true obstacle map: a sixth
+entry in `docs/tracker_observation.md`'s leak table, of exactly the kind
+the tracker path exists to remove. It now reads the obstacle belief
+channel in belief mode and the obstacle tracker in tracker mode. Three
+tests were pinning the leaky behaviour by driving the truth grid; they now
+drive the estimate, and a new one asserts that moving truth alone changes
+nothing.
+
+#### 10.2 The gap was the paralysis, and it is gone
+
+50 matched-seed episodes per cell, same geometry as §9:
+
+| ObsGreedy on | Stationary | Random | RunFromNearest | **mean /3** |
+|---|---|---|---|---|
+| belief | 3.00 (68.6 steps) | 3.00 (64.6) | 2.74 (125.2) | **2.913** |
+| tracker | 2.98 (**47.3**) | 3.00 (**49.5**) | 2.72 (**107.1**) | **2.900** |
+
+**−0.013, against §9.2's −0.133.** The belief map's entire advantage was
+the tracker arm freezing; give both a principled search fallback and it
+vanishes. On the stationary red alone the tracker expert goes from 58.4%
+of agent-steps idle at 2.80/3 to **0.0% idle at 2.95/3**.
+
+The belief row is unchanged to the digit, including step counts — the
+control that says region nodes did nothing there. Correct: its enemy
+graph always offers a memory peak, so the search tier never fires.
+
+#### 10.3 What this establishes
+
+* **On captures the two observations are now equivalent**, and the
+  tracker gets there **14–31% faster** (47.3 vs 68.6 steps on
+  `Stationary`, 49.5 vs 64.6 on `Random`, 107.1 vs 125.2 on `run`) —
+  §7.3's metre-accurate tracks finally showing up in behaviour instead of
+  being spent recovering from paralysis.
+* **And it does so having given up all five privileged leaks.** Equal
+  captures, better efficiency, less information: on this evidence the
+  tracker is the path to build on, not the fallback.
+* **§9.2's 0.133 is explained and retired.** It measured a missing
+  search rule, not a difference between representations.
+* **The clone target follows.** The expert to imitate is `ObsGreedy` on
+  the **tracker** observation — it is the one a fielded system could
+  actually run. The acceptance bar is its own **2.900**, not the belief
+  arm's 2.913 (which is reached with privileged information) and not
+  §9.2's 2.780 (which was reached while idle half the time).
+* **Scope, unchanged.** `n_obstacles 0`, so the obstacle half of the
+  tracker path is still inert, and `searchable` is still trivially 1.0
+  everywhere — the leak fix above is untested against real obstacles
+  because there are none to test against yet.
