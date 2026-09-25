@@ -708,7 +708,27 @@ worth doing).  Recommend starting with a `z_enabled=False` default
 that collapses to the current 2D arena, so existing checkpoints and
 tests stay valid.
 
-## 15. Learned trajectory prediction (belief-kernel / aux head)
+## 15. Learned trajectory prediction (belief-kernel / aux head) — ⚠️ BUILT, NEVER USED
+
+> **Status 2026-09-25.**  `isr/agents/learned_red_motion.py` exists,
+> four checkpoints are trained (`runs/red_motion/model_v{,2,3,4}.pt`),
+> and `--red-motion-ckpt` is threaded through the env, the config
+> defaults and `policy_loader.env_kwargs_from_checkpoint`.  So this is
+> not a proposal any more — it is an unused feature.
+>
+> **Every result in `stage4_results.md` §7–§12 ran CONSTANT VELOCITY**
+> (`red_motion_ckpt=None`), including the tracker arm, the clone and both
+> PPO runs.  That matters for how they read: `run_from_nearest_uav` is a
+> REACTIVE evader that turns whenever the nearest blue moves, so the CV
+> assumption is systematically wrong for exactly the hardest red.  What
+> saves it is calibration rather than accuracy — §7.3 measured `nees`
+> 3.8–5.5 against its 4.0 target, so the filter inflates covariance
+> honestly instead of being confidently wrong.
+>
+> Switching it on is a one-flag experiment and has never been run.  It is
+> the obvious lever on the `run` column, and §21.3 notes the model would
+> want re-collecting at a new speed distribution before being used at
+> red 1.4.
 
 **Motivation.**  The current belief-map diffusion uses a fixed
 isotropic 3×3 kernel (`enemy_belief_diffusion=0.2`) — effectively
@@ -952,7 +972,19 @@ degradation, not a regression.
 **Blocking**: none — ~15 lines in `_measured_vel` plus threading the
 line-of-sight vector through the two graph builders.
 
-## 18. Track continuity / coasting on a missed detection
+## 18. Track continuity / coasting on a missed detection — ✅ LANDED
+
+> **Status 2026-09-25: built, and the actor is shown it.**  This section
+> reads as a proposal; it describes the tracker that now exists.
+> `isr/tracking/tracker.py` coasts on a miss, inflates covariance on
+> every predict, and drops a track by M-of-N (`max_misses=3`,
+> `max_coast_steps=80`, `reacquire_after=4` — `isr/tracking/actor_graph.py`).
+> The actor sees the age directly: `red_slots` exposes
+> `min(steps_since_hit / max_coast_steps, 1.0)` as a red node feature.
+> Health was measured in `stage4_results.md` §7.3 — `nees` 3.8–5.5
+> against a 4.0 target, `trk` 2.2–5.0 m — and §12's runs sit at
+> `trk` 4.8 m with red at 1.4.  Kept in full below because the reasoning
+> for coasting-over-shortcuts is the rationale for the design.
 
 **Motivation.**  Now that live tracks obey the real detection chain
 (`track_detection`, see `stage4_results.md` §4b), a target is missed on
