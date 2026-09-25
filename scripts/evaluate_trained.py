@@ -36,7 +36,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from isr.agents.heuristics import (
-    GreedyPursuer, HeuristicBlueAgent, ObservationGreedyPursuer, RandomAgent,
+    AssignmentGreedyPursuer, GreedyPursuer, HeuristicBlueAgent,
+    ObservationGreedyPursuer, RandomAgent,
     run_from_nearest_uav, stationary_red, random_red,
 )
 from isr.agents.policy_loader import (
@@ -309,6 +310,9 @@ def main() -> None:
         # comparison that isolates policy quality from the information gap.
         "Greedy":  lambda: GreedyPursuer(),
         "ObsGreedy": lambda: ObservationGreedyPursuer(),
+        # Same observation as ObsGreedy, but the team assigns targets:
+        # the coordination upper bound the policy is measured against.
+        "AssignGreedy": lambda: AssignmentGreedyPursuer(),
         # ``build_trained_agent`` picks the right adapter (Stage 1/2
         # adapter) from the loaded policy's class.
         "Trained": lambda: build_trained_agent(

@@ -49,8 +49,8 @@ import numpy as np                                               # noqa: E402
 
 import scripts.train_stage4 as train_stage4                      # noqa: E402
 from isr.agents.heuristics import (                              # noqa: E402
-    GreedyPursuer, ObservationGreedyPursuer, RandomAgent,
-    run_from_nearest_uav,
+    AssignmentGreedyPursuer, GreedyPursuer, ObservationGreedyPursuer,
+    RandomAgent, run_from_nearest_uav,
 )
 from isr.agents.policy_loader import env_kwargs_from_checkpoint  # noqa: E402
 from scripts.evaluate_trained import run_episode                 # noqa: E402
@@ -84,6 +84,10 @@ def main() -> None:
         "Random":    lambda: RandomAgent(seed=0),
         "Greedy":    lambda: GreedyPursuer(),
         "ObsGreedy": lambda: ObservationGreedyPursuer(),
+        # The upper bound: same rule, same observation, but the team
+        # divides the targets.  What it beats ObsGreedy by IS the value
+        # of coordination at that speed.
+        "AssignGreedy": lambda: AssignmentGreedyPursuer(),
     }
 
     print(f"blue v_max {BLUE_V_MAX}, red = run_from_nearest_uav, "
@@ -118,14 +122,23 @@ def main() -> None:
         print(f"{v:9.2f}  {BLUE_V_MAX - v:8.2f}  {cells}")
         out[f"{v:.2f}"] = row
 
-    # The headline: how much a coordination-free rule leaves on the table.
-    print(f"\n{'red v_max':>9}  {'ObsGreedy':>10}  {'vs Greedy':>10}  "
-          f"{'vs 3.00':>9}")
+    # The headline: what coordination is WORTH at each speed.  Deliberately
+    # not "vs 3.00" -- that assumes 3.00 is reachable at every speed, which
+    # is exactly what is not known, and at red 1.5 it is almost certainly
+    # not.  AssignGreedy minus ObsGreedy is a measured bound instead of an
+    # assumed one: two rules identical but for the assignment.
+    print(f"\n{'red v_max':>9}  {'ObsGreedy':>10}  {'AssignGreedy':>13}  "
+          f"{'coordination':>13}")
     for v in args.speeds:
         r = out[f"{v:.2f}"]
         og = r["ObsGreedy"]["mean_caught"]
-        print(f"{v:9.2f}  {og:10.2f}  "
-              f"{og - r['Greedy']['mean_caught']:+10.2f}  {og - 3.0:+9.2f}")
+        ag = r["AssignGreedy"]["mean_caught"]
+        se = float(np.hypot(r["ObsGreedy"]["se_caught"],
+                            r["AssignGreedy"]["se_caught"]))
+        flag = "  *" if abs(ag - og) > 2.0 * se else ""
+        print(f"{v:9.2f}  {og:10.2f}  {ag:13.2f}  "
+              f"{ag - og:+9.2f}+-{se:.2f}{flag}")
+    print("  * = beyond two standard errors")
 
     args.out_json.parent.mkdir(parents=True, exist_ok=True)
     args.out_json.write_text(json.dumps(

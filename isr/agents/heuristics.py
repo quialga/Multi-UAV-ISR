@@ -294,6 +294,101 @@ class ObservationGreedyPursuer(HeuristicBlueAgent):
         return self._heading(gb[mine[int(np.argmax(score))], 0:2])
 
 
+class AssignmentGreedyPursuer(ObservationGreedyPursuer):
+    """``ObsGreedy`` with exactly one thing added: the team ASSIGNS.
+
+    Why it exists.  `docs/stage4_results.md` measured that an
+    uncoordinated pure-pursuit rule scores 2.90/3 (§10) and that PPO
+    fine-tuning past it buys ~+0.20 on the evader by de-clustering the
+    team (§12).  Neither number says how much coordination is *available*
+    — the gap between "no coordination" and "the task's ceiling" was never
+    measured, only inferred.  This is the missing upper bound: the same
+    rule, the same observation, the same targets, differing **only** in
+    that blues divide the targets between them instead of each taking its
+    own nearest.  What it beats `ObsGreedy` by is what assignment alone is
+    worth, with no learning involved.
+
+    It consumes no more information than `ObsGreedy` does.  The track
+    positions in the enemy graph are the shared command-layer fusion, so
+    every (blue, slot) range is already present in the observation; the
+    assignment is arithmetic over numbers the actor is given, not new
+    knowledge.  What it does add is a **team-level decision**, which is
+    precisely the thing under test.
+
+    Rule: take the slots visible at the top confidence tier, give each a
+    capacity of ``ceil(n_blue / n_slots)`` so the load is balanced, and
+    greedily match the globally cheapest (blue, slot) pair until every
+    blue has one.  Greedy rather than Hungarian because the problem is
+    5x3 and the project has no scipy dependency; on this size the two
+    agree almost always, and where they differ the gap is far below the
+    effect being measured.  A blue left without a slot searches, exactly
+    as in the base class.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._assign = None
+
+    def reset(self) -> None:
+        super().reset()
+        self._assign = None
+
+    def act(self, obs, env, agent):
+        t = int(env._t)
+        if self._obs is None or env is not self._env or t != self._t:
+            self._obs = env.structured_belief_observation()
+            self._env = env
+            self._t   = t
+            self._assign = self._assign_team(self._obs, int(env.n_blue))
+
+        my_idx = env.possible_agents.index(agent)
+        edge = self._assign.get(my_idx)
+        if edge is None:
+            return self._search(self._obs, my_idx, int(env.n_blue))
+        return self._heading(
+            np.asarray(self._obs["rb_edge_features"])[edge, 0:2])
+
+    @staticmethod
+    def _assign_team(obs, n_blue: int) -> dict:
+        """blue index -> edge index, or absent when it should search."""
+        feats = np.asarray(obs["rb_edge_features"])
+        vis   = np.asarray(obs["rb_edge_visible"])
+        n_edge = vis.shape[0]
+        assert n_edge % n_blue == 0, (n_edge, n_blue)
+        n_slot = n_edge // n_blue
+
+        # A slot's confidence is the best any blue has on it, so the tier
+        # is decided for the TEAM.  ObsGreedy takes this per blue; here it
+        # has to be global or two blues could be working off different
+        # tiers and the assignment would not be one problem.
+        slot_conf = np.array([vis[s * n_blue:(s + 1) * n_blue].max()
+                              for s in range(n_slot)])
+        live = np.nonzero(slot_conf > 0.0)[0]
+        if live.size == 0:
+            return {}
+        best = slot_conf[live].max()
+        live = live[slot_conf[live] >= best - 1e-6]
+
+        # Balanced capacity: with 5 blues on 3 targets this is 2, so the
+        # loads come out 2/2/1 instead of 5/0/0.
+        cap = int(np.ceil(n_blue / live.size))
+        capacity = {int(s): cap for s in live}
+
+        # Greedy matching on range (edge feature 4).
+        pairs = [(float(feats[s * n_blue + b, 4]), b, int(s))
+                 for s in live for b in range(n_blue)]
+        pairs.sort()
+        out: dict = {}
+        for _rng, b, s in pairs:
+            if b in out or capacity[s] == 0:
+                continue
+            out[b] = s * n_blue + b
+            capacity[s] -= 1
+            if len(out) == n_blue:
+                break
+        return out
+
+
 # ===========================================================================
 #  Red policies — (blue_pos, red_pos, red_active) -> (N_red, 2)
 # ===========================================================================
@@ -353,5 +448,6 @@ def random_red(seed: Optional[int] = None):
 
 __all__ = [
     "HeuristicBlueAgent", "RandomAgent", "GreedyPursuer",
+    "ObservationGreedyPursuer", "AssignmentGreedyPursuer",
     "stationary_red", "random_red", "run_from_nearest_uav",
 ]

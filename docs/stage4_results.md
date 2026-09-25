@@ -28,9 +28,14 @@ first real step toward what a fielded ISR UAV actually sees.
 >   acceptance criterion passes for the first time under §4b
 >   perception (§11).
 >
-> Next: PPO fine-tuning from the cloned checkpoint, which must pass
-> `--reset-log-std` or it will collect rollouts from a policy 0.8/3
-> worse than the one it is meant to improve (§11.4).
+> * PPO fine-tuning from that clone reaches **2.967/3** and converts 9 of
+>   the expert's 12 failures on the evader into wins (§12.1);
+> * but **every result in this file was measured where coordination is
+>   worth nothing** — dividing the targets between blues buys −0.03 at
+>   red 1.0 and only starts paying at red ≈ 1.4 (§12.2).
+>
+> Next: the task itself. The interesting regime begins at red v_max ≈
+> 1.4, and nothing here has been measured there.
 
 ---
 
@@ -1539,3 +1544,141 @@ GRU's memory is the untested candidate.
   clone has, and which is what PPO fine-tuning would have to add.
 * **`n_obstacles 0`**, so the obstacle half of the tracker path is still
   inert, as everywhere above.
+
+---
+
+### 12. PPO past the clone, and the speed at which coordination starts to pay (MEASURED, 2026-09-24/25) · `feature/target-tracking`
+
+Two experiments that only make sense together. The first fine-tunes PPO
+from §11's clone. The second asks whether this task rewards coordination
+at all — because if it does not, the first has nowhere to go for reasons
+that have nothing to do with the algorithm.
+
+#### 12.1 Fine-tuning holds, and wins on the evader
+
+`ppo_from_bc_v1`: warm-started full from `bc_tracker_v1/best.pt`,
+`--reset-log-std -1.2`, `lr 3e-5`, `aux_hidden_coef 0`, 60 rollouts,
+154 min CPU. Same env as §11.
+
+50 matched-seed episodes, comparable with §10 and §11:
+
+| policy | Stationary | Random | RunFromNearest | **mean /3** |
+|---|---|---|---|---|
+| `ObsGreedy` (the expert) | 2.98 (47.3) | 3.00 (49.5) | 2.72 (107.1) | **2.900** |
+| Clone (BC) | 3.00 (53.5) | 3.00 (56.1) | 2.82 (100.7) | **2.940** |
+| PPO `best.pt` @ rollout 5 | 2.94 (59.3) | 3.00 (54.1) | 2.76 (106.9) | **2.900** |
+| **PPO `final.pt` @ rollout 60** | 2.98 (53.2) | 3.00 (51.7) | **2.92 (94.0)** | **2.967** |
+
+The fine-tune **does not destroy the clone** — the outcome §6.5's
+`bv3_warm` made worth fearing — and it wins on the evader. Per-episode
+on that column, 50 matched seeds:
+
+| | caught | steps *on clean 3/3* | clean sweeps |
+|---|---|---|---|
+| `ObsGreedy` | 2.72 | 77.7 | 38 / 50 |
+| Clone | 2.82 | 81.7 | 42 / 50 |
+| **PPO final** | **2.92** | 87.3 | **47 / 50** |
+
+**38 → 47 clean sweeps is 2.6 standard errors** on matched seeds: PPO
+converts 9 of the expert's 12 failures into wins. Note it is *slower* on
+the episodes that were already won (87.3 vs 77.7), so "fewer mean steps"
+in the table above is entirely timeout conversion, not speed — the two
+are mechanically coupled and only the conditional number separates them.
+
+Two things the run also settles:
+
+* **`--reset-log-std` earns its keep.** 154 minutes of PPO sampling with
+  σ 0.30 and not one degraded eval. At the σ 1.0 the clone ships with,
+  the behaviour policy scores 1.70 (§11.4) and this run would have begun
+  from there.
+* **`best_ckpt_metric` mis-selected again**, in a new way. §6.6 recorded
+  it picking badly on crash runs; here the metric was the right one
+  (`det_caught`) and it still chose **rollout 5**, whose 20-episode eval
+  read 2.97 by luck, over 55 later rollouts. `best.pt` (2.900) is worse
+  than `final.pt` (2.967). On a nearly flat curve, 20-episode evals
+  select noise.
+
+#### 12.2 Coordination is worth nothing below red 1.2, and pays from 1.4
+
+`docs/design.md §3.6` set blue 1.5 against red 1.0 so "coordination among
+blue agents has to provide the extra edge". That did not come true, and
+§10 already implied it: `ObsGreedy` has no coordination at all and scores
+2.90/3. The arithmetic says why — a stern chase closes 0.5/step, covering
+100 units of a 130 m arena in an episode, so nobody ever has to cut
+anybody off.
+
+`AssignmentGreedyPursuer` measures the gap instead of inferring it: it is
+`ObsGreedy` differing in **exactly one respect**, the team dividing the
+targets (balanced capacity, greedy matching on the same observation). It
+reads nothing extra — every (blue, slot) range is already in the enemy
+graph, since track positions are the shared command-layer fusion. What it
+beats `ObsGreedy` by is what target assignment alone is worth.
+
+Red = `run_from_nearest_uav`, 30 matched-seed episodes per cell:
+
+| red v_max | closing | `ObsGreedy` | `AssignGreedy` | **coordination** |
+|---|---|---|---|---|
+| 1.00 | 0.50 | 2.73 (108.9) | 2.70 (109.9) | −0.03 ± 0.13 |
+| 1.10 | 0.40 | 2.77 (111.9) | 2.70 (113.0) | −0.07 ± 0.11 |
+| 1.20 | 0.30 | 2.67 (127.8) | 2.63 (124.1) | −0.03 ± 0.14 |
+| 1.30 | 0.20 | 2.50 (152.2) | 2.60 (135.8) | +0.10 ± 0.14 |
+| **1.40** | 0.10 | 2.07 (183.0) | **2.43 (166.7)** | **+0.37 ± 0.17** |
+| 1.50 | 0.00 | 0.80 (190.8) | 1.20 (184.2) | +0.40 ± 0.25 |
+
+Three measurements in a row at **zero** (−0.03, −0.07, −0.03) and then
++0.37 beyond two standard errors. **Every result in §6–§12 was measured
+in a regime where dividing the targets buys nothing**, which is worth
+knowing before reading any of them as a statement about coordination.
+
+Deliberately *not* reported as a gap to 3.00: that would assume 3.00 is
+reachable at every speed, which is unknown and at red 1.5 almost
+certainly false. Two rules identical but for the assignment is a measured
+bound; a ceiling nobody has demonstrated is not.
+
+#### 12.3 Whatever PPO learned, it is not target assignment
+
+These two experiments contradict the obvious story, and the contradiction
+is the useful part.
+
+At red 1.0, `AssignGreedy` beats `ObsGreedy` by **−0.03** — target
+division is worthless there. Yet at that same speed PPO reached **2.92**
+on the evader against the expert's 2.72 and the assignment rule's 2.70.
+**PPO is above the assignment bound at a speed where assignment buys
+nothing.**
+
+So `AssignGreedy` is not a bound on what is achievable; it is a bound on
+what *one kind* of coordination achieves. And §11.5's open question
+narrows rather than closes: three candidate mechanisms have now been
+proposed and measured, and all three are dead.
+
+| mechanism | test | verdict |
+|---|---|---|
+| decorrelating an over-correlated team | team spread, redundant pairs (§11.5) | **falsified** — the clone is *more* clustered than the expert and matches it |
+| interception / leading the target | lead angle vs the expert's 0.00° | **unsupported** — same −7° offset whether or not the target moves |
+| dividing the targets | `AssignGreedy` at red 1.0 | **worthless there** (−0.03), yet PPO gains +0.20 |
+
+PPO *does* reduce redundant pursuit (28.9% → 23.3%) and raise team spread
+(37.9 → 41.6 m) relative to the clone — that much is measured. But the
+assignment sweep says de-conflicting targets cannot be *why* it scores
+higher at this speed. The GRU's memory remains untested, and so does
+whatever positional behaviour the eval GIFs might show.
+
+#### 12.4 What this sets up
+
+The interesting problem starts at **red ≈ 1.4**, where coordination is
+measurably worth +0.37 to a rule that does nothing else. Below 1.3 it is
+worth nothing, so a policy trained there cannot demonstrate coordination
+however good it is — there is none to demonstrate.
+
+Note what that means for a curriculum: its early rungs teach pure
+pursuit, and **§11 already has pure pursuit for free** (the clone is at
+2.94 at red 1.0 after 768k supervised steps). A ramp starting at 1.0
+would spend its budget re-learning what cloning already gave. Starting
+from the clone at ~1.3 and ramping up skips that.
+
+**Caveats.** One seed and one run on the fine-tune. The redundancy and
+spread metrics are this project's own constructions, not standard ones.
+`AssignGreedy` uses greedy matching rather than Hungarian (no scipy
+dependency); at 5×3 the two agree almost always and the difference is far
+below the effects measured. And `n_obstacles 0` throughout, so the
+obstacle half of the tracker path is still inert.
