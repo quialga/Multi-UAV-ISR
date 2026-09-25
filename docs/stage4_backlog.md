@@ -152,6 +152,51 @@ v6.x architecture.  Kept as short pointers so the reader can trace
   `bb_edge_visible`.  §13b (per-UAV command-link gating on the
   peaks) remains open — see below.
 
+
+### Landed 2026-09-23/25 (see `stage4_results.md §9–§12`)
+
+- **Region / staleness nodes, wired end to end.**  §9.5 found the field,
+  the `R×R` nodes and the encoder's coverage path all implemented, fully
+  tested, and connected by *nothing* — no observation key, no `n_region`
+  on the Stage 4 policy, no trainer flag.  Now reachable via
+  `--use-staleness` / `--staleness-regions`, actor-side only (the critic
+  already reads `true_occupancy`).  Closed a leak on the way:
+  `searchable` was computed from the TRUE obstacle grid, harmless at
+  `n_obstacles 0` but a sixth entry in `tracker_observation.md`'s leak
+  table the moment obstacles return.
+- **`ObservationGreedyPursuer`** — the same-information expert.  Runs
+  `GreedyPursuer`'s rule on the ACTOR's observation instead of
+  `state_snapshot()`, which made the repo-wide "1.2 × Greedy" bar
+  measurable again under §4b perception (the old bar was calibrated
+  against an oracle-in-range opponent).
+- **`AssignmentGreedyPursuer`** — the coordination bound.  `ObsGreedy`
+  differing in exactly one respect: the team divides the targets.  What
+  it beats `ObsGreedy` by is what assignment alone is worth, and the
+  sweep in §21.3 is what it was built for.
+- **Behaviour cloning / DAgger** (`scripts/train_bc.py`).  Reaches the
+  expert in 768k steps where PPO from scratch plateaued at 1.28/3 in
+  12.8M.  Three design points that are not free choices are documented in
+  the module docstring: the expert must label the STORED observation
+  (the sensor is re-drawn per call), hidden states are the student's own
+  stored per transition (the update does not back-propagate through
+  time), and the critic is fitted on the same rollouts so `--warm-start-
+  full` restores a matched pair.
+- **`--reset-log-std`** — the exploration width a warm start hands to
+  PPO.  Cloning regresses the mean and leaves `log_std` at its init
+  (σ 1.0), which on a `[-1,1]²` box is near-uniform noise: the clone
+  scores 2.52 deterministic and **1.70 sampled**, and PPO samples.
+  Applied AFTER the warm-start copy, which is the only place it works —
+  `load_full_stage4` copies every shape-matching tensor, `actor_log_std`
+  included.
+- **`red_v_max` as an env parameter** — see §21.3 for the sweep it
+  enabled.
+- **`eval_matrix` seeding fix.**  It took red POLICIES, so
+  `random_red(seed=0)`'s closure shared one RNG stream across every
+  episode AND every blue row; its draws depended on how many steps the
+  preceding rows consumed, and episode length is what the matrix
+  measures.  Re-ordering the blue rows moved a score by 0.25.  Now takes
+  `(seed) -> policy`.
+
 ## 1. Blue ↔ obstacle crash penalty  — ✅ LANDED (see LANDED section)
 
 > Shipped as the per-agent crash-avoidance extension.  The v1 sketch
@@ -375,10 +420,46 @@ mention now describes the actual sensor-gated behaviour or is
 explicitly marked as "design predicted / never landed".)
 
 **Blocking**: none.  ~5 lines in `_compute_edge_visibility` to plumb
-the new knob.  Priority is low because `sensor_radius`-gated bb
-visibility already gives an interesting partial-comms behaviour;
-would matter for a scenario deliberately studying TDL loss (jamming,
-urban shadowing).
+the new knob.
+
+**Priority RAISED to high, 2026-09-25 — the old "low" rating predates
+the evidence.**  It read "sensor-gated bb visibility already gives an
+interesting partial-comms behaviour", which was fair when coordination
+was not the thing under study.  It now is, and the gating works directly
+against it.  Measured over 25 episodes, 5 blues, `run_from_nearest_uav`,
+sensor 40 m:
+
+| policy | bb links open | blues with NO visible teammate | team spread |
+|---|---|---|---|
+| `ObsGreedy` | 57.2% | 12.0% | 38.4 m |
+| `AssignGreedy` | 55.8% | 12.1% | 40.0 m |
+| clone (BC) | **66.3%** | 8.9% | 35.1 m |
+| PPO fine-tuned | **54.5%** | **12.2%** | 41.2 m |
+
+Nearly half the teammate graph is masked at any instant, and ~12% of the
+time some blue is an isolated node coordinating with nobody.  The
+ORDERING is the finding: the most spread policy has the fewest links open
+and the most isolation, the most clustered is the best connected.
+**Spreading out to cover ground destroys the channel you would coordinate
+over** — and from red 1.4 up, covering ground is exactly what the task
+rewards (§21.3).
+
+There is also an internal inconsistency worth naming.  The enemy picture
+is SHARED through the command-layer fusion (§13): every blue gets the
+same red tracks whoever detected them.  Own-force positions are gated by
+each blue's own radar.  Real systems are the other way round — blue force
+tracking is the easy half, reported over the datalink; it is the enemy
+that has to be found and fused.  Modelling a denied-comms environment is
+defensible, but then the red tracks should not be shared either; the
+mixture is what does not stand up.  The cause is likely historical: the
+`bb` masking predates the Stage 4 C2 doctrine and nothing reconciled them.
+
+What this does NOT settle: whether opening the links helps.  A policy
+trained *with* gating may have learned to work without teammates and gain
+nothing; the honest test is a retrain, not an eval under a changed mask.
+And it breaks comparability with `stage4_results.md §6-§12`, all measured
+at 40 m gating, so it wants to land alongside the red-speed change rather
+than mid-series.
 
 ## 8. Per-channel sensor noise — ✅ LANDED
 
@@ -1237,78 +1318,6 @@ measurements) so a mixed fraction is representable at all, and a physical
 distance bound on the duplicate merge, which is only safe today because
 the static model keeps covariances small.
 
-
----
-
-## 22. Blues cannot see each other past 40 m — and that is backwards
-
-**Decided 2026-09-25: change it.** Blue-blue edges should be open
-regardless of distance. What follows is why, and what has to move with
-it.
-
-### The inconsistency
-
-`bb` edge visibility is gated by `sensor_radius`
-(`_compute_edge_visibility`, the convention from `docs/stage3_design.md
-§2.2`): a blue sees a teammate only within 40 m. Meanwhile the enemy
-picture is **shared**: red track positions come from the command-layer
-fusion and every blue receives the same ones whoever detected them
-(§13 of this document).
-
-So the model gives the team perfect shared knowledge of the **enemy** and
-line-of-sight-limited knowledge of **itself**. Real systems are the other
-way round — blue force tracking is the easy half. Own aircraft report
-their own positions over the datalink; it is the enemy that has to be
-found, fused and guessed at.
-
-The likely cause is historical rather than deliberate: the `bb` masking
-predates the Stage 4 C2 doctrine, and nothing reconciled the two when the
-second arrived. It is defensible to model a contested environment with no
-datalink — but then the red tracks should not be shared either. The
-mixture is what does not stand up.
-
-### What it costs, measured
-
-25 episodes per row, `run_from_nearest_uav`, 5 blues, sensor 40 m
-(`scratch` probe, 2026-09-25):
-
-| policy | bb links open | blues with NO visible teammate | team spread |
-|---|---|---|---|
-| `ObsGreedy` | 57.2% | 12.0% | 38.4 m |
-| `AssignGreedy` | 55.8% | 12.1% | 40.0 m |
-| clone (BC) | **66.3%** | 8.9% | 35.1 m |
-| PPO fine-tuned | **54.5%** | **12.2%** | 41.2 m |
-
-Nearly half the teammate graph is masked at any instant, and **~12% of
-the time some blue is an isolated node**, coordinating with nobody.
-
-The ordering is the point: **spreading out destroys the channel you would
-coordinate over.** The most spread policy (PPO, 41.2 m) has the fewest
-links open and the most isolation; the most clustered (the clone, 35.1 m)
-is the best connected. Covering ground and talking to each other are in
-direct tension, by construction — and covering ground is what the task
-rewards from red 1.4 up (§21.3).
-
-At red 1.4 the teams compress (26–31 m) and links open to ~70%, so the
-penalty is worst exactly where it is least needed.
-
-### What to do
-
-* Add `comms_radius`, separate from `sensor_radius`, defaulting to
-  **unlimited**, and drive `bb` visibility from it. A finite value then
-  models a degraded link deliberately rather than by accident.
-* `bb_edge_visible` stays in the observation either way — the mask is
-  part of the schema and an all-ones mask is already the fully-observable
-  Stage 2 behaviour the code supports.
-
-### What it does NOT settle
-
-Whether it helps. A policy trained *with* gated links may have learned to
-work without teammates and gain nothing from opening them; the honest
-test is a retrain, not an eval of an existing checkpoint under a changed
-mask. And it breaks comparability with `docs/stage4_results.md §6–§12`,
-all of which were measured at 40 m gating, so it wants to land alongside
-the red-speed change rather than in the middle of that series.
 
 ## Design questions still open
 
