@@ -1181,13 +1181,38 @@ Capture tunnelling was checked and is a non-issue: at 1.5 vs 1.5 the
 closing speed reaches 3 m/step against a 3 m capture radius, yet the probe
 saw no capture missed between sampled steps.
 
-What is missing:
+**UPDATE 2026-09-25 — the knob landed and was swept.**
+`red_v_max` is now an env parameter, a `--red-v-max` flag and a key that
+round-trips through saved args (`None` keeps 1.0, so nothing published
+moved). `scripts/sweep_red_speed.py` measured the ratio's effect with the
+Stage 4 observation, 5 blues / 3 reds, 30 matched-seed episodes — and
+added `AssignmentGreedyPursuer`, which is `ObsGreedy` differing only in
+that the team divides the targets, to separate "the task got harder" from
+"coordination started to matter":
 
-* **`red_v_max` as an env parameter.** It is `RED_TARGET.v_max` in
-  `isr/env/entities.py` today — a frozen module constant, so there is no
-  per-episode or per-run way to set it.
+| red v_max | `ObsGreedy` | `AssignGreedy` | coordination is worth |
+|---|---|---|---|
+| 1.00 | 2.73 | 2.70 | −0.03 ± 0.13 |
+| 1.20 | 2.67 | 2.63 | −0.03 ± 0.14 |
+| 1.30 | 2.50 | 2.60 | +0.10 ± 0.14 |
+| **1.40** | 2.07 | **2.43** | **+0.37 ± 0.17** |
+| 1.50 | 0.80 | 1.20 | +0.40 ± 0.25 |
+
+This section's instinct was right and its threshold was pessimistic: the
+collapse is at 1.5 as predicted, but **coordination starts paying at
+1.4**, while at ≤1.2 it is worth precisely nothing. Every result in
+`docs/stage4_results.md §6–§12` was measured at 1.0, i.e. in a regime
+where dividing the targets buys nothing.
+
+Still missing, and NOT done for the 1.4 sweep or `ppo_red14_v1`:
+
 * **Tracker priors.** `vel_prior_std` (1.0) is the "how fast could this
-  thing be" scale used for the velocity ridge at birth; it becomes 1.5.
+  thing be" scale for the velocity ridge at birth; at red 1.4 it is too
+  tight, so a new track's velocity uncertainty is under-stated. The sweep
+  and the 1.4 training run both left it at 1.0. They stay internally
+  comparable — every baseline in them shares the setting — but all of
+  them may be below what a correctly-primed tracker would give. Re-measure
+  before treating any 1.4 number as the ceiling.
 * **The learned motion model.** Its training data would need re-collecting
   at the new speed distribution (the state distribution changes, and the
   model conditions on the red's velocity). Then `sigma_a_model` and
@@ -1211,6 +1236,79 @@ constant-velocity model per track, weighted by which explains the
 measurements) so a mixed fraction is representable at all, and a physical
 distance bound on the duplicate merge, which is only safe today because
 the static model keeps covariances small.
+
+
+---
+
+## 22. Blues cannot see each other past 40 m — and that is backwards
+
+**Decided 2026-09-25: change it.** Blue-blue edges should be open
+regardless of distance. What follows is why, and what has to move with
+it.
+
+### The inconsistency
+
+`bb` edge visibility is gated by `sensor_radius`
+(`_compute_edge_visibility`, the convention from `docs/stage3_design.md
+§2.2`): a blue sees a teammate only within 40 m. Meanwhile the enemy
+picture is **shared**: red track positions come from the command-layer
+fusion and every blue receives the same ones whoever detected them
+(§13 of this document).
+
+So the model gives the team perfect shared knowledge of the **enemy** and
+line-of-sight-limited knowledge of **itself**. Real systems are the other
+way round — blue force tracking is the easy half. Own aircraft report
+their own positions over the datalink; it is the enemy that has to be
+found, fused and guessed at.
+
+The likely cause is historical rather than deliberate: the `bb` masking
+predates the Stage 4 C2 doctrine, and nothing reconciled the two when the
+second arrived. It is defensible to model a contested environment with no
+datalink — but then the red tracks should not be shared either. The
+mixture is what does not stand up.
+
+### What it costs, measured
+
+25 episodes per row, `run_from_nearest_uav`, 5 blues, sensor 40 m
+(`scratch` probe, 2026-09-25):
+
+| policy | bb links open | blues with NO visible teammate | team spread |
+|---|---|---|---|
+| `ObsGreedy` | 57.2% | 12.0% | 38.4 m |
+| `AssignGreedy` | 55.8% | 12.1% | 40.0 m |
+| clone (BC) | **66.3%** | 8.9% | 35.1 m |
+| PPO fine-tuned | **54.5%** | **12.2%** | 41.2 m |
+
+Nearly half the teammate graph is masked at any instant, and **~12% of
+the time some blue is an isolated node**, coordinating with nobody.
+
+The ordering is the point: **spreading out destroys the channel you would
+coordinate over.** The most spread policy (PPO, 41.2 m) has the fewest
+links open and the most isolation; the most clustered (the clone, 35.1 m)
+is the best connected. Covering ground and talking to each other are in
+direct tension, by construction — and covering ground is what the task
+rewards from red 1.4 up (§21.3).
+
+At red 1.4 the teams compress (26–31 m) and links open to ~70%, so the
+penalty is worst exactly where it is least needed.
+
+### What to do
+
+* Add `comms_radius`, separate from `sensor_radius`, defaulting to
+  **unlimited**, and drive `bb` visibility from it. A finite value then
+  models a degraded link deliberately rather than by accident.
+* `bb_edge_visible` stays in the observation either way — the mask is
+  part of the schema and an all-ones mask is already the fully-observable
+  Stage 2 behaviour the code supports.
+
+### What it does NOT settle
+
+Whether it helps. A policy trained *with* gated links may have learned to
+work without teammates and gain nothing from opening them; the honest
+test is a retrain, not an eval of an existing checkpoint under a changed
+mask. And it breaks comparability with `docs/stage4_results.md §6–§12`,
+all of which were measured at 40 m gating, so it wants to land alongside
+the red-speed change rather than in the middle of that series.
 
 ## Design questions still open
 
