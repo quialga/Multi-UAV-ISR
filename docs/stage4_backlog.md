@@ -725,10 +725,28 @@ tests stay valid.
 > 3.8–5.5 against its 4.0 target, so the filter inflates covariance
 > honestly instead of being confidently wrong.
 >
-> Switching it on is a one-flag experiment and has never been run.  It is
-> the obvious lever on the `run` column, and §21.3 notes the model would
-> want re-collecting at a new speed distribution before being used at
-> red 1.4.
+> **It is NOT a one-flag experiment** — an earlier version of this note
+> said it was, which the module's own docstring contradicts.  Three
+> things stand between it and a usable number:
+>
+> 1. **`sigma_a_model` is a placeholder.**  The adapter's own docstring:
+>    *"the honest value comes from a NEES sweep against real rollouts...
+>    treat any downstream number from this adapter as provisional."*
+> 2. **`vel_prior_std` is also uncalibrated** once red moves faster
+>    (§21.3).  Both are fixed by the same instrument — a sweep checking
+>    `nees` against its 4.0 target — so they want doing together.
+>    `ppo_red14_v1` ran at `nees` 8.2–9.6, i.e. badly over-confident, so
+>    this is a measured problem and not a theoretical one.
+> 3. **The model was trained at red v_max 1.0** and conditions on the
+>    red's velocity, so at 1.4 it is out of distribution; §21.3 already
+>    notes the dataset would need re-collecting.
+>
+> What it does NOT need is a leak argument: the adapter's asymmetry is
+> sound.  `run_from_nearest_uav` reads BLUE positions and obstacle
+> geometry — our own drones, known exactly, and the obstacle tracker's
+> output — so the adversary's INPUTS are observable to us even though its
+> action is not.  Train/serve skew is designed out rather than tested
+> for: the adapter calls the same `featurize_shard` as the training path.
 
 **Motivation.**  The current belief-map diffusion uses a fixed
 isotropic 3×3 kernel (`enemy_belief_diffusion=0.2`) — effectively
