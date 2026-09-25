@@ -30,12 +30,17 @@ first real step toward what a fielded ISR UAV actually sees.
 >
 > * PPO fine-tuning from that clone reaches **2.967/3** and converts 9 of
 >   the expert's 12 failures on the evader into wins (§12.1);
-> * but **every result in this file was measured where coordination is
->   worth nothing** — dividing the targets between blues buys −0.03 at
->   red 1.0 and only starts paying at red ≈ 1.4 (§12.2).
+> * but **§6–§12 were all measured where coordination is worth nothing** —
+>   dividing the targets between blues buys −0.03 at red 1.0 and only
+>   starts paying at red ≈ 1.4 (§12.2);
+> * moved to red 1.4, where it does pay, the policy beats explicit target
+>   assignment by **4.7 standard errors** and is 28% faster (§13).
 >
-> Next: the task itself. The interesting regime begins at red v_max ≈
-> 1.4, and nothing here has been measured there.
+> Two things to carry into anything that follows. The repo-wide
+> "1.2 × Greedy" acceptance bar is **degenerate above red 1.2** — it falls
+> as the task hardens (§13.2). And §13's level is depressed by a tracker
+> left un-recalibrated for the faster red (`nees` 8–9 against a target of
+> 4), so it is a floor, not a ceiling.
 
 ---
 
@@ -1682,3 +1687,118 @@ spread metrics are this project's own constructions, not standard ones.
 dependency); at 5×3 the two agree almost always and the difference is far
 below the effects measured. And `n_obstacles 0` throughout, so the
 obstacle half of the tracker path is still inert.
+
+---
+
+### 13. Coordination, finally measured where it pays (MEASURED, 2026-09-25) · `feature/target-tracking`
+
+§12.2 found that at the configured speed ratio, dividing the targets
+between blues is worth **−0.03 ± 0.13** — nothing — and first pays at red
+**1.4** (+0.37 ± 0.17). Every result in §6–§12 was therefore recorded in
+a regime where coordination could not be demonstrated, however good a
+policy was. This is the first run in the regime where it can.
+
+`ppo_red14_v1`: warm-started full from `ppo_from_bc_v1/final.pt`,
+`--red-v-max 1.4`, `lr 3e-5`, `aux_hidden_coef 0`, 100 rollouts, 279 min
+CPU. No σ reset needed — the parent checkpoint already carried σ 0.304,
+which `ent_coef 0.008` had barely moved over the previous 60 rollouts.
+
+**No speed ramp, and none was needed.** The starting checkpoint already
+scored 2.56 on the evader at red 1.4 *zero-shot*, above `AssignGreedy`'s
+2.36, so there was no cliff to protect it from. (There is also no ramp
+mechanism: `red_v_max` is fixed at env construction and the vec env
+builds its envs once.)
+
+#### 13.1 It beats the coordination bound by 4.7 standard errors
+
+50 matched-seed episodes per cell, **all rows at red v_max 1.4** — not
+comparable with any table above, which are all at 1.0:
+
+| Blue | Stationary | Random | RunFromNearest | **mean /3** |
+|---|---|---|---|---|
+| Random | 0.94 (198.4) | 1.20 (194.4) | 0.06 (200.0) | **0.733** |
+| Greedy (true-in-range) | 2.60 (93.7) | 2.90 (72.8) | 2.06 (180.3) | **2.520** |
+| `ObsGreedy` | 2.98 (47.3) | 3.00 (53.8) | 2.04 (182.8) | **2.673** |
+| `AssignGreedy` (coordination bound) | 2.98 (45.0) | 3.00 (50.1) | 2.36 (168.9) | **2.780** |
+| **Trained `best.pt` @ 80** | **3.00 (52.1)** | **3.00 (46.8)** | **2.92 (122.4)** | **2.973** |
+| Trained `final.pt` @ 100 | 2.98 (53.1) | 3.00 (47.1) | 2.90 (126.6) | **2.960** |
+
+The evader column is the whole story. **2.92 against `AssignGreedy`'s
+2.36 is +0.56, or 4.7 standard errors** on n=50 matched seeds — and in
+**122 steps against 169**, 28% faster. Unlike §12.1's speed figure this
+is not timeout conversion: it catches *more* and takes *less* time.
+
+Against the lineage: +0.36 on the starting checkpoint (2.56 zero-shot at
+this speed), +0.88 on `ObsGreedy`, +1.00 on the clone's 1.92.
+
+So the policy does something that dividing the targets one-to-one does
+not. §12.3 predicted exactly this and could not demonstrate it, because
+at red 1.0 there was nothing to demonstrate.
+
+#### 13.2 Two things this table does *not* say
+
+**The acceptance criterion has stopped meaning anything here.** It reads
+PASS at +23.62 against a bar of +10.95, but the bar is `1.20 × Greedy`
+and Greedy collapses at this speed (2.06 on the evader, down from 2.50 at
+red 1.0). A bar that *falls* as the task gets harder measures nothing.
+`AssignGreedy` is the reference to quote; the repo-wide criterion should
+be retired for any run above red 1.2.
+
+**2.97 is not the task's ceiling — it is the ceiling with a
+mis-calibrated filter.** `nees` ran **8.2–9.6** against its 4.0 target
+for most of this run, i.e. badly over-confident: the tracker's covariance
+understates its real error. `stage4_backlog.md §21.3` asked for
+`vel_prior_std` to move with `red_v_max` and it was not done — the filter
+still births tracks assuming a red can reach 1.0 while it can reach 1.4.
+Every row above shares that defect, so the *comparison* holds; the
+*level* is depressed by an amount nobody has measured. (At red 1.0,
+§7.3's `nees` was 3.8–5.5, so this is specifically a consequence of
+raising the speed without re-calibrating.)
+
+#### 13.3 `best_ckpt_metric` behaved, and why that is informative
+
+§12.1 recorded the selector choosing rollout 5 on a flat curve, leaving
+`best.pt` worse than `final.pt`. Here it chose **rollout 80**, and
+`best.pt` (2.973) is indeed above `final.pt` (2.960). The difference is
+not the metric — it was `det_caught` both times — but the signal: a curve
+that actually moves gives 20-episode evals something to select above
+their own noise. The §12.1 fix stands (require persistence, or a running
+mean) but the diagnosis is now sharper: it fails on flat curves, not in
+general.
+
+#### 13.4 Still unexplained, now five hypotheses deep
+
+The mechanism remains unidentified. Every candidate proposed so far has
+been measured and none survived:
+
+| mechanism | test | verdict |
+|---|---|---|
+| decorrelating an over-correlated team | spread, redundant pairs (§11.5) | falsified — the clone is *more* clustered yet matches |
+| interception / leading the target | lead angle vs the expert's 0.00° | unsupported — same −7° whether or not the target moves |
+| dividing the targets | `AssignGreedy` at red 1.0 | worthless there (−0.03), yet PPO gained |
+| cutting the red off | capture geometry, 50 episodes | **15.9% vs the clone's 15.7%** — indistinguishable |
+| spreading before the red commits | mean spread over steps 0–25 | **58.6 m vs the clone's 56.6** — indistinguishable |
+
+The last two came from watching the evaluation GIFs, where one episode
+showed the fine-tuned team opening early and taking the red head-on. That
+episode is real; it does not generalise. Both metrics are flat across 50
+matched seeds while the score is not.
+
+What is established is narrower and more robust than any of them: the
+policy **transfers to a regime it never trained in** (2.56 at red 1.4
+from a red-1.0 run, where the clone it came from drops to 1.92) and
+**beats explicit target assignment by 4.7 SE once trained there**. The
+GRU's memory is the one proposed mechanism never tested.
+
+#### 13.5 Caveats
+
+* **One seed, one run**, as with §11 and §12.
+* **Constant-velocity tracker throughout.** `--red-motion-ckpt` is built,
+  trained and never used (`stage4_backlog.md §15`); the filter predicts
+  "it will keep going straight" about a *reactive* evader that turns
+  whenever the nearest blue moves. What kept that honest at red 1.0 was
+  calibration, and §13.2 is that calibration failing at 1.4.
+* **`n_obstacles 0`**, so the obstacle half of the tracker path is still
+  inert, as everywhere above.
+* **The 3.00/3 at rollout 85 was the peak of the noise.** The last eight
+  evals mean 2.94 overall and 2.85 on the evader; quote those.
