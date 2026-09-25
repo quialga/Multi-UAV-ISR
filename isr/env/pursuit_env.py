@@ -202,6 +202,21 @@ class PursuitEnv(ParallelEnv):
         # off rather than running it down, which is the only condition
         # under which coordination can pay.
         red_v_max:                Optional[float]    = None,
+        # The RED TRACKER's own velocity prior — NOT the env's
+        # ``vel_prior_std`` below, which scales the belief path's velocity
+        # ridge and the actor's covariance features.  The tracker's lives
+        # in ``actor_graph.RED_TRACKER_CONFIG``, tuned at red v_max 1.0,
+        # and it is the "how fast could a newborn track be moving" scale:
+        # leaving it at 1.0 while red runs at 1.4 makes the filter
+        # over-confident from birth.  None = the config's value.
+        tracker_vel_prior_std:    Optional[float]    = None,
+        # The tracker's assumed manoeuvre scale, which sets the process
+        # noise (sigma_a = a_max*sqrt(2)) and therefore the STEADY-STATE
+        # covariance.  This -- not the birth prior above -- is the lever
+        # on NEES: measured, raising vel_prior_std 1.0 -> 2.8 moved NEES
+        # by 1.2 out of 24 of error, because a birth prior washes out
+        # after a few updates.  None = the config's value.
+        tracker_a_max:            Optional[float]    = None,
         red_policy:               Optional[Callable] = None,
         seed:                     Optional[int]      = None,
         # ----- Reward shape (was hard-coded in _step) ---------------------
@@ -478,6 +493,13 @@ class PursuitEnv(ParallelEnv):
         self.red_v_max = (RED_TARGET.v_max if red_v_max is None
                           else float(red_v_max))
         assert self.red_v_max > 0.0
+        self.tracker_vel_prior_std = (None if tracker_vel_prior_std is None
+                                      else float(tracker_vel_prior_std))
+        self.tracker_a_max = (None if tracker_a_max is None
+                              else float(tracker_a_max))
+        assert self.tracker_a_max is None or self.tracker_a_max > 0.0
+        assert (self.tracker_vel_prior_std is None
+                or self.tracker_vel_prior_std > 0.0)
         self.dt             = float(dt)
         self.red_policy     = red_policy or run_from_nearest_uav
         self.sensor_radius: Optional[float] = (
@@ -822,7 +844,10 @@ class PursuitEnv(ParallelEnv):
         # (exactly as the belief map is updated above).
         if self.actor_obs == "tracker":
             self._track_err, self._nees, self._nis = [], [], []
-            self._red_tracker = actor_graph.make_red_tracker(self._red_motion)
+            self._red_tracker = actor_graph.make_red_tracker(
+                self._red_motion,
+                vel_prior_std=self.tracker_vel_prior_std,
+                a_max=self.tracker_a_max)
             self._obstacle_tracker = actor_graph.make_obstacle_tracker(
                 static=not (self.moving_obstacle_fraction > 0.0
                             and self.obstacle_speed > 0.0))

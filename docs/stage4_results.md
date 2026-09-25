@@ -1744,16 +1744,41 @@ red 1.0). A bar that *falls* as the task gets harder measures nothing.
 `AssignGreedy` is the reference to quote; the repo-wide criterion should
 be retired for any run above red 1.2.
 
-**2.97 is not the task's ceiling — it is the ceiling with a
-mis-calibrated filter.** `nees` ran **8.2–9.6** against its 4.0 target
-for most of this run, i.e. badly over-confident: the tracker's covariance
-understates its real error. `stage4_backlog.md §21.3` asked for
-`vel_prior_std` to move with `red_v_max` and it was not done — the filter
-still births tracks assuming a red can reach 1.0 while it can reach 1.4.
-Every row above shares that defect, so the *comparison* holds; the
-*level* is depressed by an amount nobody has measured. (At red 1.0,
-§7.3's `nees` was 3.8–5.5, so this is specifically a consequence of
-raising the speed without re-calibrating.)
+**2.97 is not the task's ceiling — the tracker is over-confident, and
+it cannot be tuned out.** `nees` ran **8.2–9.6** against its 4.0 target
+for most of this run (and ~12 against the evader alone, which is where a
+constant-velocity model hurts most): the covariance understates the real
+error. Every row above shares the defect, so the *comparison* holds and
+the *level* is depressed.
+
+**The first version of this paragraph blamed `vel_prior_std` not having
+been raised with `red_v_max`, as `stage4_backlog.md §21.3` had asked.
+That was wrong, and `scripts/sweep_tracker_calibration.py` is what
+measured it wrong.** Neither available knob fixes it:
+
+| `a_max` (→ `sigma_a = a_max·√2`) | `nees` | `trk` | caught |
+|---|---|---|---|
+| **1.00 (shipped)** | 12.31 | 3.81 m | **2.92** |
+| 1.50 | **11.58** | 5.76 m | 2.80 |
+| 3.00 | 14.30 | 9.48 m | 2.92 |
+| 6.00 | 20.37 | 15.01 m | 2.56 |
+
+`vel_prior_std` is only the BIRTH prior and washes out within a few
+updates — moving it 1.0 → 2.8 changed `nees` by ~1 out of ~24 of error.
+`a_max` *is* the steady-state lever (it sets the process noise and is used
+for nothing else), and swept over sigma_a 1.41 → 8.49 the best reachable
+`nees` is **11.6**, rising in both directions while track error nearly
+quadruples and captures fall.
+
+Which is the finding: **this is not a mis-calibration, it is the motion
+model.** `sigma_a` admits more *white* acceleration, while the error
+against `run_from_nearest_uav` is *systematic* — the evader turns away
+from the nearest blue, every time, and constant velocity predicts
+"straight on", every time. Isotropic noise cannot correct a directional
+bias; it only blurs the track. The fix is `stage4_backlog.md §15`, the
+trained red-motion model that is built and has never been switched on.
+Meanwhile the shipped `a_max=1.0` is already the best operating point, so
+nothing should be changed on this evidence.
 
 #### 13.3 `best_ckpt_metric` behaved, and why that is informative
 

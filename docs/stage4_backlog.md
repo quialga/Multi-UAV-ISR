@@ -1337,13 +1337,24 @@ where dividing the targets buys nothing.
 
 Still missing, and NOT done for the 1.4 sweep or `ppo_red14_v1`:
 
-* **Tracker priors.** `vel_prior_std` (1.0) is the "how fast could this
-  thing be" scale for the velocity ridge at birth; at red 1.4 it is too
-  tight, so a new track's velocity uncertainty is under-stated. The sweep
-  and the 1.4 training run both left it at 1.0. They stay internally
-  comparable — every baseline in them shares the setting — but all of
-  them may be below what a correctly-primed tracker would give. Re-measure
-  before treating any 1.4 number as the ceiling.
+* ~~**Tracker priors.**~~ **MEASURED AND WRONG, 2026-09-25.** This asked
+  for `vel_prior_std` to rise with `red_v_max`, and
+  `scripts/sweep_tracker_calibration.py` shows it is not the lever:
+  `vel_prior_std` is the BIRTH prior and washes out within a few updates
+  (1.0 → 2.8 moved `nees` by ~1 out of ~24 of error). `a_max` *is* the
+  steady-state lever — it sets `sigma_a = a_max·√2` and is used for
+  nothing else — and swept over `sigma_a` 1.41 → 8.49 the best reachable
+  `nees` is **11.6** against a 4.0 target, rising in both directions while
+  track error goes 3.8 → 15.0 m and captures fall 2.92 → 2.56.
+
+  The over-confidence is **the motion model, not the tuning**: `sigma_a`
+  admits more *white* acceleration, while the error against
+  `run_from_nearest_uav` is *systematic* — it turns away from the nearest
+  blue every time and constant velocity predicts straight on every time.
+  See §15. The shipped `a_max=1.0` is already the best operating point,
+  so nothing here should change on this evidence. Both knobs are now
+  reachable (`--tracker-a-max`, `--tracker-vel-prior-std`) for whoever
+  re-opens this.
 * **The learned motion model.** Its training data would need re-collecting
   at the new speed distribution (the state distribution changes, and the
   model conditions on the red's velocity). Then `sigma_a_model` and

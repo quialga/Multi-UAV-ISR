@@ -85,8 +85,27 @@ OBSTACLE_TRACKER_MOVING = dict(_OBSTACLE_BASE)
 RADIUS_SD_SCALE = 2.0
 
 
-def make_red_tracker(motion_model=None) -> MultiTargetTracker:
+def make_red_tracker(motion_model=None, **overrides) -> MultiTargetTracker:
+    """Build the red tracker from ``RED_TRACKER_CONFIG``.
+
+    ``overrides`` exists because that config is a module constant tuned at
+    red ``v_max`` 1.0, and ``vel_prior_std`` in particular is the "how fast
+    could a newly born track be moving" scale — so raising ``red_v_max``
+    without raising it leaves the filter over-confident from birth.
+    Measured: `ppo_red14_v1` ran at `nees` 8.2–9.6 against its 4.0 target
+    at red 1.4, where the same tracker reads 3.8–5.5 at red 1.0
+    (docs/stage4_results.md §7.3, §13.2).
+
+    Unknown keys are rejected rather than silently ignored — a typo here
+    would leave the default in place and read as "calibration did not
+    help".
+    """
     kw = dict(RED_TRACKER_CONFIG)
+    unknown = set(overrides) - set(kw)
+    if unknown:
+        raise KeyError(f"unknown red-tracker override(s): {sorted(unknown)}; "
+                       f"known keys are {sorted(kw)}")
+    kw.update({k: v for k, v in overrides.items() if v is not None})
     if motion_model is not None:
         kw.update(motion_model=motion_model, max_components=8)
     return MultiTargetTracker(**kw)

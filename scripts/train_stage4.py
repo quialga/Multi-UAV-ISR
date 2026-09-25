@@ -188,6 +188,18 @@ def _parse_args() -> argparse.Namespace:
                    default=d["tracker_red_slots"])
     p.add_argument("--tracker-obstacle-slots", type=int,
                    default=d["tracker_obstacle_slots"])
+    p.add_argument("--tracker-vel-prior-std", type=float, default=None,
+                   help="The RED TRACKER's velocity prior -- the \"how "
+                        "fast could a newborn track be moving\" scale, "
+                        "which lives in actor_graph.RED_TRACKER_CONFIG "
+                        "and was tuned at red v_max 1.0.  Leaving it "
+                        "there while --red-v-max is raised makes the "
+                        "filter over-confident from birth: measured "
+                        "nees 8.2-9.6 against a 4.0 target at red 1.4, "
+                        "against 3.8-5.5 at red 1.0.  Distinct from the "
+                        "env's vel_prior_std, which scales the BELIEF "
+                        "path's ridge and the actor's covariance "
+                        "features.  None = the config value.")
     p.add_argument("--tracker-sigma-cutoff", type=float,
                    default=d["tracker_sigma_cutoff"],
                    help="Red tracks with position sd above this (m) are "
@@ -554,6 +566,7 @@ def main() -> None:
         use_staleness           = args.use_staleness,
         staleness_regions       = args.staleness_regions,
         red_v_max               = args.red_v_max,
+        tracker_vel_prior_std   = args.tracker_vel_prior_std,
     )
 
     # Red policy mix parsing.
