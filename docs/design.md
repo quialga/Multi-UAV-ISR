@@ -133,6 +133,18 @@ Red `v_max_red = 1.0`.  Blue `v_max_blue = 1.5`.  This ratio guarantees pursuit
 is possible in principle but not trivial (red can dodge for a long time
 against a single UAV; coordination among blue UAVs matters).
 
+> **MEASURED 2026-09-25: the second half of that parenthesis is false at
+> this ratio.** Coordination does *not* matter at 1.5 vs 1.0. A blue in a
+> stern chase closes 0.5 per step, covering 100 units of a 130 m arena in
+> a 200-step episode, so pure pursuit essentially always wins.
+> `AssignmentGreedyPursuer` — a rule identical to uncoordinated greedy
+> except that the team divides the targets — is worth **−0.03 ± 0.13** at
+> red 1.0, i.e. nothing. It first pays at red **1.4** (+0.37 ± 0.17).
+> `red_v_max` is now an env parameter; see `stage4_backlog.md §21.3` for
+> the sweep and `stage4_results.md §12.2` for the discussion. Every
+> result recorded at this ratio was measured in a regime where dividing
+> the targets buys nothing.
+
 ### 3.7 Reward (Stage 1: shared team reward)
 
 Per step, the **whole blue team** receives:

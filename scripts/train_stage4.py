@@ -324,7 +324,11 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--log-interval",   type=int,   default=d["log_interval"])
     p.add_argument("--save-interval",  type=int,   default=d["save_interval"])
     p.add_argument("--no-eval",        action="store_true")
-    p.add_argument("--red-policy-mix", default="stationary:1,random:1,run:1")
+    p.add_argument("--red-policy-mix", default="stationary:1,random:1,run:1",
+                   help="weighted mix the red policy is sampled from PER "
+                        "EPISODE.  Training against a single red collapses "
+                        "out of distribution -- see docs/red_policy_mixing.md "
+                        "for the measurement that motivated this.")
     # GNN
     p.add_argument("--d-hidden",       type=int, default=d["d_hidden"])
     p.add_argument("--n-msg-rounds",   type=int, default=d["n_msg_rounds"])

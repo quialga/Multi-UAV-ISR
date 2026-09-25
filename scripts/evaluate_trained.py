@@ -10,16 +10,23 @@ Given a trained checkpoint:
 3. Render one GIF per scenario (trained blue vs each red).
 4. Also render Greedy blue vs Run on the same seed so the user can
    visually compare coordination behaviour.
-5. Write a markdown results writeup to ``docs/stage1_results.md`` with:
-   acceptance verdict, full eval table, GIF links, training metadata.
+5. Write a markdown results writeup with the acceptance verdict, the
+   full eval table, GIF links and training metadata.
 
 Run:
-    python scripts/evaluate_trained.py --checkpoint runs/stage1/<run>/best.pt
+    python scripts/evaluate_trained.py --checkpoint runs/stage4/<run>/best.pt
 
-Outputs land alongside the checkpoint:
-    runs/stage1/<run>/eval_gifs/
-    runs/stage1/<run>/eval_results.json
-    docs/stage1_results.md  (overwritten each call — by design)
+Every output lands ALONGSIDE THE CHECKPOINT, never in docs/:
+
+    runs/stage4/<run>/eval_gifs/
+    runs/stage4/<run>/eval_results.json
+    runs/stage4/<run>/eval_results.md      (or eval_results_stochastic.md)
+
+This docstring used to say the write-up went to ``docs/stage1_results.md``
+"overwritten each call — by design".  It does not: the default moved next
+to the checkpoint precisely because writing to a TRACKED doc meant any
+eval silently overwrote it (see the note at the ``--results-md`` default
+below).  ``--results-md`` still lets a caller aim it anywhere.
 """
 from __future__ import annotations
 
