@@ -708,45 +708,58 @@ worth doing).  Recommend starting with a `z_enabled=False` default
 that collapses to the current 2D arena, so existing checkpoints and
 tests stay valid.
 
-## 15. Learned trajectory prediction (belief-kernel / aux head) — ⚠️ BUILT, NEVER USED
+## 15. Learned trajectory prediction (belief-kernel / aux head) — ⛔ MEASURED, DECLINED (the `red_motion` arm)
 
-> **Status 2026-09-25.**  `isr/agents/learned_red_motion.py` exists,
-> four checkpoints are trained (`runs/red_motion/model_v{,2,3,4}.pt`),
-> and `--red-motion-ckpt` is threaded through the env, the config
-> defaults and `policy_loader.env_kwargs_from_checkpoint`.  So this is
-> not a proposal any more — it is an unused feature.
+> **Status 2026-09-25 — measured and closed.**  `stage4_results.md §14`
+> switched `--red-motion-ckpt` on, swept `sigma_a_model` under both the
+> pure evader and the trainer's `stationary:1,random:1,run:1` mix, and
+> **declined it**.  The earlier ⚠️ BUILT-NEVER-USED status is resolved:
+> it is now built, wired, measured and deliberately off.
 >
-> **Every result in `stage4_results.md` §7–§12 ran CONSTANT VELOCITY**
-> (`red_motion_ckpt=None`), including the tracker arm, the clone and both
-> PPO runs.  That matters for how they read: `run_from_nearest_uav` is a
-> REACTIVE evader that turns whenever the nearest blue moves, so the CV
-> assumption is systematically wrong for exactly the hardest red.  What
-> saves it is calibration rather than accuracy — §7.3 measured `nees`
-> 3.8–5.5 against its 4.0 target, so the filter inflates covariance
-> honestly instead of being confidently wrong.
+> **Why declined.**  Under the training mix the CV tracker already takes
+> **3.00/3 at both red 1.0 and 1.4** — captures are at ceiling, so there
+> is no headroom to demonstrate value on the metric that matters, and
+> every learned row ties it.  NEES is a wash (CV better at 1.0, the model
+> better at 1.4) and too noisy at n=25 to resolve.  The one real gain is
+> time-to-capture, 59.6 -> ~53 steps at red **1.0** — the regime we are
+> leaving — shrinking to ~2% at red 1.4.  Against that sits re-collecting
+> the dataset, retraining the model, then retraining the clone and PPO.
 >
-> **It is NOT a one-flag experiment** — an earlier version of this note
-> said it was, which the module's own docstring contradicts.  Three
-> things stand between it and a usable number:
+> **Two findings worth keeping** even though the arm is off:
 >
-> 1. **`sigma_a_model` is a placeholder.**  The adapter's own docstring:
->    *"the honest value comes from a NEES sweep against real rollouts...
->    treat any downstream number from this adapter as provisional."*
-> 2. **`vel_prior_std` is also uncalibrated** once red moves faster
->    (§21.3).  Both are fixed by the same instrument — a sweep checking
->    `nees` against its 4.0 target — so they want doing together.
->    `ppo_red14_v1` ran at `nees` 8.2–9.6, i.e. badly over-confident, so
->    this is a measured problem and not a theoretical one.
-> 3. **The model was trained at red v_max 1.0** and conditions on the
->    red's velocity, so at 1.4 it is out of distribution; §21.3 already
->    notes the dataset would need re-collecting.
+> 1. **A bias bug, fixed** (`pursuit_env.py:736`): the env never passed
+>    `red_v_max` to `LearnedRedMotion`, so `_advance()` clipped every
+>    predicted branch to `RED_TARGET.v_max` 1.0 while reds ran at 1.4 —
+>    up to 40% systematic under-prediction of speed.  The first sweep's
+>    red-1.4 rows measured that bug; its apparent 3.00/3 win did not
+>    survive the fix.
+> 2. **`sigma_a_model` is regime-dependent, not a constant to tune once.**
+>    The network emits a *categorical*, not a mean and covariance, so the
+>    branch covariance has three terms and which one dominates flips with
+>    the red policy mix.  Under the mix the model hedges and the basin
+>    spread dominates (`tracking_diagnostics.md §11.7`: 0.35 -> 0.0 moves
+>    NEES 1.64 -> 1.67); under a single red policy the hedging collapses
+>    and the additive term is everything (§14.2).  Documented in
+>    `learned_red_motion.py`'s docstring; `LEARNED_MOTION_CONFIG` stays at
+>    0.10 rather than overfit a 25-episode sweep in one geometry.
 >
-> What it does NOT need is a leak argument: the adapter's asymmetry is
+> **If it is ever revisited**, §14.7 records what v4 actually trained on:
+> arena 200, 7 blue / 9 obstacle caps, red v_max **1.0**, heuristic blues
+> — out of distribution on three axes at once against today's config.
+> `collect_red_motion_dataset.py` would need a `--red-v-max` that
+> **samples** rather than fixes the speed, or the same gap reopens as soon
+> as red speed becomes variable within an episode (§7 / variable-speed
+> work).
+>
+> What it never needed is a leak argument: the adapter's asymmetry is
 > sound.  `run_from_nearest_uav` reads BLUE positions and obstacle
 > geometry — our own drones, known exactly, and the obstacle tracker's
 > output — so the adversary's INPUTS are observable to us even though its
 > action is not.  Train/serve skew is designed out rather than tested
 > for: the adapter calls the same `featurize_shard` as the training path.
+>
+> The 15a / 15b proposals below are a *different* mechanism (an auxiliary
+> head inside the policy, not a tracker motion model) and remain open.
 
 **Motivation.**  The current belief-map diffusion uses a fixed
 isotropic 3×3 kernel (`enemy_belief_diffusion=0.2`) — effectively

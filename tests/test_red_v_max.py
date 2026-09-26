@@ -117,3 +117,26 @@ def test_a_faster_evader_is_measurably_harder_to_catch():
 
     slow, fast = caught_at(1.0), caught_at(1.45)
     assert slow > fast, (slow, fast)
+
+
+def test_the_learned_motion_model_gets_the_envs_red_speed():
+    """The tracker's motion model must clip predictions at the env's red
+    speed, not at ``RED_TARGET.v_max``.
+
+    ``LearnedRedMotion._advance`` clips every predicted branch to its own
+    ``v_max``.  The env used to construct the adapter without passing
+    ``red_v_max``, so the default 1.0 capped predictions while reds ran at
+    1.4 -- a systematic under-prediction of up to 40%.  That is BIAS, which
+    no covariance term can absorb, and it put a floor under NEES that a
+    ``sigma_a_model`` sweep could not get past (docs/stage4_results.md
+    Sec. 14.3).
+    """
+    import pytest
+    ckpt = "runs/red_motion/model_v4.pt"
+    if not __import__("pathlib").Path(ckpt).exists():
+        pytest.skip(f"{ckpt} not present")
+    env = PursuitEnv(**dict(BASE, sensor_radius=40.0, actor_obs="tracker",
+                            use_belief_maps=False, red_v_max=1.4,
+                            red_motion_ckpt=ckpt))
+    assert env._red_motion is not None
+    assert env._red_motion.v_max == env.red_v_max == 1.4

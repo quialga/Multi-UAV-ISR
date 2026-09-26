@@ -217,6 +217,15 @@ class PursuitEnv(ParallelEnv):
         # by 1.2 out of 24 of error, because a birth prior washes out
         # after a few updates.  None = the config's value.
         tracker_a_max:            Optional[float]    = None,
+        # The LEARNED motion model's per-branch residual covariance, added
+        # as sigma_a_model^2 * I to every branch.  Its shipped 0.10 is the
+        # placeholder the adapter's own docstring flags as untuned -- 14x
+        # tighter than the CV model's sigma_a of 1.414 -- and measured, it
+        # is why switching the model on makes NEES worse (12.4 -> 21.3 at
+        # red 1.0) even though track error IMPROVES (5.28 -> 4.78 m): the
+        # predictions are better and the claimed precision is not earned.
+        # Ignored unless red_motion_ckpt is set.  None = the config value.
+        tracker_sigma_a_model:    Optional[float]    = None,
         red_policy:               Optional[Callable] = None,
         seed:                     Optional[int]      = None,
         # ----- Reward shape (was hard-coded in _step) ---------------------
@@ -497,6 +506,8 @@ class PursuitEnv(ParallelEnv):
                                       else float(tracker_vel_prior_std))
         self.tracker_a_max = (None if tracker_a_max is None
                               else float(tracker_a_max))
+        self.tracker_sigma_a_model = (None if tracker_sigma_a_model is None
+                                      else float(tracker_sigma_a_model))
         assert self.tracker_a_max is None or self.tracker_a_max > 0.0
         assert (self.tracker_vel_prior_std is None
                 or self.tracker_vel_prior_std > 0.0)
@@ -722,9 +733,19 @@ class PursuitEnv(ParallelEnv):
                 LearnedRedMotion, load_red_motion_model,
             )
             model, blue_cap, obs_cap = load_red_motion_model(red_motion_ckpt)
+            # v_max MUST be the env's red speed, not the adapter's
+            # RED_TARGET.v_max default: _advance() clips every predicted
+            # branch to it, so leaving the default capped predictions at
+            # 1.0 while red_v_max was 1.4 -- a SYSTEMATIC under-prediction
+            # of up to 40%, which no covariance term can absorb (it is
+            # bias, not spread) and which showed up as a NEES floor of
+            # ~10.8 against a target of 4.0.
             self._red_motion = LearnedRedMotion(
                 model, blue_cap, obs_cap, arena_size=self.arena_size,
-                **actor_graph.LEARNED_MOTION_CONFIG)
+                v_max=self.red_v_max,
+                **dict(actor_graph.LEARNED_MOTION_CONFIG,
+                       **({} if tracker_sigma_a_model is None else
+                          {"sigma_a_model": float(tracker_sigma_a_model)})))
 
         # Mutable state — initialised in reset().
         self._blue_pos:   Optional[np.ndarray] = None

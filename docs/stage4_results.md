@@ -1818,12 +1818,188 @@ GRU's memory is the one proposed mechanism never tested.
 #### 13.5 Caveats
 
 * **One seed, one run**, as with §11 and §12.
-* **Constant-velocity tracker throughout.** `--red-motion-ckpt` is built,
-  trained and never used (`stage4_backlog.md §15`); the filter predicts
-  "it will keep going straight" about a *reactive* evader that turns
-  whenever the nearest blue moves. What kept that honest at red 1.0 was
-  calibration, and §13.2 is that calibration failing at 1.4.
+* **Constant-velocity tracker throughout.** The filter predicts "it will
+  keep going straight" about a *reactive* evader that turns whenever the
+  nearest blue moves. What kept that honest at red 1.0 was calibration,
+  and §13.2 is that calibration failing at 1.4. **§14 switched the learned
+  motion model on and measured it**: it ties CV on captures (both at the
+  3.00/3 ceiling under the training mix) and is not worth a retrain, so CV
+  stays. §14.6 also corrects the NEES figures quoted in §13.2 — they were
+  measured against the pure evader, not the training mix.
 * **`n_obstacles 0`**, so the obstacle half of the tracker path is still
   inert, as everywhere above.
 * **The 3.00/3 at rollout 85 was the peak of the noise.** The last eight
   evals mean 2.94 overall and 2.85 on the evader; quote those.
+
+---
+
+### 14. The learned red-motion model, switched on and measured (MEASURED, 2026-09-25) · `feature/target-tracking`
+
+§13.5 listed the constant-velocity tracker as a caveat: `--red-motion-ckpt`
+was built, trained and never used, so the filter predicts "it keeps going
+straight" about an evader that turns whenever the nearest blue moves.  This
+section switches it on and measures it.  **Verdict: it does not earn a
+retrain.**  The reasoning matters more than the verdict, because two of the
+three things found along the way are corrections to earlier claims here.
+
+#### 14.1 What the network actually emits — and why `sigma_a_model` exists
+
+The natural expectation is that a learned motion model replaces both halves
+of the constant-velocity assumption: the mean (`a = 0`) *and* the
+covariance (`Q = G (sigma_a^2 I) G^T`).  It does not.  `RedMotionGNN` emits
+a **categorical over a 181-cell (heading, magnitude) grid** — one flat
+softmax, no variance head.  So `LearnedRedMotion._basins` assembles each
+branch's covariance from three separate sources:
+
+| term | what it is | free? |
+|---|---|---|
+| spread of cell means across the basin, weighted by the network's own probabilities | the model's **self-reported** uncertainty | no |
+| within-cell quantisation spread | fixed property of the grid | no |
+| `sigma_a_model^2 * I` | the network's **error against the world** | **yes** |
+
+Only the third is tunable, and it exists precisely because the first cannot
+replace it: **the categorical says how concentrated the prediction is, never
+how wrong it is.**  A cross-entropy fit reports confidence on its training
+distribution and says nothing about generalisation at serve time.
+
+This also dissolves what looked like a paradox in the first measurement —
+track error improving while NEES got worse.  NEES is a *ratio*: error
+divided by declared covariance.  The learned model cut the numerator ~10%
+(5.28 -> 4.78 m) while `sigma_a_model = 0.10` cut the denominator far more
+(0.10 against CV's 1.414 is 14x in sd, ~200x in variance).  Numerator down
+a little, denominator down a lot, ratio up: 12.4 -> 21.3.  That is the
+signature of a better predictor with badly declared confidence, not of a
+worse predictor.
+
+#### 14.2 Which term dominates flips between regimes
+
+`docs/tracking_diagnostics.md §11.7` calibrated the shipped `0.10` and found
+`sigma_a_model` **nearly inert**: 0.35 -> 0.0 moved the NEES median
+1.64 -> 1.67, because v4 has to hedge across stationary/random/run and the
+basin spread carries the uncertainty.  The first sweep here found the
+opposite — 0.10 -> 0.70 moving NEES 19.8 -> 10.8 — because it was run
+against **pure `run_from_nearest_uav`**, where the model stops hedging, the
+basin term collapses and the additive term is all that is left.
+
+Both are right about their own regime.  The value does not transfer, and
+the sweep below therefore measures **both** the pure evader and the
+trainer's actual `stationary:1,random:1,run:1` mix.
+
+#### 14.3 A bug that invalidated the first sweep
+
+`PursuitEnv` constructed `LearnedRedMotion` without passing `red_v_max`, so
+the adapter kept its `RED_TARGET.v_max` default of **1.0** while the env ran
+reds at **1.4**.  `_advance()` clips every predicted branch to that cap:
+a systematic under-prediction of speed by up to 40%.
+
+That is **bias, not spread**, so no covariance term can absorb it — and it
+is the most likely explanation for the NEES floor around 10.8 that the
+first sweep could not get past.  Fixed at `pursuit_env.py:736`
+(`v_max=self.red_v_max`), with the reasoning in a comment so it is not
+re-introduced.
+
+**The first sweep's red-1.4 rows measured this bug**, and its headline
+result did not survive the fix:
+
+| red 1.4, `sigma_a_model` | before (capped at 1.0) | after (cap fixed) |
+|---|---|---|
+| 0.10 (shipped) | nees 19.77, caught 2.80 | nees 15.04, caught 2.84 |
+| **0.70** | nees 10.79, caught **3.00** | nees 14.29, caught **2.88** |
+| CV baseline | nees 12.31, caught 2.92 | unchanged (does not use the model) |
+
+The 3.00/3 that made the model look like a clear win was an artefact.
+
+#### 14.4 The sweep, cap fixed
+
+`ppo_red14_v1/best.pt`, deterministic, 25 matched seeds per row, NEES
+target 4.0.  `mix` resamples one policy per episode exactly as the trainer
+does.
+
+**Pure `run_from_nearest_uav`** (1/3 of the training distribution):
+
+| red | `sigma_a_model` | nees | trk (m) | caught | steps |
+|---|---|---|---|---|---|
+| 1.0 | CV | 12.40 | 5.28 | 3.00 | 80.4 |
+| 1.0 | 0.70 | 15.53 | 4.93 | 3.00 | **69.8** |
+| 1.4 | CV | 12.31 | 3.81 | **2.92** | 120.4 |
+| 1.4 | 0.85 | 10.52 | 3.99 | 2.92 | 111.1 |
+
+**The trainer's mix** — the regime that actually matters:
+
+| red | `sigma_a_model` | nees | trk (m) | caught | steps |
+|---|---|---|---|---|---|
+| 1.0 | CV | **5.92** | 6.35 | 3.00 | 59.6 |
+| 1.0 | 0.40 | 8.39 | 5.82 | 3.00 | 54.0 |
+| 1.0 | 0.85 | 7.70 | 6.27 | 3.00 | 55.3 |
+| 1.4 | CV | 10.48 | 5.53 | 3.00 | 68.1 |
+| 1.4 | 0.85 | **8.94** | 5.43 | 3.00 | **66.6** |
+
+#### 14.5 Why the gate fails
+
+**Captures are at ceiling.**  Under the training mix CV already takes 3.00/3
+at both speeds.  There is no headroom for the motion model to demonstrate
+value on the metric the project is judged by, and every learned row ties it.
+
+The remaining axes are close and noisy:
+
+* **NEES** — CV wins at red 1.0 (5.92 against the best learned 7.70),
+  the model wins at 1.4 (8.94 against 10.48).  A wash.  And across the
+  sweep NEES has no monotone trend at all (at red 1.4, pure evader:
+  15.0, 17.2, 11.9, 14.3, 10.5, 12.6, 15.3), so at n=25 the estimator's
+  own variance exceeds the effect being swept.  **`sigma_a_model` is not
+  a strong lever here**, which is §11.7's finding reproduced.
+* **Track error** — the model is marginally better everywhere
+  (5.43–6.27 m against 5.53–6.35 m).  Within noise.
+* **Time to capture** — the one real gain: 59.6 -> 51.2–55.3 steps under
+  the mix at red 1.0, about 12%, and the pure-evader block agrees
+  (80.4 -> 69.8).  But at red **1.4** it shrinks to 68.1 -> 66.6, ~2%.
+
+So the only solid improvement is time-to-capture **in the regime we are
+leaving**.  Against that: re-collecting the dataset, retraining the motion
+model, then retraining the clone and PPO on top.  Not worth it.
+
+**Decision: keep the constant-velocity tracker.**  The learned path stays
+built, wired and now measured rather than assumed.
+
+#### 14.6 Two corrections to earlier claims
+
+* **"NEES bottoms out at 11.6 against a 4.0 target, the error is
+  systematic"** (§13.2 and the `sweep_tracker_calibration` work) was
+  measured against **pure `run_from_nearest_uav`**.  Under the actual
+  training mix the CV tracker reads **5.92 at red 1.0** — 1.9 from target,
+  not 8.4.  The tracker is far better calibrated in the regime it trains
+  in than that line implied.  The degradation at red 1.4 is real
+  (5.92 -> 10.48), and that part of §13.2 stands.
+* **§13.5's caveat** that `--red-motion-ckpt` is "built, trained and never
+  used" is superseded by this section; `stage4_backlog.md §15` likewise.
+
+#### 14.7 What v4 was trained on, and what retraining would need
+
+Recorded because the question recurs and the answer is not in any one file:
+
+| | v4 dataset | current training config |
+|---|---|---|
+| reds | `stationary / random / run` | same |
+| blues | `GreedyPursuer` + `RandomAgent`, p_greedy ~ U(0.3, 1.0) | trained PPO policy |
+| red `v_max` | **1.0** (the collector has no flag) | **1.4** |
+| arena | **200** | **130** |
+| capacities | 7 blue / 9 obstacle | 5 blue / 0 obstacle |
+
+So v4 is out of distribution on speed, arena and blue policy simultaneously.
+If it is ever revisited, `collect_red_motion_dataset.py` needs a
+`--red-v-max` that **samples** rather than fixes the speed — otherwise the
+same gap reopens the moment red speed becomes variable within an episode.
+
+#### 14.8 Caveats
+
+* **25 episodes per row**, which the NEES non-monotonicity shows is not
+  enough to resolve `sigma_a_model` — but is enough for the capture-ceiling
+  argument, which is what the decision rests on.
+* **`LEARNED_MOTION_CONFIG` is left at 0.10.**  Under this geometry 0.85
+  looks better, but that rests on the same 25-episode noise, and 0.10 was
+  calibrated correctly for §11.7's geometry (arena 200).  Changing a
+  global default to fit one noisy sweep in one geometry would be
+  overfitting; the regime-dependence is documented in the adapter's
+  docstring instead.
+* **`n_obstacles 0`**, so `o2r` edges — a third of what the model
+  conditions on — were inert in every row above.

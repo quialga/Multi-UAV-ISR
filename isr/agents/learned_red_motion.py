@@ -31,11 +31,30 @@ field dict and calls the SAME ``featurize_shard`` the training path uses.
 There is no second copy of the normalisation conventions to drift.
 ``tests/test_learned_red_motion.py`` pins the equivalence anyway.
 
-The residual per-branch covariance is NOT yet tuned.  ``sigma_a_model``
-below is a placeholder standing in for the network's own error; the honest
-value comes from a NEES sweep against real rollouts, exactly as
-``sigma_a`` was tuned for the obstacle tracker.  Until then, treat any
-downstream number from this adapter as provisional.
+WHAT THE NETWORK DOES AND DOES NOT GIVE YOU.  It emits a CATEGORICAL over
+the 181-cell (heading, magnitude) grid -- not a mean and a covariance.  So
+``_basins`` builds each branch's covariance from three separate things:
+
+  1. the spread of the cell means across the basin, weighted by the
+     network's own probabilities -- the model's SELF-REPORTED uncertainty;
+  2. the within-cell quantisation spread, a fixed property of the grid;
+  3. ``sigma_a_model**2 * I`` -- the network's own ERROR against the world.
+
+Only (3) is a free parameter, and it exists precisely because (1) cannot
+substitute for it: the categorical says how CONCENTRATED the prediction is,
+never how WRONG it is.  A cross-entropy fit reports confidence on its
+training distribution and says nothing about generalisation at serve time.
+
+``sigma_a_model`` is therefore REGIME-DEPENDENT, and which term dominates
+flips between regimes.  Against the trainer's stationary/random/run mix the
+model must hedge, (1) dominates, and the term is nearly inert: 0.35 -> 0.0
+moved the NEES median 1.64 -> 1.67 (docs/tracking_diagnostics.md Sec. 11.7,
+which is where the shipped 0.10 comes from).  Against a SINGLE red policy
+with purposeful blues the hedging disappears, (1) collapses, and the term
+becomes the whole story: 0.10 -> 0.70 moved NEES 19.8 -> 10.8
+(docs/stage4_results.md Sec. 14).  Re-calibrate when the red policy mix,
+the blue policy or the geometry changes -- a value tuned in one regime does
+not transfer to the other.
 """
 from __future__ import annotations
 
@@ -118,8 +137,8 @@ class LearnedRedMotion:
         # only changes how finely the modes are resolved.
         self.max_branches = int(max_branches)
         # Stands in for the NETWORK's own error, on top of the within-bin
-        # quantisation spread computed per branch below.  Placeholder --
-        # see the module docstring.
+        # quantisation spread and the basin spread computed per branch
+        # below.  Regime-dependent -- see the module docstring.
         self.sigma_a_model = float(sigma_a_model)
         self.device = device
 
