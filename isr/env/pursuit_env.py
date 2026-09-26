@@ -202,6 +202,15 @@ class PursuitEnv(ParallelEnv):
         # off rather than running it down, which is the only condition
         # under which coordination can pay.
         red_v_max:                Optional[float]    = None,
+        # Range of the BLUE-TO-BLUE datalink, decoupled from
+        # ``sensor_radius`` (backlog §7).  A bb edge carries a MESSAGE
+        # between our own drones, not a sensor return, and a radio
+        # outranging an onboard sensor by an order of magnitude is the
+        # normal case in real UAV teams — so gating both with one number was
+        # a modelling accident.  ``float('inf')`` = blues always talk.
+        # None = ``sensor_radius``, i.e. exactly the pre-flag behaviour that
+        # every result in docs/stage4_results.md was measured under.
+        comms_radius:             Optional[float]    = None,
         # The RED TRACKER's own velocity prior — NOT the env's
         # ``vel_prior_std`` below, which scales the belief path's velocity
         # ridge and the actor's covariance features.  The tracker's lives
@@ -415,6 +424,13 @@ class PursuitEnv(ParallelEnv):
             The full-state ``structured_observation()`` remains
             unaffected — used by the CTDE critic.
 
+        comms_radius: range of the blue-to-blue datalink, which gates
+            ``bb_edge_visible`` independently of ``sensor_radius``.
+            ``float('inf')`` = blues always talk.  None = ``sensor_radius``,
+            the pre-flag behaviour every result in docs/stage4_results.md
+            was measured under.  It does NOT touch ``rb_edge_visible``:
+            seeing a target is sensing, talking to a wingman is radio.
+
         Stage 4 params
         --------------
         n_obstacles                Number of static circular obstacles
@@ -516,6 +532,16 @@ class PursuitEnv(ParallelEnv):
         self.sensor_radius: Optional[float] = (
             float(sensor_radius) if sensor_radius is not None else None
         )
+        # Resolved to a plain float so ``_compute_edge_visibility`` never has
+        # to re-derive the default: None means "as far as I can see", which
+        # is the pre-flag behaviour.  When sensor_radius is None the env is
+        # fully observable and both masks are all ones anyway, so inf is the
+        # consistent resolution there.
+        self.comms_radius: float = (
+            (float("inf") if self.sensor_radius is None else self.sensor_radius)
+            if comms_radius is None else float(comms_radius)
+        )
+        assert self.comms_radius > 0.0, "comms_radius must be positive"
 
         # ---- Stage 4 knobs ------------------------------------------------
         self.n_obstacles              = int(n_obstacles)
@@ -1749,12 +1775,22 @@ class PursuitEnv(ParallelEnv):
 
         Convention (see docs/stage3_design.md §2.2):
         - A bb edge ``(i -> j)`` is visible iff
-          ``distance(blue_j, blue_i) <= sensor_radius`` — the RECEIVER
+          ``distance(blue_j, blue_i) <= comms_radius`` — the RECEIVER
           is what matters.  Because Euclidean distance is symmetric,
           bb visibility for a pair (i, j) is symmetric across the two
           directed edges (i->j and j->i are both visible together).
         - A rb edge ``(r -> b)`` is visible iff
           ``distance(blue_b, red_r) <= sensor_radius``.
+
+        TWO radii, deliberately.  A rb edge is a SENSING event: blue b has
+        to detect red r itself, so ``sensor_radius`` is the right gate.  A bb
+        edge is a MESSAGE between our own drones, which is a radio link, not
+        a sensor — and a datalink outranging an onboard sensor by an order of
+        magnitude is the normal case in real UAV teams.  Tying the two to one
+        number was a modelling accident of Stage 3, and it silently made
+        "blue i knows where blue j is" as hard as "blue i can see a target".
+        ``comms_radius`` decouples them (backlog §7); it defaults to
+        ``sensor_radius``, so every pre-flag checkpoint is unaffected.
 
         When ``sensor_radius`` is None (fully observable), both masks
         are all ones (Stage 2 behaviour, preserved).
@@ -1772,10 +1808,15 @@ class PursuitEnv(ParallelEnv):
 
         R = self.sensor_radius
         # bb: receiver = bb_edge_dst.  Distance receiver-to-sender.
-        bb_recv = self._blue_pos[self.bb_edge_dst]
-        bb_send = self._blue_pos[self.bb_edge_src]
-        bb_dists = np.linalg.norm(bb_recv - bb_send, axis=1)
-        bb_visible = (bb_dists <= R).astype(np.float32)
+        if np.isinf(self.comms_radius):
+            # Unlimited comms: skip the distance computation entirely rather
+            # than compare against inf, so the common case costs nothing.
+            bb_visible = np.ones(n_bb, dtype=np.float32)
+        else:
+            bb_recv = self._blue_pos[self.bb_edge_dst]
+            bb_send = self._blue_pos[self.bb_edge_src]
+            bb_dists = np.linalg.norm(bb_recv - bb_send, axis=1)
+            bb_visible = (bb_dists <= self.comms_radius).astype(np.float32)
 
         # rb: receiver blue = rb_edge_dst, sender red = rb_edge_src.
         rb_recv = self._blue_pos[self.rb_edge_dst]
@@ -2470,14 +2511,15 @@ class PursuitEnv(ParallelEnv):
         (what an operator staring at a track display would see).
 
         Consequence: the per-step GNN ally-comms mask
-        ``bb_edge_visible`` (sensor-radius-gated) is a separate
+        ``bb_edge_visible`` (``comms_radius``-gated) is a separate
         thing entirely -- it models per-step UAV-to-UAV messaging,
         not the command-layer fusion.  A UAV out of comms with
         peers can still contribute evidence to the map because
         command receives its raw sensor returns over the C2
-        downlink.  Backlog §13b (command-link gating on peaks)
-        and §7 (decoupled ``comms_radius``) together open the
-        door to studying degraded-network scenarios.
+        downlink.  ``comms_radius`` is now decoupled from
+        ``sensor_radius`` (backlog §7, landed); backlog §13b
+        (command-link gating on peaks) would open the rest of the
+        door to degraded-network scenarios.
 
         Channel layout (2 channels):
         - 0: P(enemy)    -- Bayesian log-odds from noisy sensors
@@ -2943,9 +2985,8 @@ class PursuitEnv(ParallelEnv):
         "position broadcast over TDL"; strictly speaking, tracks
         travel over the C2 downlink from command to each UAV; the
         UAV-to-UAV TDL is a separate channel modelled here by
-        ``bb_edge_visible`` (per-step GNN messaging, sensor-radius-
-        gated).  Backlog §7 tracks decoupling the messaging range
-        into its own ``comms_radius`` knob.
+        ``bb_edge_visible``, gated by its own ``comms_radius``
+        (backlog §7, landed) rather than by ``sensor_radius``.
         """
         N = self.n_blue
         K = track_pos.shape[0]

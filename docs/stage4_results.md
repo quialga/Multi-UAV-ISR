@@ -2124,3 +2124,91 @@ capture gain does not exist.
 * The unwinnable-episode fraction at red 1.5 is **not** measured.  Until it
   is, "2.72 is the ceiling" is a statement about this configuration, not
   about the task.
+
+---
+
+### 16. `comms_radius`, and why the free ablation cannot answer the question (MEASURED, 2026-09-26) · `feature/target-tracking`
+
+`bb_edge_visible` was gated by `sensor_radius` — the same number that decides
+whether a blue can DETECT A TARGET.  That conflated two physically different
+channels: a bb edge is a radio message between our own drones, and a datalink
+outranging an onboard sensor by an order of magnitude is the normal case in
+real UAV teams.  Backlog §7 tracked decoupling them; `comms_radius` does it,
+defaulting to `sensor_radius` so every earlier result is untouched.  It does
+**not** touch `rb_edge_visible`: seeing a target is sensing.
+
+Then, before spending a retrain on it, an eval-time ablation — free, because
+`comms_radius` changes no tensor shapes (bb edges are already complete,
+`n_blue*(n_blue-1)`; only the mask moves).
+
+#### 16.1 The ablation, and the confound that invalidates it
+
+`ppo_red15_v2/final.pt`, red 1.5, 50 matched seeds, deterministic.  The
+policy trained with comms gated at `sensor_radius` 40.
+
+The second column is measured separately, on the **same fixed states** (59
+sampled from trajectories the policy visits under its trained mask), so the
+input perturbation is isolated from the trajectory divergence:
+
+| `comms_radius` | rel. bb magnitude | caught | steps |
+|---|---|---|---|
+| 20 | **0.55x** | **2.88 ± 0.05** | 141.2 |
+| 40 (as trained) | 1.00x | 2.72 ± 0.08 | 143.8 |
+| 60 | 1.56x | 2.70 ± 0.08 | 151.5 |
+| 90 | 2.23x | 2.26 ± 0.11 | 177.6 |
+| 130 | 2.48x | 1.70 ± 0.15 | 187.5 |
+| inf | 2.50x | **1.26 ± 0.16** | 190.4 |
+
+**The damage tracks the magnitude, not the information.**  The policy
+aggregates ally messages with an UNNORMALISED SUM — `agg.index_add_(1,
+self.bb_dst, msg_bb)`, with `bb_visible` multiplied into `msg_bb` first — so
+the count of open bb edges scales what reaches `update_mlp`.  Opening the
+radio to `inf` multiplies that term by 2.5x against what the policy trained
+on; the score collapses to 1.26, barely above `AssignGreedy`'s 1.06 (§15.2).
+Narrowing to 20 m is a *smaller* perturbation (0.55x) and the score goes
+slightly UP.
+
+`gnn_stage4_policy.py` already knows this failure mode.  Its region path is
+normalised for exactly this reason — *"an unnormalised `index_add_` SUM would
+grow with K, making the resolution R also a scale knob on this pathway"* —
+and `bb`/`rb`/`ob` were left as raw sums.
+
+**So the ablation cannot answer the question in EITHER direction.**  The
+pre-registered reading was: a drop proves nothing (out-of-distribution inputs
+degrading a policy is the expected null), a rise would be strong evidence, and
+a flat response to *narrowing* would say the policy barely uses ally edges.
+What was not anticipated is that **narrowing helping is equally
+uninformative** — it is just a gentler perturbation.  Neither the 1.26 nor
+the 2.88 says anything about ally information.
+
+One crack in the scale story, left standing rather than argued away: 130 and
+`inf` differ by almost nothing in magnitude (2.48x against 2.50x) yet score
+1.70 against 1.26, about 2.4 SE apart.  Scale alone does not explain all of
+it; once trajectories diverge, everything compounds.
+
+#### 16.2 What can answer it
+
+A retrain.  That comparison is **not** confounded: both policies train to
+convergence under their own aggregate scale, so comparing `red15_v2` against
+a run with `--comms-radius inf` is an end-to-end comparison of two trained
+policies, which is the question actually being asked.
+
+#### 16.3 A latent confound worth recording
+
+The same unnormalised sum makes **blue team size** a scale knob on the bb
+pathway, since `n_blue` sets the edge count.  It does not bite today —
+`n_blue` is fixed at 5, and there are `--n-red-min` and `--n-obstacles-min`
+flags but no `--n-blue-min` — but any future variable-blue-count work
+inherits it.  Normalising bb/rb/ob the way the region path already is would
+remove both this and the `comms_radius` scale coupling, at the cost of
+invalidating every existing checkpoint.
+
+#### 16.4 Caveats
+
+* The ablation is **one checkpoint**.  A different policy might be more or
+  less scale-sensitive.
+* The magnitude column is a proxy: it counts open edges rather than measuring
+  `||agg||` through the network, so it captures the scaling mechanism but not
+  the non-linear response to it.
+* `n_obstacles 0`, so the `ob` pathway was inert and its own sum-scaling
+  never exercised.

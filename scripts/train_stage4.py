@@ -79,6 +79,18 @@ def _parse_args() -> argparse.Namespace:
                         "Raise it to make cutting a target off the only way "
                         "to catch it.  CHANGES THE TASK: results are not "
                         "comparable across values.")
+    p.add_argument("--comms-radius", type=float, default=None,
+                   help="Range of the blue-to-blue datalink, gating "
+                        "bb_edge_visible independently of --sensor-radius. "
+                        "Pass inf so blues always talk, which is the "
+                        "realistic case: a bb edge is a RADIO MESSAGE "
+                        "between our own drones, not a sensor return, and a "
+                        "datalink outranging an onboard sensor by an order "
+                        "of magnitude is normal in real UAV teams.  Unset = "
+                        "--sensor-radius, the pre-flag behaviour every "
+                        "result in docs/stage4_results.md was measured "
+                        "under.  Does NOT affect rb edges: seeing a target "
+                        "is sensing.  See docs/stage4_backlog.md section 7.")
     # Stage 4 obstacle + belief knobs
     p.add_argument("--n-obstacles",           type=int,   default=d["n_obstacles"])
     p.add_argument("--n-red-min", type=int, default=d.get("n_red_min", None),
@@ -566,6 +578,7 @@ def main() -> None:
         use_staleness           = args.use_staleness,
         staleness_regions       = args.staleness_regions,
         red_v_max               = args.red_v_max,
+        comms_radius            = args.comms_radius,
         tracker_vel_prior_std   = args.tracker_vel_prior_std,
     )
 

@@ -192,6 +192,9 @@ def env_kwargs_from_checkpoint(train_args: dict) -> dict:
         # None = RED_TARGET.v_max, which is what every pre-flag checkpoint
         # trained under.
         red_v_max                = g("red_v_max", None),
+        # None = sensor_radius, i.e. bb edges gated exactly as they were
+        # before comms_radius existed.
+        comms_radius             = g("comms_radius", None),
         tracker_vel_prior_std    = g("tracker_vel_prior_std", None),
         tracker_a_max            = g("tracker_a_max", None),
     )

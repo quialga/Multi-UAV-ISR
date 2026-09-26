@@ -386,10 +386,37 @@ live-critic version turns out to be a limiter in some future stage.
 we care about.  Current runs (`belief_v3` 3.00/3, `obstacles_v1`
 2.95/3) do not motivate the extra cost.
 
-## 7. Decoupled `comms_radius` for ally GPS uplink  **[PARTIALLY LANDED]**
+## 7. Decoupled `comms_radius` for ally GPS uplink  **[✅ KNOB LANDED 2026-09-26 — the EXPERIMENT is what remains]**
 
-**Current state (v6.x — different from the sketch below).**
-`bb_edge_visible` is NOT identically 1 as originally planned — it is
+> **Status 2026-09-26.**  The knob exists: `PursuitEnv(comms_radius=...)`,
+> `--comms-radius` on the trainer, round-tripped through
+> `env_kwargs_from_checkpoint`, 8 tests in `tests/test_comms_radius.py`.  It
+> defaults to `sensor_radius`, so every result in `stage4_results.md` is
+> untouched.  It gates bb edges only — rb visibility is sensing, not radio.
+>
+> **What is NOT settled is whether unlimited comms helps**, and
+> `stage4_results.md §16` explains why the cheap version of that experiment
+> cannot settle it.  The eval-time ablation on `ppo_red15_v2/final.pt`
+> collapses from 2.72 to **1.26** at `comms_radius=inf` — but the policy
+> aggregates ally messages with an UNNORMALISED SUM, so opening the radio
+> multiplies that term by 2.5x against what it trained on.  The damage
+> tracks the magnitude, not the information: narrowing to 20 m is a gentler
+> perturbation (0.55x) and the score goes slightly UP, to 2.88.  Neither
+> number is evidence about ally information.
+>
+> **So the remaining work is a RETRAIN** with `--comms-radius inf`, compared
+> end-to-end against `ppo_red15_v2/final.pt` (2.72 ± 0.08 at red 1.5,
+> §15.2).  That comparison is not confounded: both policies converge under
+> their own aggregate scale.
+>
+> **Related latent issue (§16.3).**  The same unnormalised sum makes blue
+> TEAM SIZE a scale knob on the bb pathway.  Inert today (`n_blue` fixed at
+> 5, no `--n-blue-min` flag) but any variable-blue-count work inherits it.
+> Normalising bb/rb/ob as the region path already is would fix both, at the
+> cost of invalidating every existing checkpoint.
+
+**Historical sketch (superseded by the implementation above).**
+`bb_edge_visible` was NOT identically 1 as originally planned — it was
 gated by `sensor_radius`:
 
 ```
