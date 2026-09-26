@@ -2003,3 +2003,124 @@ same gap reopens the moment red speed becomes variable within an episode.
   docstring instead.
 * **`n_obstacles 0`**, so `o2r` edges — a third of what the model
   conditions on — were inert in every row above.
+
+---
+
+### 15. Red 1.5: where pure pursuit stops working (MEASURED, 2026-09-26) · `feature/target-tracking`
+
+§13 measured coordination at red 1.4 and found it worth +0.37 — real, but
+thin next to a Greedy baseline already scoring 2.50/3.  The reason to go to
+1.5 is geometric rather than incremental: `BLUE_UAV.v_max` is **1.5**, so at
+red 1.5 the evader is exactly as fast as its pursuers and chasing from
+behind can never close.  Capture has to come from interception, which means
+**coordination stops being an advantage and becomes a requirement**.
+
+That prediction is visible before any training, in the heuristic baselines
+the trainer prints at startup:
+
+| Greedy vs the evader | caught | steps |
+|---|---|---|
+| red 1.4 | 2.50 / 3 | 169.2 |
+| **red 1.5** | **1.00 / 3** | 191.0 |
+
+Pure chase falls off a cliff between 1.4 and 1.5.  That is what makes 1.5
+the regime with measurable headroom — and §14 had just shown how easily a
+saturated metric wastes an experiment.
+
+#### 15.1 Two training cycles
+
+Both warm-started, `n_rollouts 100`, otherwise identical to `ppo_red14_v1`
+(verified by diffing the reconstructed args dict against the checkpoint's,
+which caught a `belief_grid_size` default that had drifted 26 -> 40 since
+that run and would have silently changed the comparison).
+
+| run | warm start | `lr` | elapsed |
+|---|---|---|---|
+| `ppo_red15_v1` | `ppo_red14_v1/best.pt` | 3e-05 | 322.7 min |
+| `ppo_red15_v2` | `ppo_red15_v1/final.pt` | **6e-05** | 341.3 min |
+
+The second cycle exists because v1's optimizer diagnostics said its plateau
+was partly the learning-rate schedule and not convergence: at rollout 100
+`kl` was **0.0011** against a `target_kl` of 0.03 — 27x below, so the trust
+region *never once* cut an update short — with `clip` down to 0.006 and
+`lr` decayed to 3e-06.  Entropy had not collapsed (0.510 -> 0.564), so
+exploration was still alive.  The binding constraint was the schedule.
+
+Raising `lr` to 6e-05 confirmed that reading and then hit the same wall:
+v2's `kl` peaked at **0.0095**, still a third of target, and v2 was flat
+from rollout 5 to 100 across a 4x range of `lr`.  **So ~2.7 is a real
+ceiling for this configuration at red 1.5, and the bottleneck is not the
+optimizer.**  A third cycle at a higher `lr` is not the lever; what remains
+is the reward shape, the observation, network capacity, or the fraction of
+episodes at red 1.5 that are simply unwinnable.
+
+#### 15.2 The reference table
+
+50 matched seeds, `run_from_nearest_uav`, deterministic, tracker
+observation.  The heuristics run in the **same partial-observability env as
+the policy** — unlike the trainer's startup baselines, which use
+`sensor_radius=None` and so are not comparable.
+
+| blue | red | caught | steps | return |
+|---|---|---|---|---|
+| `ObsGreedy` | 1.5 | 0.66 ± 0.11 | 197.2 | -13.58 |
+| `AssignGreedy` | 1.5 | 1.06 ± 0.14 | 192.7 | -7.38 |
+| `red14/best`, no retraining | 1.5 | 2.16 ± 0.13 | 170.1 | 10.04 |
+| `red15_v1/final` | 1.5 | 2.72 ± 0.08 | 148.4 | 19.20 |
+| `red15_v2/best` | 1.5 | 2.72 ± 0.09 | 149.2 | 19.09 |
+| **`red15_v2/final`** | 1.5 | **2.72 ± 0.08** | **143.8** | **19.29** |
+| `red15_v2/final` | 1.4 | 2.96 ± 0.03 | 109.9 | 24.47 |
+| `red14/best` | 1.4 | 2.92 ± 0.04 | 118.2 | 23.79 |
+
+**`red15_v2/final` is the reference checkpoint** for everything downstream:
+tied on captures, fewest steps, best return.
+
+#### 15.3 What the table says
+
+* **The coordination claim gets its cleanest evidence yet.**  Against the
+  best heuristic in the same observation regime, 2.72 against **1.06** —
+  a margin of **+1.66, about 10 SE**.  At red 1.4 the comparable margin was
+  +0.34.  Whatever the policy is doing, it is not pursuit: pursuit is on the
+  table at 1.06 and 0.66.
+* **Coordination's value keeps growing with red speed.**  The
+  `AssignGreedy` − `ObsGreedy` gap — coordination by construction, target
+  division, nothing learned — reads **−0.03 at red 1.0** (§13), **+0.37 at
+  1.4** (§13), **+0.40 at 1.5**.  Monotone, and the sign flip between 1.0
+  and 1.4 is the whole story of why §13 had to move off 1.0.
+* **The curriculum step was worth +0.56.**  `red14/best` transplanted to
+  1.5 with no retraining scores 2.16; trained at 1.5 it reaches 2.72.  At
+  these SEs that is ~3.6 SE — solid.  Note the training log *understated*
+  this: its rollout-5 eval already read 2.32, because five rollouts of
+  training had happened by then.
+* **No catastrophic forgetting.**  Trained at 1.5, the policy scores
+  **2.96 ± 0.03 back at red 1.4**, against `red14/best`'s 2.92 ± 0.04 — a
+  tie at worst, and 7% fewer steps.  The harder regime cost nothing on the
+  easier one it came from.
+
+#### 15.4 A correction
+
+**The second cycle did not improve captures.**  Reading the training logs,
+v2's mean over its last eight evals was 2.750 against v1's 2.590, and that
+was reported here as "+0.16, the `lr` bump paid off".  Measured properly —
+both final checkpoints on the same 50 seeds — they are **identical at
+2.72 ± 0.08**.  The 25-episode evals in the log were noisier than the
+difference, and v1's last-eight window happened to include its 2.28 dip at
+rollout 90.
+
+What v2 did buy is ~3% in time-to-capture (143.8 against 148.4 steps) and
+the ceiling argument in §15.1, which was the methodological reason for
+running it: an under-trained 1.5 reference would confound any later
+`comms_radius` result with "more training".  That reason still holds.  The
+capture gain does not exist.
+
+#### 15.5 Caveats
+
+* **One seed per run**, as with §11–§14.  Two cycles at different `lr` are
+  not two seeds.
+* **`n_obstacles 0`**, as everywhere above.
+* **Constant-velocity tracker**, per §14's decision.
+* `stat` and `rand` sit at 3.00 throughout, so every number that moves here
+  is the evader's.
+* The unwinnable-episode fraction at red 1.5 is **not** measured.  Until it
+  is, "2.72 is the ceiling" is a statement about this configuration, not
+  about the task.
