@@ -81,6 +81,15 @@ started=$(date '+%Y-%m-%d %H:%M:%S')
 declare -A STATUS
 
 write_summary() {
+  # `local` is NOT optional here.  Bash functions share the caller's scope, so
+  # an earlier version of this loop reused the names `label` and `cr` and
+  # clobbered the arm loop's own variables on the first call -- every log line,
+  # STATUS key and output filename after that point carried the LAST arm's
+  # label, which would have made arm 2 overwrite arm 1's results.  The
+  # training itself was unaffected (bc_name/ppo_name/env_args are computed
+  # before the first call and never reassigned), which is exactly what made it
+  # quiet.
+  local arm label cr stage key st res num
   {
     echo "# comms_radius experiment"
     echo
@@ -120,6 +129,12 @@ write_summary() {
 
 log() { echo "[$(date '+%H:%M:%S')] $*"; }
 
+# Resume: a stage whose checkpoint already exists is not redone.  Cheap
+# insurance on a ~31 h batch -- the first launch had to be killed five minutes
+# into arm 1's PPO to fix a bookkeeping bug, and without this the 1.6 h clone
+# would have been thrown away with it.  Delete a run's directory to force it.
+have_ckpt() { [ -s "runs/stage4/$1/best.pt" ] || [ -s "runs/stage4/$1/final.pt" ]; }
+
 write_summary
 log "comms experiment starting; ${#ARMS[@]} arms, summary at $SUMMARY"
 
@@ -131,6 +146,14 @@ for arm in "${ARMS[@]}"; do
   env_args="$ENV_BASE --comms-radius $cr"
 
   # ---- clone -------------------------------------------------------- #
+  if have_ckpt "$bc_name"; then
+    log "$label: clone already present, reusing runs/stage4/$bc_name"
+    STATUS["$label/bc"]="reused"
+    $PY scripts/eval_checkpoint.py \
+        --ckpt "runs/stage4/$bc_name/best.pt" --episodes 50 --reds all \
+        > "$OUT/${label}_bc_eval.txt" 2>&1 || true
+    write_summary
+  else
   log "$label: clone (comms_radius=$cr)"
   STATUS["$label/bc"]="running"; write_summary
   if $PY scripts/train_bc.py \
@@ -151,8 +174,19 @@ for arm in "${ARMS[@]}"; do
     continue
   fi
   write_summary
+  fi
 
   # ---- PPO ---------------------------------------------------------- #
+  # NOT resumed on an existing checkpoint: PPO writes best.pt early and keeps
+  # going, so a half-finished run looks identical to a finished one from the
+  # filesystem.  Reusing one would silently report a truncated arm as a
+  # result.  Delete runs/stage4/comms_<arm>_ppo to redo it.
+  if have_ckpt "$ppo_name" && [ -f "$OUT/${label}_ppo_final_eval.txt" ]; then
+    log "$label: PPO already complete, reusing"
+    STATUS["$label/ppo"]="reused"; write_summary
+    continue
+  fi
+  rm -rf "runs/stage4/$ppo_name"
   log "$label: PPO"
   STATUS["$label/ppo"]="running"; write_summary
   if $PY scripts/train_stage4.py \
