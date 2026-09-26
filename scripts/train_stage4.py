@@ -321,7 +321,7 @@ def _parse_args() -> argparse.Namespace:
                         "caution lowers return, so it peaks at ~rollout 1).  "
                         "'det_caught' / 'det_composite' use the DETERMINISTIC "
                         "eval (robust; require --eval-interval > 0).  "
-                        "det_composite = det_caught − λ·(obstacle+ally crash "
+                        "det_composite = det_caught - lambda*(obstacle+ally crash "
                         "events) — the crash-aware selector for penalty runs.")
     p.add_argument("--best-ckpt-crash-lambda", type=float,
                    default=d.get("best_ckpt_crash_lambda", 0.5),
