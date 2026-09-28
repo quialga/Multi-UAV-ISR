@@ -2212,3 +2212,280 @@ invalidating every existing checkpoint.
   the non-linear response to it.
 * `n_obstacles 0`, so the `ob` pathway was inert and its own sum-scaling
   never exercised.
+
+---
+
+### 17. The comms experiment, and two things it found instead (MEASURED, 2026-09-28) · `feature/target-tracking`
+
+§16 established that flipping `comms_radius` on a trained checkpoint cannot
+answer whether unlimited comms helps, and that every arm therefore has to be
+trained from scratch.  Three arms — `comms_radius` 20, 40 and `inf` — each
+clone (60 rounds) then PPO (150 rollouts) at red 1.5, 31 h of unattended
+compute.
+
+**It did not answer the question.**  It found two other things, one of which
+is more useful than the answer would have been.
+
+#### 17.1 The comms result: null, and premature
+
+50 matched seeds against the evader, deterministic:
+
+| arm | `comms_radius` | clone | PPO best | PPO final |
+|---|---|---|---|---|
+| `inf` | inf | 1.34 ± 0.14 | 1.74 ± 0.14 | **1.86 ± 0.12** |
+| `narrow` | 20 | 1.10 ± 0.14 | 1.68 ± 0.14 | 1.56 ± 0.15 |
+| `incumbent` | 40 | 1.00 ± 0.12 | 1.62 ± 0.12 | 1.56 ± 0.14 |
+| *reference, curriculum* | 40 | — | — | *2.72 ± 0.08* |
+
+`inf` over `incumbent` is 0.30 with a combined SE of 0.18 — **1.6 SE**, not
+significant.  20 and 40 are *identical* at 1.56, so there is no monotone
+trend either.
+
+And the two reasonable ways of reading the data **disagree on the ordering**.
+By final checkpoint `inf` leads (1.86 vs 1.56).  By the mean of the last
+eval block in the training log, `narrow` leads (1.83 vs 1.78).  When the
+ranking inverts depending on which summary you take, the differences are
+noise.
+
+The reason is visible in the eval trajectories: **all three arms were still
+rising at rollout 150.**
+
+| eval block | `inf` | `narrow` | `incumbent` |
+|---|---|---|---|
+| rollouts 5–30 | 1.39 | 1.17 | 1.14 |
+| 95–120 | 1.75 | 1.72 | 1.51 |
+| 125–150 | 1.78 ↗ | 1.83 ↗ | 1.63 ↗ |
+
+None plateaued, and `kl` finished at 0.0009–0.0013 against a `target_kl` of
+0.03 — 20-30x under, with `lr` decayed to near zero.  **The arms are
+under-trained, not converged**, so this compares three unfinished policies.
+
+#### 17.2 The incumbent control is what saved it
+
+`comms_radius` 40 **from scratch** reaches 1.56.  The same `comms_radius` 40
+**via curriculum** reaches 2.72.  Identical comms setting, a gap of ~1.2 —
+about 7 SE.
+
+So the entire distance from the new arms to the reference is **training path
+and budget, nothing to do with comms**.  Without this arm the comparison
+would have been `inf`'s 1.86 against the reference's 2.72, and the natural
+reading — "unlimited comms hurts" — would have been flatly wrong.
+
+Recorded as a method note, because it generalises: **when an experiment
+changes the training path, it needs an incumbent arm on that same path, or a
+path effect gets attributed to the treatment.**
+
+It is also direct evidence that the curriculum does real work rather than
+merely saving time.  §15 priced the 1.4 → 1.5 step at +0.56; this prices the
+whole curriculum at ~1.2.
+
+#### 17.3 A design error, owned
+
+150 rollouts was chosen by scaling from the curriculum runs, where 100
+sufficed — but those started from an already-good policy.  From scratch at
+red 1.5, beginning from a clone scoring 1.00–1.34, it is not enough.  The
+evidence was available beforehand and was not used.  The 31 h produced three
+under-trained policies and one useful control.
+
+#### 17.4 The task almost never requires exploration
+
+Prompted by the question of whether the 2.72 policy ever learned to search,
+measured on `ppo_red15_v2/final.pt` at red 1.5, 30 episodes:
+
+| | |
+|---|---|
+| arena | 130 × 130 = 16,900 m² |
+| sensor disc × 5 blues | 25,133 m² |
+| **team sensor coverage** | **1.49x the whole arena** |
+| **reds already inside a blue's sensor at t = 0** | **78.9%** |
+| steps until all three reds have been seen at once | **median 6** (of 200) |
+
+Four reds in five are visible before anything moves, and the team's sensors
+cover the arena one and a half times over.  **There is essentially nothing to
+explore**, which is consistent with §9.3's correction that the policy chases
+clutter rather than stale cells: the coverage pathway has had almost no work
+to do in any result recorded here.
+
+Nothing above is invalidated by this — captures are captures — but any claim
+that the policy *learned to search* is unsupported, and the staleness/region
+machinery has never been tested under conditions that need it.
+
+Forcing exploration needs the analogue of raising red speed to 1.5: break the
+coverage ratio.  Two knobs, neither clean.  Shrinking `sensor_radius`
+(40 → 20 gives 0.37x) is one number and keeps the geometry, but the sensor
+also feeds the tracker and the rb edges, so it confounds exploration with
+tracking difficulty.  Growing the arena (130 → 260 gives 0.37x) keeps sensor
+quality fixed but changes travel times and interacts with red speed.  The
+arena is preferred: perception quality is the one thing not to move when
+perception is the object of study.
+
+#### 17.5 What would actually answer the comms question
+
+Not more sweeps.  §16.1 showed the aggregation is an unnormalised sum, so
+`comms_radius` is a scale knob as well as an information knob, and §17.1
+showed the from-scratch path is too weak to separate anything.  The next step
+is **attention** (§18 design), which makes the aggregation scale-invariant and
+turns `comms_radius` into a pure information knob — and the decisive
+experiment becomes sum vs attention, both at `comms_radius inf`, both
+continuing the curriculum from `ppo_red14_v1/best.pt`.
+
+#### 17.6 Caveats
+
+* **One seed per arm.**  Three arms are not three seeds.
+* The non-evader reds sit near ceiling throughout (2.72–2.94), so only the
+  evader column carries information.  `narrow` is notably faster there
+  (100.8 steps at its best checkpoint against `inf`'s 140.2), which is a real
+  difference but on a saturated metric.
+* `n_obstacles 0`, as everywhere above.
+* The exploration figures are for `ppo_red15_v2` at red 1.5 only; a different
+  arena or sensor radius would change them entirely, which is the point.
+
+---
+
+### 18. Attention over the typed edges (DESIGN, 2026-09-28) · not yet built
+
+Not a measurement — the agreed design, written down before building so the
+experiment it enables is fixed in advance rather than chosen after seeing
+results.
+
+#### 18.1 Why, in one line each
+
+The encoder aggregates every incoming message with an **unnormalised sum**:
+`agg.index_add_(1, self.bb_dst, msg_bb)`, with the visibility mask multiplied
+into `msg_bb` first.  So the *count* of live edges scales what reaches
+`update_mlp`.  That single fact is behind three separate blocked items:
+
+| blocked item | how the sum blocks it |
+|---|---|
+| `comms_radius` (§16, §17) | opening the radio is a 2.5x magnitude change, so the knob cannot be varied without also perturbing scale — the experiment is uninterpretable |
+| variable red counts | 1 → 3 active reds triples the rb term; a policy trained at one count is out of distribution at another |
+| heterogeneous red speeds | no way to weight the fast red over the slow one; every sender contributes equally |
+
+Attention replaces the sum with a **convex combination**: weights are a
+softmax over the incoming edges of each receiver, so they sum to 1 regardless
+of how many edges are live.  Magnitude stops depending on count, and the
+weights themselves become the selectivity the three items above need.
+
+The operational framing that motivated this: *the right coordination is not
+the same against 1, 2 or 3 evaders*.  A blue should be able to read the reds'
+positions, count and estimated velocities and conclude it needs one ally on a
+target, or two, or all of them.  A sum cannot express that; an attention
+weight is exactly that quantity.
+
+#### 18.2 Where it goes
+
+Per receiver, per edge type, per message round.  The current path is
+
+```
+msg   = msg_mlp([h_send, h_recv, e_edge])      # (B, n_edges, d)
+msg   = msg * visible                          # mask -> zero
+agg  += index_add(msg)                         # UNNORMALISED SUM
+h_recv = h_recv + update_mlp([h_recv, agg])
+```
+
+and becomes
+
+```
+msg   = msg_mlp([h_send, h_recv, e_edge])      # unchanged
+score = att_mlp([h_send, h_recv, e_edge])      # (B, n_edges, n_heads)
+score = score.masked_fill(~visible, -inf)      # masked BEFORE softmax
+alpha = softmax(score, over each receiver's incoming edges)
+agg  += index_add(alpha * msg)                 # CONVEX COMBINATION
+```
+
+Four decisions, each with its reason:
+
+**Masking before the softmax, not after.**  Zeroing a weight after softmax
+leaves the remaining weights summing to less than 1, which reintroduces the
+scale dependence the change exists to remove.  `-inf` before the softmax
+removes the edge from the normalisation entirely.
+
+**Per edge TYPE, not one softmax over everything.**  bb, rb, ob and gb are
+different questions ("which ally", "which target", "which obstacle", "where to
+look").  One softmax across all of them would force a blue to trade attention
+on a target against attention on a wingman, and would make the *relative*
+weight of the four pathways a learned quantity that varies per state — a much
+larger change than intended.  Each type normalises within itself and the four
+results are summed, exactly as today.
+
+**A receiver with NO live edges of a type must get a zero vector**, not
+`NaN`.  An all-`-inf` row makes softmax produce `NaN`, which then poisons
+every downstream gradient.  This is the single most likely way to get a run
+that trains for an hour and emits garbage, so it needs an explicit guard and
+a test: if a receiver has no live edges, write zeros for that type.  It is a
+reachable state — a blue alone beyond `comms_radius` has no live bb edges.
+
+**Multi-head, heads = 4 at `d_hidden` 64.**  One head forces a single
+ranking; "the nearest ally" and "the ally nearest my target" are different
+questions and a single softmax has to pick one.  Four heads at 16 dims each
+is the conventional split and adds little.
+
+#### 18.3 What it costs
+
+`att_mlp` is one extra MLP of the same input width as `msg_mlp`
+(`3 * d_hidden`) with `n_heads` outputs instead of `d_hidden` — so roughly
+`d_hidden / n_heads` times *fewer* output parameters than `msg_mlp`, about a
+5-8% parameter increase on 145,989.  The forward cost is one more MLP per edge
+type per round plus a scatter-softmax.
+
+**It invalidates every existing checkpoint.**  The `state_dict` gains tensors
+and the aggregation semantics change, so `policy_loader` cannot load an old
+checkpoint into the new class and must not silently try.  The knob therefore
+ships as `--attention` defaulting **off**, with the loader reading it from the
+checkpoint's args the way `use_staleness` and `comms_radius` already are, so
+every result in this document keeps evaluating exactly as it was trained.
+
+#### 18.4 The experiment, fixed in advance
+
+Two arms, differing **only** in the aggregation:
+
+| | |
+|---|---|
+| warm start | `runs/stage4/ppo_red14_v1/best.pt` (red 1.4, comms 40) |
+| red `v_max` | **1.5** |
+| `comms_radius` | **inf**, both arms |
+| rollouts | 150 |
+| arm A | sum (today's aggregation) |
+| arm B | attention |
+
+Continuing the curriculum rather than training from scratch, because §17.2
+measured the from-scratch path as ~1.2 weaker for reasons unrelated to the
+treatment — and that arm exists precisely so this mistake is not repeated.
+
+**Both arms carry the same handicap.**  `ppo_red14_v1` trained with comms
+gated at 40; both arms open it to `inf`, so both start displaced from their
+warm start.  Arm A additionally eats the 2.5x magnitude jump (§16.1) while
+arm B does not, since a convex combination is unchanged by the edge count.
+That asymmetry is not a flaw in the comparison — **it is the hypothesis.**
+
+Read it against two reference points, not one:
+* `ppo_red15_v2/final.pt` = **2.72 ± 0.08**, the curriculum's best at
+  comms 40, which is what "did attention beat the incumbent" means;
+* arm A itself, which is what "did attention beat the sum, all else equal"
+  means.
+
+Pre-registered readings, so the result cannot be reinterpreted after the fact:
+* **B > A and B ≥ 2.72** — attention helps and unlimited comms is usable.
+  Proceed to variable red counts, where the sum is a hard blocker anyway.
+* **B ≈ A, both < 2.72** — the handicap of opening comms dominates; rerun both
+  at comms 40 before concluding anything about attention.
+* **B ≈ A ≈ 2.72** — aggregation is not the bottleneck at this scale.
+  Attention still earns its place for variable counts, but not on this metric,
+  and that should be said plainly rather than hunted for in subgroups.
+* **B < A** — attention costs more than it buys here; keep it off by default
+  and record it.
+
+#### 18.5 Deliberately NOT in this change
+
+* **The region path keeps `gb_weight`.**  It is already a hand-designed
+  normalised weighting applied per-edge at exactly the site attention weights
+  would occupy, so it is the natural *second* place to apply this — but
+  changing it in the same step would confound the two.  It is the obvious
+  follow-up once §18.4 has an answer.
+* **`rb`, `ob` attention is built but the experiment does not isolate it.**
+  All four types get the mechanism (leaving some as sums would be a strange
+  hybrid), but §18.4 only asks about the aggregate effect.
+* **No exploration changes.**  §17.4 showed the task barely requires search,
+  and fixing that means changing the arena, which would invalidate the 2.72
+  reference this experiment is measured against.  Architecture first, geometry
+  second.
