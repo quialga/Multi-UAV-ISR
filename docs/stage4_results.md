@@ -2186,6 +2186,15 @@ One crack in the scale story, left standing rather than argued away: 130 and
 1.70 against 1.26, about 2.4 SE apart.  Scale alone does not explain all of
 it; once trajectories diverge, everything compounds.
 
+**The magnitude column above is revised downward by a later, larger
+measurement.**  It came from 59 sampled states and put comms 40 at 40.0% of
+bb edges open.  Measured on full trajectories — 8,185 (blue, step) samples —
+the figure is **52.8%**, i.e. 2.11 live edges of 4, so opening the radio is a
+**1.9x** jump rather than 2.5x.  The mechanism and the conclusion are
+unchanged; the number was over-stated.  The same measurement gives the
+per-receiver distribution that §18.4 turns on: 0 live ally edges in 12% of
+samples, 1 in 26%, 2 in 23%, 3 in 14%, 4 in 24%.
+
 #### 16.2 What can answer it
 
 A retrain.  That comparison is **not** confounded: both policies train to
@@ -2357,7 +2366,7 @@ into `msg_bb` first.  So the *count* of live edges scales what reaches
 
 | blocked item | how the sum blocks it |
 |---|---|
-| `comms_radius` (§16, §17) | opening the radio is a 2.5x magnitude change, so the knob cannot be varied without also perturbing scale — the experiment is uninterpretable |
+| `comms_radius` (§16, §17) | opening the radio is a 1.9x magnitude change, so the knob cannot be varied without also perturbing scale — the experiment is uninterpretable |
 | variable red counts | 1 → 3 active reds triples the rb term; a policy trained at one count is out of distribution at another |
 | heterogeneous red speeds | no way to weight the fast red over the slow one; every sender contributes equally |
 
@@ -2412,8 +2421,25 @@ results are summed, exactly as today.
 `NaN`.  An all-`-inf` row makes softmax produce `NaN`, which then poisons
 every downstream gradient.  This is the single most likely way to get a run
 that trains for an hour and emits garbage, so it needs an explicit guard and
-a test: if a receiver has no live edges, write zeros for that type.  It is a
-reachable state — a blue alone beyond `comms_radius` has no live bb edges.
+a test.  It is not an edge case: measured on `ppo_red15_v2` at red 1.5,
+**27.6% of steps have no confirmed track at all**, and on the bb side 12% of
+(blue, step) samples have no live ally edge.
+
+A correction on what the rb mask *is*, since an earlier draft of this section
+had it wrong.  In tracker mode the actor's "red" nodes are the **8 tracker
+slots**, not the 3 true reds, and `rb_edge_visible` is 8x5 = 40 edges, not
+the Stage-3 path's 3x5 = 15.  More importantly the mask is **identical across
+all five blues in 100% of steps that have any track**: the tracker is
+command-layer fusion, so it encodes "which slot holds a confirmed track", a
+GLOBAL fact, not "which red can this blue see".  When it is empty it is empty
+for the whole team at once.
+
+That makes rb attention a different and more interesting thing than per-blue
+visibility gating: since every blue reads the same tracks, attention over rb
+is not "what can I see" but **"which target do I commit to"** — learned
+target assignment, and the natural place for the 1-vs-2-vs-3 allocation that
+motivates this work.  §13 looked for exactly that mechanism with five
+hypotheses and found none of them.
 
 **Multi-head, heads = 4 at `d_hidden` 64.**  One head forces a single
 ranking; "the nearest ally" and "the ally nearest my target" are different
@@ -2437,26 +2463,52 @@ every result in this document keeps evaluating exactly as it was trained.
 
 #### 18.4 The experiment, fixed in advance
 
-Two arms, differing **only** in the aggregation:
+An earlier draft warm-started both arms from `ppo_red14_v1/best.pt` and
+called the resulting asymmetry "the hypothesis".  That was too convenient and
+is withdrawn: **neither arm warm-starts cleanly.**  Arm A eats the magnitude
+jump from opening comms, but arm B is displaced too, in the opposite
+direction — the old `msg_mlp`/`update_mlp` were trained consuming a sum of
+~2.11 messages, and a convex combination is worth ~1, so arm B starts ~0.47x
+displaced with a randomly initialised `att_mlp` on top.  Two differently
+broken warm starts do not make a controlled comparison.
 
-| | |
+**The two comms settings also test different halves of the hypothesis**,
+which decides where to run it.  Measured live bb edges per receiver at comms
+40: 0 in 12% of samples, 1 in 26%, 2 in 23%, 3 in 14%, 4 in 24%.
+
+| | comms 40 | comms inf |
+|---|---|---|
+| live allies | swings 0–4 | **always 4** |
+| **normalisation** benefit | **maximal** — scale varies 4x | nil — constant scale, absorbable by the weights |
+| **discrimination** benefit | **diluted** — softmax over 1 element is 1.0, so attention is a literal no-op in the 38% of samples with 0 or 1 live edge | **maximal** — always four allies to rank |
+
+The question this work exists to answer — can a blue decide it needs one ally
+on a target, or two, or three — is the **discrimination** half.  So it is run
+at `comms_radius inf`, and testing at 40 would have measured the wrong half.
+
+Both arms therefore train **from birth at comms inf**, each with its own
+clone (they cannot share one, the architectures differ), through a
+1.4 → 1.5 curriculum:
+
+| | per arm |
 |---|---|
-| warm start | `runs/stage4/ppo_red14_v1/best.pt` (red 1.4, comms 40) |
-| red `v_max` | **1.5** |
-| `comms_radius` | **inf**, both arms |
-| rollouts | 150 |
-| arm A | sum (today's aggregation) |
-| arm B | attention |
+| clone at comms inf, red 1.4 | ~2 h |
+| PPO @ red 1.4 | ~8 h |
+| PPO @ red 1.5 | ~8 h |
+| | **~18 h**, so ~36 h for both |
 
-Continuing the curriculum rather than training from scratch, because §17.2
-measured the from-scratch path as ~1.2 weaker for reasons unrelated to the
-treatment — and that arm exists precisely so this mistake is not repeated.
+Curriculum rather than a single from-scratch run at 1.5, because §17
+measured that path as ~1.2 weaker and still rising at 150 rollouts.  Starting
+the clone at 1.4 rather than 1.0 is what keeps this at 36 h instead of ~52 h.
+Neither arm is ever displaced: each sees its own aggregation and unlimited
+comms from its first step.
 
-**Both arms carry the same handicap.**  `ppo_red14_v1` trained with comms
-gated at 40; both arms open it to `inf`, so both start displaced from their
-warm start.  Arm A additionally eats the 2.5x magnitude jump (§16.1) while
-arm B does not, since a convex combination is unchanged by the edge count.
-That asymmetry is not a flaw in the comparison — **it is the hypothesis.**
+**Expect nothing from rb attention in this experiment.**  Tracks are global
+and only **1.04 of 8 slots are live on average** (max 3), so there is
+usually nothing to discriminate between.  The target-assignment payoff needs
+more reds or variable counts — the roadmap item this unblocks.  What this
+experiment can show is bb attention: breaking the symmetry between blues that
+are all reading the same global picture.
 
 Read it against two reference points, not one:
 * `ppo_red15_v2/final.pt` = **2.72 ± 0.08**, the curriculum's best at
