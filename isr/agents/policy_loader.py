@@ -72,6 +72,12 @@ def load_policy(
             # coverage path existed rebuilds without it, as it trained.
             n_region          = (int(args.get("staleness_regions", 5)) ** 2
                                  if args.get("use_staleness", False) else 0),
+            # Pre-feature default False: a checkpoint written before
+            # attention existed rebuilds with the summed aggregation it
+            # trained under.  Getting this wrong loads the right tensors into
+            # the wrong aggregation and reads as a mysteriously bad policy.
+            attention         = bool(args.get("attention", False)),
+            n_heads           = int(args.get("n_heads", 4)),
             **_actor_sizing(args),
         ).to(device)
     else:

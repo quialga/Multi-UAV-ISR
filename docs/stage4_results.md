@@ -2490,12 +2490,23 @@ Both arms therefore train **from birth at comms inf**, each with its own
 clone (they cannot share one, the architectures differ), through a
 1.4 → 1.5 curriculum:
 
-| | per arm |
-|---|---|
-| clone at comms inf, red 1.4 | ~2 h |
-| PPO @ red 1.4 | ~8 h |
-| PPO @ red 1.5 | ~8 h |
-| | **~18 h**, so ~36 h for both |
+| | sum arm | attention arm |
+|---|---|---|
+| clone at comms inf, red 1.4 | ~2 h | ~2.5 h |
+| PPO @ red 1.4 | ~8 h | ~10 h |
+| PPO @ red 1.5 | ~8 h | ~10 h |
+| | **~18 h** | **~22.5 h** |
+
+so **~41 h** for both.  Attention's measured throughput cost is **1.25x**
+(90 against 72 steps/s at the production configuration), and the encoder
+forward alone is 1.0-1.4x — it is the aggregation that changes, not the
+model's size, and the parameter count grows 8.6% (145,989 -> 158,601).
+
+A first measurement of that cost read 47x and would have put the experiment
+at 22 days.  It was an artefact: an orphaned process left by a malformed
+command was holding a core throughout.  Worth the note because the lesson
+generalises — check for stray processes before believing any timing on this
+machine.
 
 Curriculum rather than a single from-scratch run at 1.5, because §17
 measured that path as ~1.2 weaker and still rising at 150 rollouts.  Starting

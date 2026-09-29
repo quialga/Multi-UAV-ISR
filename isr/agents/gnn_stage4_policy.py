@@ -128,6 +128,30 @@ def _build_xb_edges(n_src: int, n_blue: int) -> Tuple[torch.Tensor, torch.Tensor
             torch.tensor(dst, dtype=torch.long))
 
 
+def _incoming_index(dst: torch.Tensor, n_recv: int) -> torch.Tensor:
+    """``(n_recv, degree)`` edge indices grouped by receiver.
+
+    Every edge type here is complete (bb is complete-minus-self, the rest are
+    complete bipartite), so EVERY receiver has the same in-degree and the
+    grouping is a dense tensor rather than a ragged one.  That is what lets
+    attention normalise with a plain ``softmax`` over a gathered axis instead
+    of a scatter-softmax: gather (B, E, ...) -> (B, n_recv, degree, ...),
+    softmax over the degree axis, weighted-sum it away.  The result is already
+    per-receiver, so the aggregation needs no scatter at all.
+
+    Raises if the degree is ragged, because the dense reshape would silently
+    mis-group edges rather than fail.
+    """
+    rows = [torch.nonzero(dst == r, as_tuple=False).flatten()
+            for r in range(n_recv)]
+    degs = {int(r.numel()) for r in rows}
+    if len(degs) != 1:
+        raise ValueError(
+            f"attention needs a constant in-degree, got degrees {sorted(degs)}; "
+            f"a ragged graph would need a scatter-softmax instead")
+    return torch.stack(rows)
+
+
 # ---------------------------------------------------------------------------
 # Typed GNN encoder (blue + red + obstacle nodes; bb + rb + ob edges)
 # ---------------------------------------------------------------------------
@@ -170,6 +194,8 @@ class GNNEncoder(nn.Module):
         n_msg_rounds:   int = 2,
         n_region:       int = 0,   # R*R coverage nodes; 0 = path disabled
         region_feat_dim: int = 2,  # [staleness, searchable]
+        attention:      bool = False,
+        n_heads:        int = 4,
     ) -> None:
         super().__init__()
         self.n_blue       = n_blue
@@ -178,6 +204,11 @@ class GNNEncoder(nn.Module):
         self.n_region     = n_region
         self.d_hidden     = d_hidden
         self.n_msg_rounds = n_msg_rounds
+        self.attention    = bool(attention)
+        self.n_heads      = int(n_heads)
+        if self.attention and d_hidden % self.n_heads != 0:
+            raise ValueError(
+                f"d_hidden {d_hidden} must divide by n_heads {self.n_heads}")
 
         self.blue_input_mlp = _mlp(blue_feat_dim, [d_hidden], d_hidden)
         self.red_input_mlp  = _mlp(red_feat_dim,  [d_hidden], d_hidden)
@@ -212,6 +243,83 @@ class GNNEncoder(nn.Module):
         else:
             self.region_input_mlp = None
             self.gb_edge_mlp      = None
+
+        if self.attention:
+            # ONE head-scoring MLP, shared across edge types exactly as
+            # msg_mlp is: the type information already arrives through the
+            # type-specific edge encoder in its input, so a per-type scorer
+            # would duplicate what e_* already carries.
+            self.att_mlp = _mlp(3 * d_hidden, [d_hidden], self.n_heads)
+            # Small init: near-uniform attention at step 0, so a fresh
+            # attention model starts close to a mean over its neighbours
+            # rather than committing to one before it has learned anything.
+            _layer_init(self.att_mlp[-1], std=0.01)
+            self.register_buffer("bb_in", _incoming_index(bb_dst, n_blue),
+                                 persistent=False)
+            self.register_buffer("rb_in", _incoming_index(rb_dst, n_blue),
+                                 persistent=False)
+            if n_obs > 0:
+                self.register_buffer("ob_in", _incoming_index(ob_dst, n_blue),
+                                     persistent=False)
+        else:
+            self.att_mlp = None
+
+    def _attend(
+        self,
+        msg:    torch.Tensor,                 # (B, E, d)   per-edge messages
+        score:  torch.Tensor,                 # (B, E, H)   per-edge head scores
+        in_idx: torch.Tensor,                 # (R, degree) edges by receiver
+        mask:   Optional[torch.Tensor],       # (B, E)      1 = live, 0 = hidden
+    ) -> torch.Tensor:                        # (B, R, d)   already aggregated
+        """Convex combination of a receiver's incoming messages.
+
+        Replaces ``index_add_``'s unnormalised sum.  The weights softmax to 1
+        over each receiver's LIVE incoming edges, so the aggregate's magnitude
+        no longer depends on how many edges happen to be live — which is what
+        makes ``comms_radius`` an information knob rather than a scale knob
+        (docs/stage4_results.md §16, §18.1), and what makes a variable entity
+        count representable at all.
+
+        The mask is applied BEFORE the softmax, not after.  Zeroing a weight
+        afterwards leaves the survivors summing to less than one, which
+        reintroduces exactly the count-dependence this exists to remove:
+        scores [2,1,1,0] with the last two hidden give [.51,.19,0,0] summing
+        to 0.70 that way, against [.73,.27,0,0] summing to 1.00 this way.
+
+        A receiver with NO live edges would make softmax see a row of all
+        ``-inf`` and return NaN, which then poisons every gradient in the
+        model.  That is not hypothetical: 27.6% of steps have no confirmed
+        track at all, so the whole team's rb rows are empty at once (§18.2).
+        Such rows are flattened to zero scores BEFORE the softmax — so no NaN
+        is ever created, rather than created and patched — and their output is
+        then zeroed, which is what "no neighbours contributed" should mean.
+        """
+        B, E, d = msg.shape
+        R, deg = in_idx.shape
+        H = self.n_heads
+        flat = in_idx.reshape(-1)
+
+        m = msg.index_select(1, flat).view(B, R, deg, d)
+        s = score.index_select(1, flat).view(B, R, deg, H)
+
+        empty = None
+        if mask is not None:
+            k = mask.index_select(1, flat).view(B, R, deg, 1)
+            s = s.masked_fill(k == 0, float("-inf"))
+            empty = (k.sum(dim=2, keepdim=True) == 0)          # (B, R, 1, 1)
+            s = torch.where(empty.expand_as(s), torch.zeros_like(s), s)
+
+        a = torch.softmax(s, dim=2)                            # over neighbours
+        if empty is not None:
+            a = torch.where(empty.expand_as(a), torch.zeros_like(a), a)
+
+        # Each head weights its own d/H slice, so the heads can rank the same
+        # neighbours by different criteria -- "nearest ally" and "ally best
+        # placed to cut the evader off" are different questions and one head
+        # would have to compromise between them.
+        m = m.view(B, R, deg, H, d // H)
+        out = (a.unsqueeze(-1) * m).sum(dim=2)                 # (B, R, H, d/H)
+        return out.reshape(B, R, d)
 
     def forward(
         self,
@@ -256,35 +364,60 @@ class GNNEncoder(nn.Module):
             # Blue-Blue messages.
             h_send_bb = h_blue.index_select(1, self.bb_src)
             h_recv_bb = h_blue.index_select(1, self.bb_dst)
-            msg_bb = self.msg_mlp(torch.cat([h_send_bb, h_recv_bb, e_bb], dim=-1))
-            if bb_visible is not None:
-                msg_bb = msg_bb * bb_visible.unsqueeze(-1)
+            in_bb  = torch.cat([h_send_bb, h_recv_bb, e_bb], dim=-1)
+            msg_bb = self.msg_mlp(in_bb)
 
             # Red-Blue messages.
             h_send_rb = h_red.index_select(1, self.rb_src)
             h_recv_rb = h_blue.index_select(1, self.rb_dst)
-            msg_rb = self.msg_mlp(torch.cat([h_send_rb, h_recv_rb, e_rb], dim=-1))
-            if rb_visible is not None:
-                msg_rb = msg_rb * rb_visible.unsqueeze(-1)
+            in_rb  = torch.cat([h_send_rb, h_recv_rb, e_rb], dim=-1)
+            msg_rb = self.msg_mlp(in_rb)
 
-            # Aggregate onto blue receivers.
             agg = torch.zeros(B, self.n_blue, d,
                               device=h_blue.device, dtype=h_blue.dtype)
-            agg.index_add_(1, self.bb_dst, msg_bb)
-            agg.index_add_(1, self.rb_dst, msg_rb)
+
+            if self.attention:
+                # Per edge TYPE, not one softmax over everything: "which
+                # ally", "which target" and "which obstacle" are different
+                # questions, and a single normalisation would force a blue to
+                # trade attention on a target against attention on a wingman,
+                # and make the four pathways' RELATIVE weight a learned
+                # per-state quantity -- a far larger change than intended.
+                agg = agg + self._attend(msg_bb, self.att_mlp(in_bb),
+                                         self.bb_in, bb_visible)
+                agg = agg + self._attend(msg_rb, self.att_mlp(in_rb),
+                                         self.rb_in, rb_visible)
+            else:
+                if bb_visible is not None:
+                    msg_bb = msg_bb * bb_visible.unsqueeze(-1)
+                if rb_visible is not None:
+                    msg_rb = msg_rb * rb_visible.unsqueeze(-1)
+                agg.index_add_(1, self.bb_dst, msg_bb)
+                agg.index_add_(1, self.rb_dst, msg_rb)
 
             # Obstacle-Blue messages.
             if has_obs:
                 h_send_ob = h_obs.index_select(1, self.ob_src)
                 h_recv_ob = h_blue.index_select(1, self.ob_dst)
-                msg_ob = self.msg_mlp(
-                    torch.cat([h_send_ob, h_recv_ob, e_ob], dim=-1),
-                )
-                if ob_visible is not None:
-                    msg_ob = msg_ob * ob_visible.unsqueeze(-1)
-                agg.index_add_(1, self.ob_dst, msg_ob)
+                in_ob  = torch.cat([h_send_ob, h_recv_ob, e_ob], dim=-1)
+                msg_ob = self.msg_mlp(in_ob)
+                if self.attention:
+                    agg = agg + self._attend(msg_ob, self.att_mlp(in_ob),
+                                             self.ob_in, ob_visible)
+                else:
+                    if ob_visible is not None:
+                        msg_ob = msg_ob * ob_visible.unsqueeze(-1)
+                    agg.index_add_(1, self.ob_dst, msg_ob)
 
             # Region->Blue (coverage) messages.
+            #
+            # DELIBERATELY NOT ATTENDED, even when self.attention is on.
+            # gb_weight is already a hand-designed normalised weighting
+            # applied at exactly the site attention weights would occupy, so
+            # this is the natural SECOND place to learn them -- but changing
+            # it in the same step as bb/rb/ob would confound the two, and the
+            # experiment in docs/stage4_results.md §18.4 asks about the
+            # others.  Left as the measured follow-up (§18.5).
             #
             # gb_weight is NOT a visibility mask.  Coverage is a
             # command-layer quantity like the belief map, so no region is
@@ -401,8 +534,19 @@ class GNNStage4Policy(nn.Module):
         # looked" is not news to it, and adding nodes there would change
         # the CTDE baseline for no information gain.
         n_region:           int = 0,
+        # Convex-combination aggregation instead of the unnormalised sum.
+        # ACTOR ONLY: the critic sees full state with fixed entity counts and
+        # no visibility masks, so the count-dependence attention removes does
+        # not arise there -- and changing the CTDE baseline at the same time
+        # would confound the experiment in docs/stage4_results.md §18.4.
+        # Default False keeps every existing checkpoint loadable and the
+        # forward byte-identical.
+        attention:          bool = False,
+        n_heads:            int = 4,
     ) -> None:
         super().__init__()
+        self.attention         = bool(attention)
+        self.n_heads           = int(n_heads)
         self.n_blue            = n_blue
         self.n_red             = n_red
         self.n_obs             = n_obs
@@ -434,6 +578,8 @@ class GNNStage4Policy(nn.Module):
             d_hidden      = d_hidden,
             n_msg_rounds  = n_msg_rounds,
             n_region      = self.n_region,
+            attention     = self.attention,
+            n_heads       = self.n_heads,
         )
         self.actor_gru  = nn.GRUCell(input_size=d_hidden, hidden_size=d_hidden)
         self.actor_mean = _layer_init(nn.Linear(d_hidden, action_dim), std=0.01)

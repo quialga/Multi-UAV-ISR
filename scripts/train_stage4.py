@@ -358,6 +358,22 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--n-msg-rounds",   type=int, default=d["n_msg_rounds"])
     p.add_argument("--share-hidden-via-gnn", action="store_true",
                    default=d.get("use_hidden_in_gnn", True))
+    p.add_argument("--attention", action="store_true",
+                   help="aggregate the ACTOR's incoming messages as a convex "
+                        "combination (softmax over each receiver's live "
+                        "edges) instead of an unnormalised sum.  The sum "
+                        "makes the EDGE COUNT a scale knob, which is what "
+                        "makes comms_radius uninterpretable and blocks "
+                        "variable entity counts (docs/stage4_results.md "
+                        "sections 16 and 18).  CHANGES THE STATE DICT: a "
+                        "checkpoint trained one way cannot be loaded the "
+                        "other.  Critic unchanged -- it sees full state with "
+                        "fixed counts and no masks.")
+    p.add_argument("--n-heads", type=int, default=4,
+                   help="attention heads; must divide --d-hidden.  One head "
+                        "forces a single ranking of neighbours, and 'nearest "
+                        "ally' and 'ally best placed to intercept' are "
+                        "different questions.")
     # Run management
     p.add_argument("--seed",           type=int,   default=0)
     p.add_argument("--device",         default="cpu")
@@ -671,10 +687,13 @@ def main() -> None:
         # Coverage path, actor only; 0 leaves the policy as it was.
         n_region          = (args.staleness_regions ** 2
                              if args.use_staleness else 0),
+        attention         = args.attention,
+        n_heads           = args.n_heads,
     ).to(device)
     n_params = sum(p.numel() for p in policy.parameters())
     log(f"Policy: GNNStage4Policy (v6) d_hidden={args.d_hidden} "
         f"rounds={args.n_msg_rounds} n_obs={vec_env.n_obstacles} "
+        f"agg={'attention x' + str(args.n_heads) if args.attention else 'sum'} "
         f"params={n_params}")
 
     # Warm-start.  --warm-start-full (a converged Stage 4 ckpt) copies
