@@ -2072,6 +2072,8 @@ the policy** — unlike the trainer's startup baselines, which use
 | `red15_v2/final` | 1.4 | 2.96 ± 0.03 | 109.9 | 24.47 |
 | `red14/best` | 1.4 | 2.92 ± 0.04 | 118.2 | 23.79 |
 
+Table produced by `scripts/eval_red15_reference.py`.
+
 **`red15_v2/final` is the reference checkpoint** for everything downstream:
 tied on captures, fewest steps, best return.
 
@@ -2159,14 +2161,23 @@ input perturbation is isolated from the trajectory divergence:
 | 130 | 2.48x | 1.70 ± 0.15 | 187.5 |
 | inf | 2.50x | **1.26 ± 0.16** | 190.4 |
 
+> **The mechanism below is SUPERSEDED by §19.2.**  This section attributes the
+> collapse to magnitude saturating the `tanh` activations.  §19 trained both
+> aggregations from scratch and found a better explanation: the four pathways
+> share one aggregate, so opening the radio does not merely inflate a scale,
+> it squeezes the TARGET channel from 22% to 15% of that aggregate while ally
+> chatter grows to 68%.  That also predicts the stationary-red failure §19.1
+> measured, which saturation does not.  The numbers here stand; the
+> interpretation does not.  Table produced by `scripts/eval_comms_radius.py`.
+
 **The damage tracks the magnitude, not the information.**  The policy
 aggregates ally messages with an UNNORMALISED SUM — `agg.index_add_(1,
 self.bb_dst, msg_bb)`, with `bb_visible` multiplied into `msg_bb` first — so
 the count of open bb edges scales what reaches `update_mlp`.  Opening the
-radio to `inf` multiplies that term by 2.5x against what the policy trained
-on; the score collapses to 1.26, barely above `AssignGreedy`'s 1.06 (§15.2).
-Narrowing to 20 m is a *smaller* perturbation (0.55x) and the score goes
-slightly UP.
+radio to `inf` multiplies that term by 1.9x against what the policy trained
+on (the 2.5x in the table above is the small-sample figure, revised below);
+the score collapses to 1.26, barely above `AssignGreedy`'s 1.06 (§15.2).
+Narrowing to 20 m is a *smaller* perturbation and the score goes slightly UP.
 
 `gnn_stage4_policy.py` already knows this failure mode.  Its region path is
 normalised for exactly this reason — *"an unnormalised `index_add_` SUM would
@@ -2234,6 +2245,9 @@ compute.
 
 **It did not answer the question.**  It found two other things, one of which
 is more useful than the answer would have been.
+
+Produced by `scripts/run_comms_experiment.sh` (three arms, unattended) with
+`scripts/eval_checkpoint.py` for every number below.
 
 #### 17.1 The comms result: null, and premature
 
@@ -2463,6 +2477,15 @@ every result in this document keeps evaluating exactly as it was trained.
 
 #### 18.4 The experiment, fixed in advance
 
+> **Outcome in §19, and two claims below were wrong.**  (1) Parity was
+> pre-registered as the expected result; attention won by +0.88 on the evader,
+> about 10 SE.  (2) The table below says the normalisation benefit at comms
+> inf is "nil — constant scale, absorbable by the weights".  §19.2 falsifies
+> that: the reasoning treated bb in isolation, and the pathways share one
+> aggregate.  None of the four pre-registered readings matched the outcome
+> (§19.3).  The design below is what ran; the predictions are kept as written
+> rather than edited into agreement with the result.
+
 An earlier draft warm-started both arms from `ppo_red14_v1/best.pt` and
 called the resulting asymmetry "the hypothesis".  That was too convenient and
 is withdrawn: **neither arm warm-starts cleanly.**  Arm A eats the magnitude
@@ -2576,6 +2599,9 @@ Neither arm had an optimiser pathology: `kl` 0.0012-0.0016 against a 0.03
 target, `clip` 0.005-0.011, entropy 0.44-0.59 in both.  The sum arm did not
 break, it learned worse.
 
+Produced by `scripts/run_attention_experiment.sh`; all evaluations via
+`scripts/eval_checkpoint.py`.
+
 #### 19.1 The decisive column is the STATIONARY red
 
 A stationary red does not move.  Scoring **2.62/3** against one is not "worse
@@ -2656,3 +2682,163 @@ implemented by passing a single channel of zero scores through the same
 inherits the mask-before-softmax ordering and the empty-row guard rather than
 reimplementing the two things that were hard to get right.  A test pins that
 the mean adds exactly zero parameters, which is what makes it a clean control.
+
+---
+
+### 20. Does attention's advantage grow with the target count? (DESIGN, 2026-10-01) · not yet run
+
+§19 showed attention beats the summed aggregation by +0.88 on the evader, and
+that **most of it is normalisation**: a plain mean over live edges recovers
++0.48 of that at red 1.4, leaving +0.30 for discrimination (§19.4, and at 2.3
+SE on 50 episodes with part of it inherited from a clone that started 0.16
+lower).  So the question attention was actually built for is still open: the
+operational claim is that a blue should decide, from the targets' positions,
+count and estimated velocities, whether it needs one ally on a target or
+three — and that is **selectivity**, which only pays when there is something
+to select between.
+
+This section is the experiment that tests it, designed before running and with
+every parameter decided by a cheap measurement rather than by argument.  Four
+design intuitions were tested and **three of them were wrong**, which is the
+reason for the measurements.
+
+#### 20.1 The hypothesis, stated so it can fail
+
+Not "attention scores higher" — §19 already established that.  The claim is
+that **attention degrades more slowly than a mean as the number of live
+targets varies**, because a mean normalises the magnitude while attention can
+additionally reorder which neighbours matter.
+
+The comparison is therefore **mean against attention**.  The summed
+aggregation is excluded: §19 established it is broken at `comms_radius inf`
+(2.62/3 against a *stationary* red), so including it would re-measure a known
+breakage and crowd out the question.
+
+#### 20.2 The variable the hypothesis is about is TRACKS, not reds
+
+The actor's "red" nodes are the fixed `tracker_red_slots` (8), not the active
+reds, so the actor graph is identical at every count — which is what makes one
+policy evaluable across a sweep at all (pinned by
+`tests/test_variable_counts.py`).  What varies is how many slots hold a
+confirmed track, and raising `n_red` widens that distribution substantially.
+Measured with a policy driving:
+
+| `n_red` | live tracks/blue, mean | **sd** | max | spread over 0..5 |
+|---|---|---|---|---|
+| 1 | 0.80 | **0.50** | 2 | 24 / 72 / 4 / 0 / 0 / 0 % |
+| 3 | 1.20 | **0.94** | 5 | 22 / 47 / 20 / 8 / 2 / 0 % |
+| 5 | 2.34 | **1.51** | 7 | 13 / 18 / 24 / 23 / 13 / 7 % |
+
+The standard deviation **triples**.  That is the quantity an unnormalised sum
+conflates with magnitude and a mean or attention neutralises, so the
+experiment has signal to find.
+
+#### 20.3 Four design questions, decided by measurement
+
+**Tracker slots: 8, unchanged.**  The concern was that 5 reds would saturate
+the 8 slots and degrade the input before the aggregation ever sees it,
+compressing the effect.  Measured: occupancy is *identical* at 8, 12 and 16
+slots (mean 2.38, max 7), and the limit is hit in **0.0%** of steps.  No
+saturation, so no architecture change — which also keeps A2 comparable with
+§19's red-1.4 arms.
+
+**Team size: 5 blues against 5 reds.**  Not presentation: with surplus blues
+allocation has slack, and without them it binds.  The value of coordination —
+`AssignGreedy` minus `ObsGreedy`, allocation by construction against none —
+**triples**:
+
+| | uncoordinated | coordinated | advantage |
+|---|---|---|---|
+| 3v3, red 1.4 | 2.18 | 2.32 | +0.14 |
+| **5v5, red 1.4** | 3.02 | 3.45 | **+0.43** |
+
+**`max_steps`: 200, unchanged** — and this one inverted the expectation.  The
+heuristics spend 188-197 of 200 steps at 5v5, so the metric looked
+time-bound, and raising the budget looked necessary to measure allocation
+rather than a race.  Measured, the coordination advantage **shrinks** as the
+budget grows:
+
+| `max_steps` | ObsGreedy | AssignGreedy | advantage |
+|---|---|---|---|
+| **200** | 3.02 | 3.45 | **+0.43** |
+| 300 | 3.92 | 4.33 | +0.40 |
+| 400 | 4.38 | 4.70 | +0.33 |
+
+Given enough time, uncoordinated pursuit catches everything anyway
+(`ObsGreedy` reaches 4.38/5 at 400 steps).  **Time pressure is what makes
+allocation matter**, so the budget stays where coordination is worth most —
+which also preserves comparability with every other result here.
+
+**Red speed: 1.4.**  A ceiling worry — attention scores 1.000 at `n_red` 1
+and 2 there — turned out not to bite, because a ceiling only kills the
+comparison if BOTH arms sit at it, and even the broken summed arm reads 0.867
+at `n_red` 1.  The deciding reason is convergence: §19's red-1.4 arms were
+flattening (sum 1.66 -> 1.99 -> 2.05) while the red-1.5 arms were still
+climbing at the end (attention 2.10 -> 2.24 -> 2.39, finishing 2.48).
+Comparing degradation between two *unconverged* policies measures where each
+happened to be when the budget ran out.
+
+#### 20.4 The metric: not a slope
+
+The natural summary — fit a line to captured fraction against count and
+compare slopes — was tried on §19's existing arms and **does not work**.  The
+curves are not linear, so the fit is fragile: the summed arm at red 1.5 reads
+0.900, 0.483, 0.444, 0.450, 0.553, falling then rising, and a linear slope on
+that carries an SE of 0.056 and flips sign between red speeds.
+
+So the primary metric is the **captured fraction at each count, compared
+point-by-point on matched seeds**, with a secondary robust summary: the
+fraction at `n_red` 5 relative to `n_red` 1.  `scripts/eval_red_count_sweep.py`
+reports both (it still prints a slope, with its SE, as a diagnostic — not as
+the verdict).
+
+Fraction rather than raw captures, because raw captures rise with the count
+simply because there is more to catch: a flat raw line already means
+degradation.
+
+#### 20.5 What already exists, and what it does and does not say
+
+The zero-shot curves of §19's arms are measured — both trained at `n_red` 3
+fixed, evaluated at 1..5.  Attention dominates the sum at every count, at both
+speeds.  But the gap **narrows** at high counts rather than widening (red 1.4:
+0.133, 0.317, 0.334, 0.275, 0.254 across counts 1-5), plausibly because with
+many targets the task is dominated by stumbling onto the nearest one, which
+needs no allocation.
+
+That is **weak evidence about this hypothesis, in both directions**, for two
+reasons.  It compares the wrong pair — sum against attention is dominated by
+§19's normalisation breakage, not by selectivity.  And a policy trained at a
+fixed count never had a reason to develop selectivity, so zero-shot
+generalisation is not what the claim is about.
+
+#### 20.6 The run
+
+| | |
+|---|---|
+| arms | **mean** (`--mean-agg`) against **attention** (`--attention --n-heads 4`) |
+| blues / reds | 5 / 5, capacity |
+| `n_red_min` | **1** — samples 1-5 active per episode *during training* |
+| red `v_max` | 1.4 |
+| `comms_radius` | inf |
+| `tracker_red_slots` / `max_steps` | 8 / 200 |
+| stages | clone (60 rounds) then one PPO stage, 150 rollouts |
+| evaluation | `n_red` fixed at 1,2,3,4,5, 100 episodes each, matched seeds |
+| baselines | `ObsGreedy` 3.02 ± 0.17, `AssignGreedy` 3.45 ± 0.18 (measured) |
+| cost | ~11 h per arm, ~22 h |
+
+Training samples the count and evaluation fixes it: the policy must learn to
+handle variability, and the measurement isolates each level.
+
+Pre-registered readings, **three** this time rather than a binary pair,
+because the last two pre-registrations were both too dichotomous for results
+that came out mixed (§18.4, §19.4):
+
+* **Attention's advantage grows with count** — the hypothesis holds, and the
+  case for selectivity (and for extending it to the region path) is made.
+* **Advantage flat in count** — attention is a better aggregation but not for
+  the stated reason; the honest claim becomes "normalisation plus a constant
+  offset", and the selectivity argument needs a different test.
+* **Advantage narrows with count**, as the zero-shot curves hint — then
+  coordination genuinely matters less when targets are dense, and the
+  interesting regime for this architecture is *few* targets under time
+  pressure, not many.  That would redirect the roadmap rather than close it.

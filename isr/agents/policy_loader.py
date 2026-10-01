@@ -150,6 +150,14 @@ def env_kwargs_from_checkpoint(train_args: dict) -> dict:
 
     kw.update(
         n_obstacles              = g("n_obstacles", 0),
+        # Per-episode ACTIVE-count sampling.  Omitting these silently
+        # evaluated a variable-count policy at fixed capacity -- a regime
+        # change, not a detail: a policy trained on 1-5 reds would only ever
+        # be measured at 5.  ``train_stage4.py`` has always passed them; this
+        # is the read path catching up.  None = fixed at capacity, which is
+        # what every checkpoint without the keys trained under.
+        n_red_min                = g("n_red_min", None),
+        n_obstacles_min          = g("n_obstacles_min", None),
         obstacle_radius_min      = g("obstacle_radius_min", 5.0),
         obstacle_radius_max      = g("obstacle_radius_max", 15.0),
         obstacle_spawn_clearance = g("obstacle_spawn_clearance", 10.0),
