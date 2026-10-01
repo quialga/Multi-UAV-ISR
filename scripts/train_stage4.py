@@ -369,6 +369,16 @@ def _parse_args() -> argparse.Namespace:
                         "checkpoint trained one way cannot be loaded the "
                         "other.  Critic unchanged -- it sees full state with "
                         "fixed counts and no masks.")
+    p.add_argument("--mean-agg", action="store_true",
+                   help="divide each edge type's aggregate by its LIVE edge "
+                        "count instead of summing.  The cheap half of "
+                        "--attention: it fixes the between-type imbalance "
+                        "(ally messages outnumber target messages 4.6:1 at "
+                        "comms inf, so the target channel is squeezed to 15%% "
+                        "of the aggregate) with NO parameters and NO "
+                        "selectivity.  Comparing it against --attention says "
+                        "whether that win was normalisation or "
+                        "discrimination (docs/stage4_results.md section 19).")
     p.add_argument("--n-heads", type=int, default=4,
                    help="attention heads; must divide --d-hidden.  One head "
                         "forces a single ranking of neighbours, and 'nearest "
@@ -688,12 +698,13 @@ def main() -> None:
         n_region          = (args.staleness_regions ** 2
                              if args.use_staleness else 0),
         attention         = args.attention,
+        mean_agg          = args.mean_agg,
         n_heads           = args.n_heads,
     ).to(device)
     n_params = sum(p.numel() for p in policy.parameters())
     log(f"Policy: GNNStage4Policy (v6) d_hidden={args.d_hidden} "
         f"rounds={args.n_msg_rounds} n_obs={vec_env.n_obstacles} "
-        f"agg={'attention x' + str(args.n_heads) if args.attention else 'sum'} "
+        f"agg={'attention x' + str(args.n_heads) if args.attention else ('mean' if args.mean_agg else 'sum')} "
         f"params={n_params}")
 
     # Warm-start.  --warm-start-full (a converged Stage 4 ckpt) copies

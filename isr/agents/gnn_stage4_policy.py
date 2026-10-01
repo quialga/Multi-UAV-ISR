@@ -195,6 +195,14 @@ class GNNEncoder(nn.Module):
         n_region:       int = 0,   # R*R coverage nodes; 0 = path disabled
         region_feat_dim: int = 2,  # [staleness, searchable]
         attention:      bool = False,
+        # Divide each type's aggregate by its LIVE edge count instead of
+        # summing.  This is the cheap half of attention: it fixes the
+        # BETWEEN-TYPE imbalance (docs/stage4_results.md Sec. 19 -- ally
+        # messages outnumber target messages 4.6:1 at comms inf, squeezing
+        # the target channel to 15% of the aggregate) with no parameters and
+        # no selectivity.  Comparing mean against attention is what separates
+        # "the win was normalisation" from "the win was discrimination".
+        mean_agg:       bool = False,
         n_heads:        int = 4,
     ) -> None:
         super().__init__()
@@ -205,10 +213,17 @@ class GNNEncoder(nn.Module):
         self.d_hidden     = d_hidden
         self.n_msg_rounds = n_msg_rounds
         self.attention    = bool(attention)
+        self.mean_agg     = bool(mean_agg)
         self.n_heads      = int(n_heads)
+        if self.attention and self.mean_agg:
+            raise ValueError(
+                "attention and mean_agg are alternative aggregations; pick "
+                "one (a mean IS attention with uniform weights)")
         if self.attention and d_hidden % self.n_heads != 0:
             raise ValueError(
                 f"d_hidden {d_hidden} must divide by n_heads {self.n_heads}")
+        # Both grouped aggregations need the per-receiver edge index.
+        self._grouped = self.attention or self.mean_agg
 
         self.blue_input_mlp = _mlp(blue_feat_dim, [d_hidden], d_hidden)
         self.red_input_mlp  = _mlp(red_feat_dim,  [d_hidden], d_hidden)
@@ -254,6 +269,10 @@ class GNNEncoder(nn.Module):
             # attention model starts close to a mean over its neighbours
             # rather than committing to one before it has learned anything.
             _layer_init(self.att_mlp[-1], std=0.01)
+        else:
+            self.att_mlp = None
+
+        if self._grouped:
             self.register_buffer("bb_in", _incoming_index(bb_dst, n_blue),
                                  persistent=False)
             self.register_buffer("rb_in", _incoming_index(rb_dst, n_blue),
@@ -261,8 +280,20 @@ class GNNEncoder(nn.Module):
             if n_obs > 0:
                 self.register_buffer("ob_in", _incoming_index(ob_dst, n_blue),
                                      persistent=False)
-        else:
-            self.att_mlp = None
+
+    def _scores(self, edge_in: torch.Tensor) -> torch.Tensor:
+        """Per-edge head scores for the grouped aggregation.
+
+        Attention learns them.  The MEAN aggregation uses a single channel of
+        ZEROS, whose softmax over a receiver's live edges is uniform -- i.e.
+        exactly a mean over those edges.  Routing both through ``_attend``
+        means the mean inherits the masking order and the empty-row guard
+        instead of reimplementing them, so the two aggregations cannot drift
+        apart on the parts that were hard to get right.
+        """
+        if self.attention:
+            return self.att_mlp(edge_in)
+        return edge_in.new_zeros(edge_in.shape[0], edge_in.shape[1], 1)
 
     def _attend(
         self,
@@ -296,7 +327,9 @@ class GNNEncoder(nn.Module):
         """
         B, E, d = msg.shape
         R, deg = in_idx.shape
-        H = self.n_heads
+        # From the scores, not self.n_heads: the MEAN aggregation passes a
+        # single channel, which makes it a special case of this path.
+        H = score.shape[-1]
         flat = in_idx.reshape(-1)
 
         m = msg.index_select(1, flat).view(B, R, deg, d)
@@ -376,16 +409,16 @@ class GNNEncoder(nn.Module):
             agg = torch.zeros(B, self.n_blue, d,
                               device=h_blue.device, dtype=h_blue.dtype)
 
-            if self.attention:
+            if self._grouped:
                 # Per edge TYPE, not one softmax over everything: "which
                 # ally", "which target" and "which obstacle" are different
                 # questions, and a single normalisation would force a blue to
                 # trade attention on a target against attention on a wingman,
                 # and make the four pathways' RELATIVE weight a learned
                 # per-state quantity -- a far larger change than intended.
-                agg = agg + self._attend(msg_bb, self.att_mlp(in_bb),
+                agg = agg + self._attend(msg_bb, self._scores(in_bb),
                                          self.bb_in, bb_visible)
-                agg = agg + self._attend(msg_rb, self.att_mlp(in_rb),
+                agg = agg + self._attend(msg_rb, self._scores(in_rb),
                                          self.rb_in, rb_visible)
             else:
                 if bb_visible is not None:
@@ -401,8 +434,8 @@ class GNNEncoder(nn.Module):
                 h_recv_ob = h_blue.index_select(1, self.ob_dst)
                 in_ob  = torch.cat([h_send_ob, h_recv_ob, e_ob], dim=-1)
                 msg_ob = self.msg_mlp(in_ob)
-                if self.attention:
-                    agg = agg + self._attend(msg_ob, self.att_mlp(in_ob),
+                if self._grouped:
+                    agg = agg + self._attend(msg_ob, self._scores(in_ob),
                                              self.ob_in, ob_visible)
                 else:
                     if ob_visible is not None:
@@ -542,10 +575,14 @@ class GNNStage4Policy(nn.Module):
         # Default False keeps every existing checkpoint loadable and the
         # forward byte-identical.
         attention:          bool = False,
+        # Alternative to attention: divide by the live edge count.  Separates
+        # normalisation from discrimination (Sec. 19).
+        mean_agg:           bool = False,
         n_heads:            int = 4,
     ) -> None:
         super().__init__()
         self.attention         = bool(attention)
+        self.mean_agg          = bool(mean_agg)
         self.n_heads           = int(n_heads)
         self.n_blue            = n_blue
         self.n_red             = n_red
@@ -579,6 +616,7 @@ class GNNStage4Policy(nn.Module):
             n_msg_rounds  = n_msg_rounds,
             n_region      = self.n_region,
             attention     = self.attention,
+            mean_agg      = self.mean_agg,
             n_heads       = self.n_heads,
         )
         self.actor_gru  = nn.GRUCell(input_size=d_hidden, hidden_size=d_hidden)

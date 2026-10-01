@@ -77,6 +77,7 @@ def load_policy(
             # trained under.  Getting this wrong loads the right tensors into
             # the wrong aggregation and reads as a mysteriously bad policy.
             attention         = bool(args.get("attention", False)),
+            mean_agg          = bool(args.get("mean_agg", False)),
             n_heads           = int(args.get("n_heads", 4)),
             **_actor_sizing(args),
         ).to(device)

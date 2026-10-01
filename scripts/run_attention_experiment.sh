@@ -59,7 +59,7 @@ PPO_LR=3e-05
 RESET_LOG_STD=-1.2
 
 # label:extra-flags
-ARMS=("sum:" "attention:--attention --n-heads 4")
+ARMS=("sum:" "attention:--attention --n-heads 4" "mean:--mean-agg")
 
 started=$(date '+%Y-%m-%d %H:%M:%S')
 declare -A STATUS
@@ -96,10 +96,19 @@ write_summary() {
     echo "as destroying it); the 1.4->1.5 warm start does not, since by then"
     echo "log_std is trained."
     echo
-    echo "**Pre-registered expectation: PARITY, not a win.**  Margin +-0.15 on"
-    echo "the evader, measured over $EVAL_EPISODES episodes.  Parity is a PASS:"
-    echo "it licenses attention for variable counts and heterogeneous speeds,"
-    echo "which the summed aggregation blocks outright."
+    echo "Parity was pre-registered as the expectation and MISSED: attention"
+    echo "beat the sum by +0.88 on the evader, about 10 SE, and rescued the"
+    echo "stationary red from 2.62 to 2.98 (Sec. 19).  Both arms kept, and the"
+    echo "third arm asks what the win actually was:"
+    echo
+    echo "* **mean ~ attention** -> NORMALISATION.  Ally messages outnumber"
+    echo "  target messages 4.6:1 at comms inf, squeezing the target channel"
+    echo "  to 15% of the aggregate; one division fixes that, no scorer."
+    echo "* **attention > mean** -> DISCRIMINATION already pays at three reds,"
+    echo "  a much stronger result for the attention direction."
+    echo
+    echo "The mean adds ZERO parameters (pinned by a test), which is what makes"
+    echo "it a clean control.  All evals $EVAL_EPISODES episodes, matched seeds."
     echo
     echo "| what | stage | status | caught vs evader |"
     echo "|---|---|---|---|"

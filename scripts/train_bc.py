@@ -236,10 +236,11 @@ def main() -> None:
         # model -- the exact displacement docs/stage4_results.md §18.4 exists
         # to avoid, and it would be invisible until the arm simply scored low.
         attention          = saved_args.get("attention", False),
+        mean_agg           = saved_args.get("mean_agg", False),
         n_heads            = saved_args.get("n_heads", 4),
     ).to(device)
     log(f"Policy: {sum(p_.numel() for p_ in policy.parameters())} params"
-        f"  agg={'attention x' + str(saved_args.get('n_heads', 4)) if saved_args.get('attention') else 'sum'}")
+        f"  agg={'attention x' + str(saved_args.get('n_heads', 4)) if saved_args.get('attention') else ('mean' if saved_args.get('mean_agg') else 'sum')}")
 
     optimizer = optim.Adam(policy.parameters(), lr=args.lr, eps=1e-5)
     buffer = Stage4RolloutBuffer(

@@ -2552,3 +2552,107 @@ Pre-registered readings, so the result cannot be reinterpreted after the fact:
   and fixing that means changing the arena, which would invalidate the 2.72
   reference this experiment is measured against.  Architecture first, geometry
   second.
+
+---
+
+### 19. Attention beats the sum decisively, for a reason §18 got wrong (MEASURED, 2026-10-01) · `feature/target-tracking`
+
+§18.4 pre-registered **parity** as the expected outcome and as a pass.  That
+was wrong.  Two arms, identical but for the aggregation, both at
+`comms_radius inf`, both clone -> PPO@1.4 -> PPO@1.5, 150 rollouts per stage:
+
+| | evader | stationary | random | steps (evader) |
+|---|---|---|---|---|
+| **sum** | 1.60 ± 0.07 | **2.62 ± 0.04** | 2.68 ± 0.04 | 189.0 |
+| **attention** | **2.48 ± 0.05** | **2.98 ± 0.01** | 3.00 ± 0.01 | 156.9 |
+| *reference* (curriculum, comms 40) | 2.75 ± 0.04 | 3.00 ± 0.00 | 3.00 ± 0.00 | 141.4 |
+
+200 episodes, matched seeds, deterministic.  The clones started **level** —
+1.78 ± 0.12 against 1.86 ± 0.11, half an SE apart — so the comparison is fair.
+`best` and `final` agree in both arms (1.60/1.59, 2.48/2.49), so this is not a
+checkpoint-selection artefact.  The evader gap is **+0.88, about 10 SE**.
+
+Neither arm had an optimiser pathology: `kl` 0.0012-0.0016 against a 0.03
+target, `clip` 0.005-0.011, entropy 0.44-0.59 in both.  The sum arm did not
+break, it learned worse.
+
+#### 19.1 The decisive column is the STATIONARY red
+
+A stationary red does not move.  Scoring **2.62/3** against one is not "worse
+pursuit" — it is failing to act reliably on where the target is.  Every policy
+recorded in this document sat at 3.00 there.  The summed arm at
+`comms_radius inf` is broken in a basic way, and attention restores it to
+2.98/3.00.
+
+#### 19.2 The mechanism — and what §18 got wrong
+
+§18.4 argued that at comms inf the normalisation benefit would be **nil**,
+because the live bb count is then constant at 4 and "a constant scale factor
+is absorbable by the weights".  That reasoning treated bb **in isolation**.
+It is wrong because the four pathways **share one aggregate**, so what matters
+is their RELATIVE magnitudes:
+
+| pathway | sum @ comms 40 | sum @ comms inf | mean or attention |
+|---|---|---|---|
+| bb (allies) | 2.11 msgs, 53% | **4.0 msgs, 68%** | ~1, 33% |
+| **rb (targets)** | 0.86, 22% | **0.86, 15%** | ~1, 33% |
+| gb (regions) | ~1.0, 25% | ~1.0, 17% | ~1, 33% |
+
+Opening the radio squeezes the **target channel** from 22% to 15% of the
+aggregate while ally chatter grows to 68%.  The policy loses track of what it
+is chasing — which is exactly why it fails against a target that is sitting
+still.
+
+The asymmetry was **already measured in this codebase** and recorded as an
+unintended side effect, in the comment that explains why the region path is
+normalised: *"with weights summing to 1 the coverage term is a convex
+combination (about one message's worth) while bb/rb/ob are raw sums of 3-4
+messages each, so at initialisation it is only ~9% of the aggregate's norm"*.
+Nobody connected it to `comms_radius`.
+
+This also explains §16's ablation better than §16 did.  That section
+attributed the 2.72 -> 1.26 collapse to magnitude saturating the tanh
+activations.  The likelier cause is rb being drowned out — same evidence, a
+mechanism that also predicts the stationary-red failure, which saturation does
+not.
+
+#### 19.3 What this does NOT establish
+
+* **None of §18.4's four pre-registered readings matches.**  They were: B
+  wins and reaches the reference; B ≈ A below it; B ≈ A ≈ reference; B < A.
+  What happened is B ≫ A but **0.27 below the reference** (4.2 SE).  Recorded
+  as a miss rather than retrofitted.
+* **Attention did not reach the reference**, and that gap is confounded:
+  attention was still rising at the end (eval blocks 2.10 -> 2.24 -> 2.39,
+  final 2.48) with 17% fewer PPO steps, from a clone worth 1.86 against the
+  reference chain's 2.88.  2.48 is a floor here, not a ceiling.
+* **One seed per arm.**  A 10 SE gap in a final evaluation is not 10 SE across
+  seeds.
+* **Measured at `comms_radius inf` only.**  This may be "attention rescues
+  unlimited comms" rather than "attention is better".  At comms 40 the
+  imbalance is milder (53/22 against 68/15), so the benefit could be much
+  smaller — untested.
+
+#### 19.4 Normalisation or discrimination? The control arm
+
+Attention does two separable things: it **normalises** (each type contributes
+~1 message regardless of live count) and it **discriminates** (weights differ
+per neighbour).  §19.2's mechanism is entirely about the first.  If that is
+the whole story, a plain MEAN over live edges — no parameters, no selectivity
+— should recover most of the 0.88.
+
+So a third arm runs with `--mean-agg`, identical in every other respect:
+
+* **mean ≈ attention** -> the win was NORMALISATION.  The architecture needs
+  one division, not a learned scorer, and attention's real payoff still awaits
+  variable entity counts and heterogeneous speeds, where selectivity is the
+  point.
+* **attention > mean** -> DISCRIMINATION is doing work already at three reds,
+  which is a much stronger result for the attention direction.
+
+Implementation note: a mean IS attention with uniform weights, so it is
+implemented by passing a single channel of zero scores through the same
+`_attend` path.  That is not a shortcut for its own sake — it means the mean
+inherits the mask-before-softmax ordering and the empty-row guard rather than
+reimplementing the two things that were hard to get right.  A test pins that
+the mean adds exactly zero parameters, which is what makes it a clean control.
