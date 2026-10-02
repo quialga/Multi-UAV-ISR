@@ -2667,14 +2667,48 @@ per neighbour).  §19.2's mechanism is entirely about the first.  If that is
 the whole story, a plain MEAN over live edges — no parameters, no selectivity
 — should recover most of the 0.88.
 
-So a third arm runs with `--mean-agg`, identical in every other respect:
+So a third arm ran with `--mean-agg`, identical in every other respect.
+**The answer is both, with normalisation about two thirds of it** — which is
+neither of the two readings pre-registered above, the second
+over-dichotomous pre-registration in a row (see also §18.4).
 
-* **mean ≈ attention** -> the win was NORMALISATION.  The architecture needs
-  one division, not a learned scorer, and attention's real payoff still awaits
-  variable entity counts and heterogeneous speeds, where selectivity is the
-  point.
-* **attention > mean** -> DISCRIMINATION is doing work already at three reds,
-  which is a much stronger result for the attention direction.
+Red 1.5, 200 episodes, the same matched seeds:
+
+| arm | evader | stationary | random | steps |
+|---|---|---|---|---|
+| sum | 1.60 ± 0.07 | 2.62 ± 0.04 | 2.68 ± 0.04 | 189.0 |
+| **mean** | **2.18 ± 0.06** | **2.94 ± 0.03** | 2.96 ± 0.01 | 172.7 |
+| attention | 2.48 ± 0.05 | 2.98 ± 0.01 | 3.00 ± 0.01 | 156.9 |
+
+| | red 1.4 (50 eps) | red 1.5 (200 eps) |
+|---|---|---|
+| **normalisation** (mean − sum) | +0.48, 3.2 SE | **+0.58, 6.3 SE** |
+| **discrimination** (attention − mean) | +0.30, 2.3 SE | **+0.30, 3.8 SE** |
+| share | 62% / 38% | 66% / 34% |
+
+Three things this settles:
+
+* **The §19.2 mechanism is confirmed.**  A single division takes the
+  stationary red from 2.62 to **2.94**, against attention's 2.98.  What broke
+  the policy was the between-type imbalance, not saturation — and the fix
+  needs no parameters.
+* **Discrimination is real**, not marginal: +0.30 at 3.8 SE on 200 episodes.
+  It carries one confound — the mean's clone started 0.16 below attention's
+  (1.70 against 1.86), so the architecture-attributable part is somewhere
+  between ~0.14 and 0.30.
+* **It does not grow with difficulty.**  +0.30 at red 1.4 and +0.30 at red
+  1.5, identical.  A provisional reading from the mean arm's mid-training
+  evals predicted the opposite (that discrimination's share would rise at the
+  harder speed); it did not, and the arm kept climbing after that reading was
+  taken.
+
+So the engineering conclusion for the current three-red configuration is that
+the **mean is the better trade**: two thirds of the benefit for zero
+parameters and zero wall clock, against attention's +8.6% parameters and 1.25x
+time.  Attention earns its place on what it unlocks rather than on this
+measurement — variable entity counts and heterogeneous speeds, where
+selectivity is the whole point and the summed aggregation is a hard blocker.
+§20 is the experiment that tests that.
 
 Implementation note: a mean IS attention with uniform weights, so it is
 implemented by passing a single channel of zero scores through the same
