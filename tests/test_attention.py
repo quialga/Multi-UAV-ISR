@@ -348,3 +348,142 @@ def test_mean_round_trips_through_a_checkpoint(tmp_path):
     back = load_policy(path, torch.device("cpu"))
     assert back.actor_encoder.mean_agg is True
     assert back.actor_encoder.attention is False
+
+
+# ------------------------------------------------------------------ #
+#  Attention on the REGION path
+# ------------------------------------------------------------------ #
+
+RDIMS = dict(DIMS, n_region=9, region_feat_dim=2)
+
+
+def _region_inputs(enc, seed=0):
+    g = torch.Generator().manual_seed(seed)
+    r = lambda *s: torch.randn(*s, generator=g)
+    n_gb = enc.gb_src.numel()
+    return dict(
+        blue_feats=r(B, enc.n_blue, RDIMS["blue_feat_dim"]),
+        red_feats=r(B, enc.n_red, RDIMS["red_feat_dim"]),
+        bb_edge_feats=r(B, enc.bb_src.numel(), RDIMS["edge_feat_dim"]),
+        rb_edge_feats=r(B, enc.rb_src.numel(), RDIMS["edge_feat_dim"]),
+        region_feats=r(B, enc.n_region, RDIMS["region_feat_dim"]),
+        gb_edge_feats=r(B, n_gb, RDIMS["edge_feat_dim"]),
+        gb_weight=torch.full((B, n_gb), 1.0 / enc.n_region),
+    )
+
+
+def test_attend_regions_requires_attention():
+    """A uniform softmax over regions is strictly WORSE than gb_weight, not a
+    neutral control: it reduces the aggregate to depending on the staleness
+    field only through its mean, which is what gb_weight exists to avoid."""
+    with pytest.raises(ValueError, match="requires attention"):
+        GNNEncoder(**RDIMS, attend_regions=True)
+
+
+def test_plain_attention_leaves_the_region_path_on_gb_weight():
+    """Sec. 21's arms ran this way, so the default must stay reproducible."""
+    enc = GNNEncoder(**RDIMS, attention=True)
+    assert enc.attend_regions is False
+    assert not hasattr(enc, "gb_in")
+
+
+def test_attending_regions_changes_the_output():
+    torch.manual_seed(0)
+    a = GNNEncoder(**RDIMS, attention=True)
+    torch.manual_seed(0)
+    b = GNNEncoder(**RDIMS, attention=True, attend_regions=True)
+    assert b.attend_regions is True and hasattr(b, "gb_in")
+    x = _region_inputs(a)
+    assert not torch.allclose(_blue(a, **x), _blue(b, **x))
+
+
+def test_attending_regions_ignores_gb_weight():
+    """Learned weights REPLACE the hand-designed ones, so changing gb_weight
+    must have no effect -- otherwise both are silently in play."""
+    torch.manual_seed(0)
+    enc = GNNEncoder(**RDIMS, attention=True, attend_regions=True)
+    x1 = _region_inputs(enc)
+    x2 = dict(x1, gb_weight=x1["gb_weight"] * 7.0 + 3.0)
+    torch.testing.assert_close(_blue(enc, **x1), _blue(enc, **x2))
+
+
+def test_region_weights_depend_on_the_RECEIVING_BLUE():
+    """The structural gain over gb_weight, which is a function of the region
+    alone and so hands every blue the same mixture.  Division of search is
+    exactly what a shared mixture cannot express.
+
+    Built so the regions are identical across blues but the blues differ:
+    under gb_weight every blue then gets the same region aggregate, under
+    attention they need not.
+    """
+    torch.manual_seed(0)
+    enc = GNNEncoder(**RDIMS, attention=True, attend_regions=True)
+    n_gb = enc.gb_src.numel()
+    # Distinct blues, identical regions, and gb edge features that depend
+    # only on the REGION (so any per-blue difference must come from the
+    # attention scores reading h_recv, not from the edge inputs).
+    blue = torch.randn(1, enc.n_blue, RDIMS["blue_feat_dim"])
+    region = torch.randn(1, enc.n_region, RDIMS["region_feat_dim"])
+    gb_e = torch.zeros(1, n_gb, RDIMS["edge_feat_dim"])
+    per_region = torch.randn(enc.n_region, RDIMS["edge_feat_dim"])
+    for e in range(n_gb):
+        gb_e[0, e] = per_region[enc.gb_src[e]]
+    _h_blue, _h_red, _ = enc(
+        blue_feats=blue, red_feats=torch.zeros(1, enc.n_red, RDIMS["red_feat_dim"]),
+        bb_edge_feats=torch.zeros(1, enc.bb_src.numel(), RDIMS["edge_feat_dim"]),
+        rb_edge_feats=torch.zeros(1, enc.rb_src.numel(), RDIMS["edge_feat_dim"]),
+        bb_visible=torch.zeros(1, enc.bb_src.numel()),
+        rb_visible=torch.zeros(1, enc.rb_src.numel()),
+        region_feats=region, gb_edge_feats=gb_e,
+    )
+    # Probe the weights directly: identical unit messages per region, so the
+    # aggregate IS the weight vector and two blues agreeing would mean the
+    # scores ignored h_recv.
+    h_region = enc.region_input_mlp(region)
+    h_blue0 = enc.blue_input_mlp(blue)
+    e_gb = enc.gb_edge_mlp(gb_e)
+    in_gb = torch.cat([h_region.index_select(1, enc.gb_src),
+                       h_blue0.index_select(1, enc.gb_dst), e_gb], dim=-1)
+    msg = torch.randn(1, n_gb, RDIMS["d_hidden"])
+    out = enc._attend(msg, enc._scores(in_gb), enc.gb_in, None)   # (1, n_blue, d)
+    assert not torch.allclose(out[0, 0], out[0, 1], atol=1e-6), \
+        "every blue got the same region mixture -- scores ignored the receiver"
+
+
+def test_attending_regions_adds_no_parameters():
+    """att_mlp is shared across edge types, so extending it to gb reuses the
+    scorer rather than adding one."""
+    a = GNNStage4Policy(n_blue=5, n_red=8, n_obs=0, action_dim=2,
+                        d_hidden=64, n_region=25, attention=True)
+    b = GNNStage4Policy(n_blue=5, n_red=8, n_obs=0, action_dim=2,
+                        d_hidden=64, n_region=25, attention=True,
+                        attend_regions=True)
+    assert (sum(p.numel() for p in a.parameters())
+            == sum(p.numel() for p in b.parameters()))
+
+
+def test_attend_regions_round_trips_through_a_checkpoint(tmp_path):
+    pol = GNNStage4Policy(n_blue=3, n_red=2, n_obs=0, action_dim=2,
+                          d_hidden=16, n_region=9, attention=True,
+                          attend_regions=True)
+    path = tmp_path / "ar.pt"
+    torch.save({"policy_state": pol.state_dict(),
+                "args": {"policy_type": "gnn_stage4_v6", "n_blue": 3,
+                         "n_red": 2, "n_obstacles": 0, "d_hidden": 16,
+                         "use_staleness": True, "staleness_regions": 3,
+                         "attention": True, "attend_regions": True}}, path)
+    back = load_policy(path, torch.device("cpu"))
+    assert back.actor_encoder.attend_regions is True
+
+
+def test_a_pre_flag_checkpoint_keeps_gb_weight(tmp_path):
+    pol = GNNStage4Policy(n_blue=3, n_red=2, n_obs=0, action_dim=2,
+                          d_hidden=16, n_region=9, attention=True)
+    path = tmp_path / "old_ar.pt"
+    torch.save({"policy_state": pol.state_dict(),
+                "args": {"policy_type": "gnn_stage4_v6", "n_blue": 3,
+                         "n_red": 2, "n_obstacles": 0, "d_hidden": 16,
+                         "use_staleness": True, "staleness_regions": 3,
+                         "attention": True}}, path)
+    back = load_policy(path, torch.device("cpu"))
+    assert back.actor_encoder.attend_regions is False

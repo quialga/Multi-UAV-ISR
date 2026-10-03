@@ -78,6 +78,7 @@ def load_policy(
             # the wrong aggregation and reads as a mysteriously bad policy.
             attention         = bool(args.get("attention", False)),
             mean_agg          = bool(args.get("mean_agg", False)),
+            attend_regions    = bool(args.get("attend_regions", False)),
             n_heads           = int(args.get("n_heads", 4)),
             **_actor_sizing(args),
         ).to(device)

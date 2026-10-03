@@ -237,6 +237,7 @@ def main() -> None:
         # to avoid, and it would be invisible until the arm simply scored low.
         attention          = saved_args.get("attention", False),
         mean_agg           = saved_args.get("mean_agg", False),
+        attend_regions     = saved_args.get("attend_regions", False),
         n_heads            = saved_args.get("n_heads", 4),
     ).to(device)
     log(f"Policy: {sum(p_.numel() for p_ in policy.parameters())} params"

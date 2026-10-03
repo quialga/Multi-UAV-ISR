@@ -203,6 +203,12 @@ class GNNEncoder(nn.Module):
         # no selectivity.  Comparing mean against attention is what separates
         # "the win was normalisation" from "the win was discrimination".
         mean_agg:       bool = False,
+        # Extend attention to the REGION path, replacing ``gb_weight``.
+        # Separate from ``attention`` on purpose: §21's arms ran with the
+        # region path on its hand-designed weighting, so keeping this opt-in
+        # means that result stays reproducible and this becomes its own
+        # one-variable comparison rather than a silent change to it.
+        attend_regions: bool = False,
         n_heads:        int = 4,
     ) -> None:
         super().__init__()
@@ -212,9 +218,19 @@ class GNNEncoder(nn.Module):
         self.n_region     = n_region
         self.d_hidden     = d_hidden
         self.n_msg_rounds = n_msg_rounds
-        self.attention    = bool(attention)
-        self.mean_agg     = bool(mean_agg)
-        self.n_heads      = int(n_heads)
+        self.attention      = bool(attention)
+        self.mean_agg       = bool(mean_agg)
+        self.attend_regions = bool(attend_regions)
+        self.n_heads        = int(n_heads)
+        if self.attend_regions and not self.attention:
+            # A uniform softmax over regions is WORSE than gb_weight, not a
+            # neutral control: it would reduce the aggregate to depending on
+            # the staleness field only through its mean, which is the exact
+            # failure gb_weight was introduced to avoid.  So there is no
+            # meaningful "mean over regions" variant to allow here.
+            raise ValueError(
+                "attend_regions requires attention; a uniform weighting over "
+                "regions is strictly worse than gb_weight, not a control")
         if self.attention and self.mean_agg:
             raise ValueError(
                 "attention and mean_agg are alternative aggregations; pick "
@@ -255,6 +271,10 @@ class GNNEncoder(nn.Module):
             gb_src, gb_dst = _build_xb_edges(n_region, n_blue)
             self.register_buffer("gb_src", gb_src, persistent=False)
             self.register_buffer("gb_dst", gb_dst, persistent=False)
+            if self.attend_regions:
+                self.register_buffer("gb_in",
+                                     _incoming_index(gb_dst, n_blue),
+                                     persistent=False)
         else:
             self.region_input_mlp = None
             self.gb_edge_mlp      = None
@@ -496,12 +516,36 @@ class GNNEncoder(nn.Module):
             if has_region:
                 h_send_gb = h_region.index_select(1, self.gb_src)
                 h_recv_gb = h_blue.index_select(1, self.gb_dst)
-                msg_gb = self.msg_mlp(
-                    torch.cat([h_send_gb, h_recv_gb, e_gb], dim=-1),
-                )
-                if gb_weight is not None:
-                    msg_gb = msg_gb * gb_weight.unsqueeze(-1)
-                agg.index_add_(1, self.gb_dst, msg_gb)
+                in_gb = torch.cat([h_send_gb, h_recv_gb, e_gb], dim=-1)
+                msg_gb = self.msg_mlp(in_gb)
+                if self.attend_regions:
+                    # LEARNED weights replace gb_weight entirely.  Two things
+                    # change, and the second is the one the hand-designed
+                    # version structurally cannot do:
+                    #
+                    #  * the weighting becomes learned rather than a fixed
+                    #    function of the region's own two features (which, as
+                    #    the note above says, add no information -- only an
+                    #    inductive bias);
+                    #  * the weights depend on the RECEIVING BLUE.  gb_weight
+                    #    is a function of the region alone, so every blue gets
+                    #    the same mixture; attention scores (h_region, h_blue,
+                    #    e_gb), so blue 1 can attend to the stale region on
+                    #    its side while blue 2 attends to another.  Division
+                    #    of search is exactly the thing a shared mixture
+                    #    cannot express.
+                    #
+                    # No mask: coverage is a command-layer quantity, so no
+                    # region is hidden from any blue (see below).  The softmax
+                    # therefore runs over all R*R regions -- a far larger and
+                    # more variable fan-in than the 8 tracker slots, which is
+                    # why §21.4 expected this to be where selectivity pays.
+                    agg = agg + self._attend(msg_gb, self._scores(in_gb),
+                                             self.gb_in, None)
+                else:
+                    if gb_weight is not None:
+                        msg_gb = msg_gb * gb_weight.unsqueeze(-1)
+                    agg.index_add_(1, self.gb_dst, msg_gb)
 
             # Residual node update on blues only.
             h_blue = h_blue + self.update_mlp(torch.cat([h_blue, agg], dim=-1))
@@ -578,11 +622,15 @@ class GNNStage4Policy(nn.Module):
         # Alternative to attention: divide by the live edge count.  Separates
         # normalisation from discrimination (Sec. 19).
         mean_agg:           bool = False,
+        # Region path too; requires attention.  Opt-in so Sec. 21's arms stay
+        # reproducible and this is its own one-variable comparison.
+        attend_regions:     bool = False,
         n_heads:            int = 4,
     ) -> None:
         super().__init__()
         self.attention         = bool(attention)
         self.mean_agg          = bool(mean_agg)
+        self.attend_regions    = bool(attend_regions)
         self.n_heads           = int(n_heads)
         self.n_blue            = n_blue
         self.n_red             = n_red
@@ -615,9 +663,10 @@ class GNNStage4Policy(nn.Module):
             d_hidden      = d_hidden,
             n_msg_rounds  = n_msg_rounds,
             n_region      = self.n_region,
-            attention     = self.attention,
-            mean_agg      = self.mean_agg,
-            n_heads       = self.n_heads,
+            attention      = self.attention,
+            mean_agg       = self.mean_agg,
+            attend_regions = self.attend_regions,
+            n_heads        = self.n_heads,
         )
         self.actor_gru  = nn.GRUCell(input_size=d_hidden, hidden_size=d_hidden)
         self.actor_mean = _layer_init(nn.Linear(d_hidden, action_dim), std=0.01)

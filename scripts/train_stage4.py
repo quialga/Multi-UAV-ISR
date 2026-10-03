@@ -379,6 +379,16 @@ def _parse_args() -> argparse.Namespace:
                         "selectivity.  Comparing it against --attention says "
                         "whether that win was normalisation or "
                         "discrimination (docs/stage4_results.md section 19).")
+    p.add_argument("--attend-regions", action="store_true",
+                   help="extend --attention to the REGION path, replacing "
+                        "gb_weight's hand-designed staleness weighting.  The "
+                        "structural gain: gb_weight is a function of the "
+                        "region ALONE, so every blue gets the same mixture, "
+                        "while attention scores (region, blue, edge) and so "
+                        "different blues can attend to different regions -- "
+                        "division of search, which a shared mixture cannot "
+                        "express.  Requires --attention.  Separate flag so "
+                        "section 21's result stays reproducible.")
     p.add_argument("--n-heads", type=int, default=4,
                    help="attention heads; must divide --d-hidden.  One head "
                         "forces a single ranking of neighbours, and 'nearest "
@@ -699,12 +709,13 @@ def main() -> None:
                              if args.use_staleness else 0),
         attention         = args.attention,
         mean_agg          = args.mean_agg,
+        attend_regions    = args.attend_regions,
         n_heads           = args.n_heads,
     ).to(device)
     n_params = sum(p.numel() for p in policy.parameters())
     log(f"Policy: GNNStage4Policy (v6) d_hidden={args.d_hidden} "
         f"rounds={args.n_msg_rounds} n_obs={vec_env.n_obstacles} "
-        f"agg={'attention x' + str(args.n_heads) if args.attention else ('mean' if args.mean_agg else 'sum')} "
+        f"agg={('attention x' + str(args.n_heads) + ('+regions' if args.attend_regions else '')) if args.attention else ('mean' if args.mean_agg else 'sum')} "
         f"params={n_params}")
 
     # Warm-start.  --warm-start-full (a converged Stage 4 ckpt) copies
