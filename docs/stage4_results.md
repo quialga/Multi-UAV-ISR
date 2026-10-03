@@ -2703,7 +2703,9 @@ Three things this settles:
   taken.
 
 So the engineering conclusion for the current three-red configuration is that
-the **mean is the better trade**: two thirds of the benefit for zero
+the **mean is the better trade** — a conclusion §21.4 then shows does NOT
+generalise, because at five targets with a varying count the mean retains
+65% of its single-target performance against attention's 90%: two thirds of the benefit for zero
 parameters and zero wall clock, against attention's +8.6% parameters and 1.25x
 time.  Attention earns its place on what it unlocks rather than on this
 measurement — variable entity counts and heterogeneous speeds, where
@@ -2719,7 +2721,12 @@ the mean adds exactly zero parameters, which is what makes it a clean control.
 
 ---
 
-### 20. Does attention's advantage grow with the target count? (DESIGN, 2026-10-01) · not yet run
+### 20. Does attention's advantage grow with the target count? (DESIGN, 2026-10-01) · RUN, see §21
+
+> **Outcome in §21: the hypothesis holds.**  The gap grows monotonically
+> with the count, 0.010 at one target to 0.256 at five, which is the first
+> of the three readings pre-registered in §20.6.  The design below is what
+> ran; §21.3 records the one way the arms were not level.
 
 §19 showed attention beats the summed aggregation by +0.88 on the evader, and
 that **most of it is normalisation**: a plain mean over live edges recovers
@@ -2876,3 +2883,107 @@ that came out mixed (§18.4, §19.4):
   coordination genuinely matters less when targets are dense, and the
   interesting regime for this architecture is *few* targets under time
   pressure, not many.  That would redirect the roadmap rather than close it.
+
+---
+
+### 21. Attention's advantage grows with the target count (MEASURED, 2026-10-03) · `feature/target-tracking`
+
+§20's hypothesis, confirmed.  Two arms differing **only** in the aggregation —
+a mean over live edges against learned attention — each trained from scratch
+at 5 blues against 5 reds with the active count **sampled 1-5 per episode**,
+then evaluated at each count held fixed.  Produced by
+`scripts/run_count_experiment.sh`; sweeps by
+`scripts/eval_red_count_sweep.py`.
+
+Captured fraction, 100 episodes per point, matched seeds, red 1.4,
+`comms_radius inf`:
+
+| `n_red` | `ObsGreedy` | `AssignGreedy` | mean | **attention** | gap |
+|---|---|---|---|---|---|
+| 1 | 0.890 | 0.900 | 0.980 | **0.990** | +0.010 |
+| 2 | 0.760 | 0.820 | 0.860 | **0.965** | +0.105 |
+| 3 | 0.713 | 0.773 | 0.743 | **0.943** | +0.200 |
+| 4 | 0.627 | 0.750 | 0.680 | **0.917** | +0.237 |
+| 5 | 0.592 | 0.706 | 0.640 | **0.896** | **+0.256** |
+| fitted slope | −0.0728 | −0.0458 | −0.0860 | **−0.0235** | |
+
+**The gap grows monotonically with the count**, from 0.010 at one target to
+0.256 at five.  That is §20.6's first pre-registered reading, and the first
+pre-registration in this series to land cleanly rather than between the
+options offered.
+
+Three summaries:
+
+* **Retention** (fraction at `n_red` 5 over `n_red` 1): attention **90.5%**,
+  `AssignGreedy` 78.4%, `ObsGreedy` 66.5%, mean **65.3%**.
+* **Absolute captures at `n_red` 5**: 4.48 ± 0.08 against the mean's
+  3.20 ± 0.12 — **+1.28, about 8.9 SE**.
+* **Time**: 161.6 steps at five targets against the mean's 195.9, which is
+  nearly the 200-step limit.  The mean arm runs out of clock; attention does
+  not.
+
+#### 21.1 It beats the hand-coded allocator, which the mean does not
+
+`AssignGreedy` does explicit target division with balanced capacity — the
+allocation this architecture is supposed to learn.  Two things stand out.
+
+**The mean arm loses to it at every count above two**: 0.743 against 0.773 at
+three targets, 0.640 against 0.706 at five (3.20 against 3.53 captures, about
+2 SE).  A learned policy beaten by a hand-written rule, at precisely the
+counts where allocation matters.  It wins at one and two targets (0.980
+against 0.900), so the curves cross — which is invisible at any single
+operating point, and is why §20.4 made the curve the metric.
+
+**Attention beats it everywhere and degrades half as fast** (−0.0235 against
+−0.0458).  It learned the allocation the rule encodes, and kept learning past
+it.
+
+#### 21.2 This reverses what the zero-shot curves suggested
+
+§20.5 measured the same sweep on §19's arms — trained at `n_red` 3 **fixed** —
+and found the gap *narrowing* with count (0.133, 0.317, 0.334, 0.275, 0.254).
+That was reported as weak evidence against this hypothesis.  It was weak for
+the reason recorded there, and the correction is now measured: a policy
+trained at a fixed count never had a reason to develop selectivity, so its
+zero-shot behaviour at other counts says nothing about what the mechanism is
+worth when training exercises it.  Training both arms with the count varying
+was the decisive design choice, and it came from the user's insistence on it
+over this document's reading of the zero-shot result.
+
+#### 21.3 Caveats, and the second one matters
+
+* **One seed per arm**, as everywhere in §15-§21.
+* **The clones did NOT start level.**  On the evader: attention 2.10 against
+  the mean's 1.25, a 0.85 head start — far larger than §19's 0.16.  So the
+  comparison of LEVEL is not clean.
+  The comparison of SHAPE survives it better: a uniform head start shifts a
+  curve up without changing its slope, and the slope differs by more than a
+  factor of two.  And the clone gap is itself evidence rather than only a
+  confound — cloning is supervised fitting with no RL involved, so attention
+  fitting the same expert better at a varying count is the mechanism showing
+  up in the simplest possible setting.
+* **The fitted slope's SE (0.0004) is understated.**  It is a residual-based
+  fit SE over five points, so it measures how straight the line is, not the
+  sampling uncertainty of the points it is fitted to (0.010-0.016 each).  The
+  robust statistics are the point comparison at `n_red` 5 (8.9 SE) and the
+  retention ratio; the slope is a shape summary, not a significance test.
+* `n_obstacles 0`, so the `ob` pathway remains inert and its own attention is
+  built but unexercised.
+
+#### 21.4 What this settles, and what it opens
+
+The engineering conclusion of §19.4 — that the mean was the better trade for
+three reds, at two thirds of the benefit for zero cost — **does not
+generalise**.  At five targets with a varying count, the mean retains 65% of
+its single-target performance and attention retains 90%.  The +8.6%
+parameters and 1.25x wall clock buy something that a division cannot.
+
+Open, and now with measured rather than theoretical justification:
+
+* **Attention on the region path** (§18.5).  `gb_weight` is a hand-designed
+  normalised weighting sitting at exactly the site attention weights occupy,
+  and the region count `R*R` is a far larger and more variable fan-in than the
+  eight tracker slots — so if selectivity pays anywhere else, it pays there.
+* **Heterogeneous red speeds**, the other half of the original motivation: a
+  blue weighting the fast evader over the slow one is the same mechanism
+  applied to a different feature.
