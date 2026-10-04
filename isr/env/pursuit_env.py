@@ -202,6 +202,18 @@ class PursuitEnv(ParallelEnv):
         # off rather than running it down, which is the only condition
         # under which coordination can pay.
         red_v_max:                Optional[float]    = None,
+        # Lower bound for a PER-RED top speed, sampled once per episode and
+        # held for that episode.  Mirrors ``n_red_min``: unset means fixed at
+        # ``red_v_max``, which is what every result in
+        # docs/stage4_results.md was measured under.
+        #
+        # Deliberately NOT exposed to the policy as a feature.  A target's
+        # top speed is not something a sensor reports, so declaring it would
+        # be a sixth privileged leak (docs/tracker_observation.md).  The
+        # policy has to INFER that a red is fast from the velocity its own
+        # tracker estimates -- which is the interesting part: it must work
+        # out which evaders it can still run down.
+        red_v_max_min:            Optional[float]    = None,
         # Range of the BLUE-TO-BLUE datalink, decoupled from
         # ``sensor_radius`` (backlog §7).  A bb edge carries a MESSAGE
         # between our own drones, not a sensor return, and a radio
@@ -518,6 +530,15 @@ class PursuitEnv(ParallelEnv):
         self.red_v_max = (RED_TARGET.v_max if red_v_max is None
                           else float(red_v_max))
         assert self.red_v_max > 0.0
+        self.red_v_max_min = (None if red_v_max_min is None
+                              else float(red_v_max_min))
+        if self.red_v_max_min is not None:
+            assert 0.0 < self.red_v_max_min <= self.red_v_max, (
+                f"red_v_max_min ({self.red_v_max_min}) must be in "
+                f"(0, red_v_max={self.red_v_max}]")
+        # Per-red speeds for the CURRENT episode, filled in reset().  Always
+        # an array, even when fixed, so _integrate has one code path.
+        self._red_v_max_vec: Optional[np.ndarray] = None
         self.tracker_vel_prior_std = (None if tracker_vel_prior_std is None
                                       else float(tracker_vel_prior_std))
         self.tracker_a_max = (None if tracker_a_max is None
@@ -768,6 +789,11 @@ class PursuitEnv(ParallelEnv):
             # ~10.8 against a target of 4.0.
             self._red_motion = LearnedRedMotion(
                 model, blue_cap, obs_cap, arena_size=self.arena_size,
+                # The MAX of the per-red speeds when they are heterogeneous.
+                # A cap that is too LOOSE only lets a prediction overshoot,
+                # which the covariance absorbs; a cap that is too TIGHT is a
+                # systematic under-prediction, which it cannot (the bug fixed
+                # above).  So err loose.
                 v_max=self.red_v_max,
                 **dict(actor_graph.LEARNED_MOTION_CONFIG,
                        **({} if tracker_sigma_a_model is None else
@@ -854,6 +880,19 @@ class PursuitEnv(ParallelEnv):
         # from step 0, treated exactly like caught reds everywhere).
         self._red_active = np.zeros(self.n_red, dtype=bool)
         self._red_active[:n_red_active] = True
+        # Per-red top speed for this episode.  Drawn from the env's own RNG
+        # so it is reproducible from the seed like every other per-episode
+        # quantity, and held CONSTANT for the episode: the point is that
+        # different evaders are differently fast, not that one accelerates.
+        # Padded slots get a speed too, which is harmless and keeps the
+        # array one width.
+        if self.red_v_max_min is None:
+            self._red_v_max_vec = np.full(self.n_red, self.red_v_max,
+                                          dtype=np.float32)
+        else:
+            self._red_v_max_vec = self._rng.uniform(
+                self.red_v_max_min, self.red_v_max,
+                size=self.n_red).astype(np.float32)
         self._t = 0
         self._last_n_caught = 0
         self.agents = list(self.possible_agents)
@@ -970,7 +1009,11 @@ class PursuitEnv(ParallelEnv):
         # 4. Integrate red kinematics.
         prev_red_pos = self._red_pos.copy()
         self._red_pos, self._red_vel = self._integrate(
-            self._red_pos, self._red_vel, red_a, self.red_v_max,
+            # (n_red, 1) so np.clip broadcasts the cap PER RED against the
+            # (n_red, 2) velocity.  A scalar still works for blues, so
+            # _integrate keeps one signature.
+            self._red_pos, self._red_vel, red_a,
+            self._red_v_max_vec[:, None],
         )
         if self.n_obstacles > 0:
             self._red_pos, self._red_vel, _ = self._clip_positions_from_obstacles(
@@ -1410,7 +1453,7 @@ class PursuitEnv(ParallelEnv):
         pos:    np.ndarray,
         vel:    np.ndarray,
         accel:  np.ndarray,
-        v_max:  float,
+        v_max,                      # float, or (n, 1) for a per-entity cap
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Double-integrator step with axis-wise velocity cap and arena

@@ -79,6 +79,17 @@ def _parse_args() -> argparse.Namespace:
                         "Raise it to make cutting a target off the only way "
                         "to catch it.  CHANGES THE TASK: results are not "
                         "comparable across values.")
+    p.add_argument("--red-v-max-min", type=float, default=None,
+                   help="Lower bound for a PER-RED top speed, sampled once "
+                        "per episode and held for it (--red-v-max is the "
+                        "upper bound).  Unset => every red at --red-v-max, "
+                        "which is what every result in "
+                        "docs/stage4_results.md was measured under.  The "
+                        "speed is NOT given to the policy as a feature: a "
+                        "target's top speed is not something a sensor "
+                        "reports, so the policy has to infer which evaders "
+                        "it can still run down from the velocity its own "
+                        "tracker estimates.  CHANGES THE TASK.")
     p.add_argument("--comms-radius", type=float, default=None,
                    help="Range of the blue-to-blue datalink, gating "
                         "bb_edge_visible independently of --sensor-radius. "
@@ -614,6 +625,7 @@ def main() -> None:
         use_staleness           = args.use_staleness,
         staleness_regions       = args.staleness_regions,
         red_v_max               = args.red_v_max,
+        red_v_max_min           = args.red_v_max_min,
         comms_radius            = args.comms_radius,
         tracker_vel_prior_std   = args.tracker_vel_prior_std,
     )
