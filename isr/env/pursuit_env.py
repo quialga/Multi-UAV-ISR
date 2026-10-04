@@ -403,6 +403,14 @@ class PursuitEnv(ParallelEnv):
         # not fight normal converge-on-a-red coordination.  0 = off.
         clearance_ally_weight:    float = 0.0,   # per-step magnitude; 0 = off
         clearance_ally_margin:    float = 3.0,   # m band beyond the collision radius
+        # Blue<->WALL barrier.  ONE term, not a crash + clearance pair: a blue
+        # cannot be inside a wall, so the depth saturates at 1 at contact and
+        # the penalty there IS the weight.  A tighter margin than obstacles,
+        # because three clearance bands at once leave little admissible space
+        # (measured: 54.3% of the arena free at 9 obstacles with margins 6/2,
+        # 46.7% at 8/2).  Off by default, so every earlier result stands.
+        wall_clearance_weight:    float = 0.0,   # per-step magnitude; 0 = off
+        wall_clearance_margin:    float = 2.0,   # m band inside each wall
         # ----- Variable entity counts (generalisation) --------------------
         # ``n_red`` / ``n_obstacles`` are the PADDED CAPACITY (fixed tensor
         # shapes).  When a *_min is set, each reset samples the actual
@@ -657,6 +665,9 @@ class PursuitEnv(ParallelEnv):
         self.clearance_margin         = float(clearance_margin)
         self.clearance_ally_weight    = float(clearance_ally_weight)
         self.clearance_ally_margin    = float(clearance_ally_margin)
+        self.wall_clearance_weight    = float(wall_clearance_weight)
+        self.wall_clearance_margin    = float(wall_clearance_margin)
+        assert self.wall_clearance_margin > 0.0
         assert self.crash_obstacle_penalty >= 0.0
         assert self.crash_blue_penalty >= 0.0
         assert self.blue_collision_radius >= 0.0
@@ -1124,6 +1135,40 @@ class PursuitEnv(ParallelEnv):
             ta = np.clip(ta, 0.0, None)
             np.fill_diagonal(ta, 0.0)                 # exclude self-pair
             r_clear -= self.clearance_ally_weight * ta.sum(axis=1).astype(np.float32)
+
+        # 6f. Blue<->WALL clearance.  Obstacles and allies were shaped and
+        #     walls were not, which taught the policy that touching a wall is
+        #     free -- and it is, mechanically: _integrate clips the position
+        #     to the wall and zeroes that velocity component, so contact costs
+        #     only momentum.  Measured on cnt_attention_ppo: 0.53% of
+        #     agent-steps in contact, 7x the uncoordinated heuristic's 0.08%.
+        #     Not an exploit (mean wall distance 25.7 m against the 21.7 m a
+        #     uniform point would give, so the policy is not hugging them) but
+        #     ~5 agent-steps of contact per episode, which for an indoor
+        #     certification trial is a failure rate rather than noise.
+        #
+        #     ONE term, not the obstacle path's crash + clearance pair: a blue
+        #     cannot be INSIDE a wall, so the depth t saturates at 1 exactly
+        #     at contact.  The penalty at contact is therefore the weight
+        #     itself, and the ramp before it supplies the gradient -- so a
+        #     separate flat crash term would be redundant.
+        #
+        #     A TIGHTER margin than obstacles is deliberate, for the reason
+        #     the ally term gives for its own: three clearance bands at once
+        #     leave little admissible space.  Measured at 9 obstacles with
+        #     obstacle margin 6 and wall margin 2, 54.3% of the arena is free
+        #     of every band; at obstacle margin 8 it falls to 46.7%, and a
+        #     policy with nowhere unpenalised to stand freezes (the failure
+        #     Sec. 10 measured at 58.4% idle agent-steps).
+        if self.wall_clearance_weight > 0.0:
+            L = self.arena_size
+            wd = np.minimum(
+                np.minimum(self._blue_pos[:, 0], L - self._blue_pos[:, 0]),
+                np.minimum(self._blue_pos[:, 1], L - self._blue_pos[:, 1]),
+            )                                          # dist to NEAREST wall
+            tw = (self.wall_clearance_margin - wd) / self.wall_clearance_margin
+            tw = np.clip(tw, 0.0, 1.0)                 # saturates at contact
+            r_clear -= self.wall_clearance_weight * tw.astype(np.float32)
 
         # 7. Termination check.
         self._t += 1

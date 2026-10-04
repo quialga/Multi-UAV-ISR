@@ -46,11 +46,19 @@ def _red(kind: str, seed: int):
     return random_red(seed=seed)
 
 
-def evaluate(ckpt: str, red_kind: str, n_ep: int, red_v_max, seed_base: int):
+def evaluate(ckpt: str, red_kind: str, n_ep: int, red_v_max, seed_base: int,
+             n_obstacles=None):
     ck = torch.load(ckpt, map_location="cpu", weights_only=False)
     kw = env_kwargs_from_checkpoint(ck["args"])
     if red_v_max is not None:
         kw["red_v_max"] = float(red_v_max)
+    if n_obstacles is not None:
+        # Removing obstacles from a policy TRAINED with them is the forgetting
+        # check, and it works without a shape error: the env then emits no
+        # obstacle keys, so the encoder's has_obs is False and the ob channel
+        # contributes nothing.  The question it answers is "with no obstacles
+        # present, does it still pursue as well as before it learned to dodge".
+        kw["n_obstacles"] = int(n_obstacles)
     dev = torch.device("cpu")
     policy = load_policy(ckpt, dev)
     caught, steps, rets = [], [], []
@@ -88,6 +96,9 @@ def main() -> None:
     p.add_argument("--episodes", type=int, default=50)
     p.add_argument("--red-v-max", type=float, default=None,
                    help="override the checkpoint's red speed (cross-speed check)")
+    p.add_argument("--n-obstacles", type=int, default=None,
+                   help="override the obstacle count; 0 on an obstacle-trained "
+                        "policy is the forgetting check")
     p.add_argument("--reds", default="run",
                    help=f"comma-separated subset of {RED_KINDS}, or 'all'")
     p.add_argument("--seed-base", type=int, default=70_000,
@@ -103,7 +114,8 @@ def main() -> None:
     print(f"{'red':>12}  {'caught':>14}  {'steps':>7}  {'return':>8}")
     print("-" * 48)
     for k in kinds:
-        r = evaluate(a.ckpt, k, a.episodes, a.red_v_max, a.seed_base)
+        r = evaluate(a.ckpt, k, a.episodes, a.red_v_max, a.seed_base,
+                     a.n_obstacles)
         out[k] = r
         print(f"{k:>12}  {r['caught']:6.2f} +- {r['se']:4.2f}  "
               f"{r['steps']:7.1f}  {r['ret']:8.2f}", flush=True)

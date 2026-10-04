@@ -301,6 +301,26 @@ def _parse_args() -> argparse.Namespace:
                         "barrier acts (tighter than obstacles so it doesn't "
                         "fight converge-on-a-red coordination).")
     # Parallelism
+    p.add_argument("--wall-clearance-weight", type=float,
+                   default=d.get("wall_clearance_weight", 0.0),
+                   help="Per-agent per-step barrier against the ARENA WALLS, "
+                        "which obstacles and allies had and walls did not -- "
+                        "so touching a wall was free, and it is mechanically "
+                        "free too (the integrator clips position and zeroes "
+                        "that velocity component).  Measured 0.53%% of "
+                        "agent-steps in contact, 7x the heuristic, which is "
+                        "noise for score but a failure rate for an indoor "
+                        "certification trial.  ONE term: a blue cannot be "
+                        "inside a wall, so the depth saturates at contact and "
+                        "the penalty there IS this weight.  0 = off.")
+    p.add_argument("--wall-clearance-margin", type=float,
+                   default=d.get("wall_clearance_margin", 2.0),
+                   help="Band inside each wall where the barrier applies. "
+                        "Tighter than the obstacle margin on purpose: three "
+                        "bands at once leave little admissible space (54.3%% "
+                        "of the arena free at 9 obstacles with margins 6/2, "
+                        "46.7%% at 8/2, and a policy with nowhere "
+                        "unpenalised to stand freezes).")
     p.add_argument("--n-workers", type=int, default=0,
                    help="Env-stepping worker processes (0 = in-process, "
                         "the previous behaviour).  Shards --n-envs across "
@@ -622,6 +642,8 @@ def main() -> None:
         clearance_margin        = args.clearance_margin,
         clearance_ally_weight   = args.clearance_ally_weight,
         clearance_ally_margin   = args.clearance_ally_margin,
+        wall_clearance_weight   = args.wall_clearance_weight,
+        wall_clearance_margin   = args.wall_clearance_margin,
         use_staleness           = args.use_staleness,
         staleness_regions       = args.staleness_regions,
         red_v_max               = args.red_v_max,

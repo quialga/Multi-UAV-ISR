@@ -192,6 +192,9 @@ def env_kwargs_from_checkpoint(train_args: dict) -> dict:
         clearance_margin         = g("clearance_margin", 4.0),
         clearance_ally_weight    = g("clearance_ally_weight", 0.0),
         clearance_ally_margin    = g("clearance_ally_margin", 3.0),
+        # 0.0 = off, which is how every pre-feature checkpoint trained.
+        wall_clearance_weight    = g("wall_clearance_weight", 0.0),
+        wall_clearance_margin    = g("wall_clearance_margin", 2.0),
         catch_reward             = g("catch_reward", 10.0),
         step_cost                = g("step_cost", 0.05),
         uncaught_penalty         = g("uncaught_penalty", 5.0),
