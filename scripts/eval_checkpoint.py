@@ -73,7 +73,14 @@ def evaluate(ckpt: str, red_kind: str, n_ep: int, red_v_max, seed_base: int,
                 {a: blue.act(None, env, a) for a in env.agents})
             tot += float(sum(rew.values())) / max(len(rew), 1)
         s = env.state_snapshot()
-        caught.append(int((~s["red_active"]).sum()))
+        # n_red_start, NOT the capacity: with n_red_min set, the unused slots
+        # are padded INACTIVE from step 0, so counting ~red_active credits
+        # them as captures.  At capacity 5 with 3.05 active on average that
+        # inflated every number by ~1.95 -- it read 3.58 where the trainer's
+        # own eval read 1.68.  The trainer gets this right; this script did
+        # not until 2026-10-05.
+        caught.append(int(s.get("n_red_start", len(s["red_active"]))
+                          - int(s["red_active"].sum())))
         steps.append(int(s["t"]))
         rets.append(tot)
     c = np.array(caught, dtype=float)

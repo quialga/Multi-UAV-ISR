@@ -7,9 +7,21 @@
 # is what gives the channel-gating experiment a third real channel, and cover
 # is what lets a slow red survive in self-play.
 #
-# A CURRICULUM, 4 obstacles then 9, warm-started from cnt_attention_ppo so the
-# budget is spent learning to avoid rather than relearning to pursue (Sec. 17
-# priced from-scratch at ~1.2 worse).
+# ONE STAGE at fixed CAPACITY 9 with the active count sampled 1-9 per episode,
+# warm-started from cnt_attention_ppo.  A first attempt ramped the CAPACITY
+# 4 -> 9 and failed; this is the redesign, and both changes come from that
+# failure:
+#
+#   * Capacity is the TENSOR WIDTH; the active count is the difficulty.
+#     Ramping the capacity re-initialises critic_trunk.0.weight (129 -> 194
+#     the moment obstacles exist), so the first attempt began PPO with a warm
+#     actor and a COLD CRITIC -- which Secs. 6.5 and 12 established gets
+#     destroyed by large wrong advantages.  It started at 1.37 against the
+#     blind heuristic's 1.73 and never caught up.  Sampling the active count
+#     at a fixed capacity never touches the critic's width.
+#   * Sampling also closes the 5-8 gap a two-point ramp leaves, the same
+#     lesson Sec. 21 measured for red counts: a policy trained at a fixed
+#     count has no reason to handle variation.
 #
 # Every coefficient below comes from a measurement, not a guess:
 #
@@ -19,7 +31,27 @@
 #     30.5% of agent-steps respectively.  The historical clearance_fixed_v1
 #     reached 1.20 at 4 obstacles, so ~6.6x better than blind, not zero.
 #
-#   * The crash penalty is PER STEP, so at 9 obstacles a 2.0 coefficient would
+#   * The coefficients are an ORDER OF MAGNITUDE below the first attempt, and
+#     that attempt is why.  Decomposing its -83 return: catches +16, uncaught
+#     -7, step cost -6, so crash + clearance was about -86 -- FIVE TIMES the
+#     catch reward.  The earlier budget was computed as crash x exposure and
+#     ignored that the clearance term covers a far larger band than the crash
+#     one (23.5% of the arena against 17.4% exposure) AND is summed over
+#     obstacles, so a blue between two feels both.  Hence crash 2.0 -> 0.3 and
+#     clearance 0.6 -> 0.2, for about -11 against roughly +30 from catches.
+#
+#     The deeper point: a dominant penalty is self-extinguishing only if there
+#     is budget to recover.  clearance_fixed_v1 absorbed 2.0 across 61.4M
+#     steps; with 1.9M it just dominates.  Shaping magnitude should scale
+#     INVERSELY with budget.
+#
+#   * Obstacle radii drop 5-15 to 4-10, halving their physical area (17.4% ->
+#     8.9%) and lifting the admissible area at the HARDEST count from 46.4% to
+#     59.7% while KEEPING the 8 m margin -- better than the 54.0% that cutting
+#     the margin to 6 bought with the big radii, and it keeps the wide
+#     gradient.  With the count sampled, 9 obstacles is only ~11% of episodes.
+#
+#   * (superseded) the per-step crash reasoning that set 2.0 -> 1.0:
 #     cost 2.0 x 0.305 x 200 = -122 per episode against roughly +30 from
 #     catches: four times the reward, which risks a policy that learns to
 #     dodge and stops hunting.  So the curriculum holds the PENALTY BUDGET
@@ -73,12 +105,13 @@ PPO_LR=3e-05
 ENV_BASE="--arena-size 130 --n-blue 5 --n-red 5 --n-red-min 1 \
 --belief-grid-size 26 --max-steps 200 --actor-obs tracker \
 --comms-radius inf --red-v-max 1.4 --sensor-radius 40.0 \
+--n-obstacles-min 1 --obstacle-radius-min 4.0 --obstacle-radius-max 10.0 \
 --attention --n-heads 4 \
 --clearance-ally-weight 0.6 --clearance-ally-margin 3.0 \
 --wall-clearance-weight 0.5 --wall-clearance-margin 2.0"
 
 # stage : n_obstacles : crash penalty : obstacle clearance margin
-STAGES=("obs4:4:2.0:8.0" "obs9:9:1.0:6.0")
+STAGES=("obs1to9:9:0.3:8.0")
 
 started=$(date '+%Y-%m-%d %H:%M:%S')
 declare -A STATUS
@@ -173,7 +206,7 @@ for st in "${STAGES[@]}"; do
         --n-obstacles "$n_obs" \
         --crash-obstacle-penalty "$crash" \
         --crash-blue-penalty "$crash" \
-        --clearance-weight 0.6 --clearance-margin "$cmargin" \
+        --clearance-weight 0.2 --clearance-margin "$cmargin" \
         --n-envs 64 --rollout-steps 200 --n-rollouts "$PPO_ROLLOUTS" \
         --n-epochs 10 --mb-size 512 --lr "$PPO_LR" --ent-coef 0.008 \
         --target-kl 0.03 --n-workers 4 --torch-threads 4 \
